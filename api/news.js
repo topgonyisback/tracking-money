@@ -79,11 +79,19 @@ const NEGATIVE_WORDS = [
 ]
 
 const HIGH_IMPORTANCE_WORDS = ['실적', 'CPI', 'FOMC', '금리', '환율', '관세', '규제', '가이던스', '서프라이즈']
+const REQUEST_DELAY_MS = 250
+const RETRY_DELAY_MS = 800
 
 function sendJson(res, statusCode, payload) {
   res.statusCode = statusCode
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
   res.end(JSON.stringify(payload))
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
 }
 
 function decodeEntities(value) {
@@ -150,7 +158,7 @@ function getKeywords(rawKeywords) {
   return keywords.length > 0 ? keywords : DEFAULT_KEYWORDS
 }
 
-async function fetchNaverNews({ keyword, display, clientId, clientSecret }) {
+async function requestNaverNews({ keyword, display, clientId, clientSecret, attempt = 0 }) {
   const params = new URLSearchParams({
     query: keyword,
     display: String(display),
@@ -163,12 +171,33 @@ async function fetchNaverNews({ keyword, display, clientId, clientSecret }) {
     },
   })
 
+  if (response.status === 429 && attempt < 2) {
+    await sleep(RETRY_DELAY_MS * (attempt + 1))
+    return requestNaverNews({
+      keyword,
+      display,
+      clientId,
+      clientSecret,
+      attempt: attempt + 1,
+    })
+  }
+
   if (!response.ok) {
     const message = await response.text()
     throw new Error(`Naver News API ${response.status}: ${message}`)
   }
 
-  const payload = await response.json()
+  return response.json()
+}
+
+async function fetchNaverNews({ keyword, display, clientId, clientSecret }) {
+  const payload = await requestNaverNews({
+    keyword,
+    display,
+    clientId,
+    clientSecret,
+  })
+
   return (payload.items ?? []).map((item, index) => {
     const title = cleanText(item.title)
     const description = cleanText(item.description)
@@ -211,20 +240,32 @@ export default async function handler(req, res) {
   const display = Math.min(Math.max(Number(url.searchParams.get('display') ?? 3), 1), 5)
 
   try {
-    const results = await Promise.all(
-      keywords.map((keyword) =>
-        fetchNaverNews({
+    const results = []
+    const errors = []
+
+    for (const [index, keyword] of keywords.entries()) {
+      try {
+        const items = await fetchNaverNews({
           keyword,
           display,
           clientId,
           clientSecret,
-        }),
-      ),
-    )
+        })
+        results.push(...items)
+      } catch (error) {
+        errors.push({
+          keyword,
+          message: error instanceof Error ? error.message : '수집 실패',
+        })
+      }
+
+      if (index < keywords.length - 1) {
+        await sleep(REQUEST_DELAY_MS)
+      }
+    }
 
     const seenLinks = new Set()
     const items = results
-      .flat()
       .filter((item) => {
         if (seenLinks.has(item.link)) return false
         seenLinks.add(item.link)
@@ -239,6 +280,15 @@ export default async function handler(req, res) {
       fetchedAt: new Date().toISOString(),
       keywords,
       items,
+      message:
+        errors.length > 0
+          ? items.length > 0
+            ? `일부 키워드는 네이버 속도 제한으로 다음 새로고침에서 다시 수집합니다: ${errors
+                .slice(0, 3)
+                .map((error) => error.keyword)
+                .join(', ')}`
+            : errors[0].message
+          : undefined,
     })
   } catch (error) {
     sendJson(res, 502, {

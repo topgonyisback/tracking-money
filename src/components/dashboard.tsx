@@ -421,11 +421,18 @@ function NewsPage() {
       const response = await fetch(`/api/news?${params.toString()}`, { signal })
       const contentType = response.headers.get('content-type') ?? ''
 
-      if (!response.ok || !contentType.includes('application/json')) {
+      if (!contentType.includes('application/json')) {
         throw new Error('네이버 뉴스 API 응답을 확인할 수 없습니다.')
       }
 
       const payload = (await response.json()) as NewsApiResponse
+
+      if (!response.ok) {
+        setLiveNews(payload.items ?? [])
+        setNewsStatus('error')
+        setNewsMessage(payload.message ?? '네이버 뉴스 API 호출에 실패했습니다.')
+        return
+      }
 
       if (!payload.configured) {
         setLiveNews([])
