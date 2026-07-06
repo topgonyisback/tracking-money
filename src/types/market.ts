@@ -64,6 +64,22 @@ export type NewsIssue = {
   expectedImpact: string
 }
 
+export type LiveNewsItem = {
+  id: string
+  keyword: string
+  title: string
+  source: string
+  link: string
+  description: string
+  publishedAt: string
+  direction: Direction
+  importance: 'low' | 'medium' | 'high'
+  confidence: Confidence
+  relatedSymbols: string[]
+  sectors: string[]
+  expectedImpact: string
+}
+
 export type CalendarEvent = {
   id: string
   date: string

@@ -1,16 +1,18 @@
-import { useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import {
   Activity,
   Bell,
   CalendarDays,
   ChartCandlestick,
   Clock3,
+  ExternalLink,
   Gauge,
   LayoutDashboard,
   LineChart,
   Newspaper,
   NotebookPen,
   Radar,
+  RefreshCw,
   Settings,
   Star,
   TrendingDown,
@@ -46,7 +48,7 @@ import {
   watchlist,
 } from '@/data/mock-dashboard'
 import { cn } from '@/lib/utils'
-import type { Direction } from '@/types/market'
+import type { Direction, LiveNewsItem } from '@/types/market'
 
 const navItems = [
   { id: 'dashboard', label: '대시보드', subtitle: '국내장 예열과 포트폴리오 영향', icon: LayoutDashboard },
@@ -382,59 +384,214 @@ function MarketRadarPage() {
   )
 }
 
+type NewsApiResponse = {
+  configured: boolean
+  fetchedAt?: string
+  items: LiveNewsItem[]
+  message?: string
+}
+
+function formatNewsTime(value: string) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '시간 확인'
+
+  return date.toLocaleString('ko-KR', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
 function NewsPage() {
+  const [activeKeyword, setActiveKeyword] = useState('전체')
+  const [liveNews, setLiveNews] = useState<LiveNewsItem[]>([])
+  const [newsStatus, setNewsStatus] = useState<'idle' | 'loading' | 'ready' | 'fallback' | 'error'>('idle')
+  const [newsMessage, setNewsMessage] = useState('')
+
+  const loadLiveNews = useCallback(async (signal?: AbortSignal) => {
+    setNewsStatus('loading')
+    setNewsMessage('')
+
+    try {
+      const params = new URLSearchParams({
+        keywords: newsKeywords.join(','),
+        display: '3',
+      })
+      const response = await fetch(`/api/news?${params.toString()}`, { signal })
+      const contentType = response.headers.get('content-type') ?? ''
+
+      if (!response.ok || !contentType.includes('application/json')) {
+        throw new Error('네이버 뉴스 API 응답을 확인할 수 없습니다.')
+      }
+
+      const payload = (await response.json()) as NewsApiResponse
+
+      if (!payload.configured) {
+        setLiveNews([])
+        setNewsStatus('fallback')
+        setNewsMessage(payload.message ?? '네이버 뉴스 API 환경변수 설정이 필요합니다.')
+        return
+      }
+
+      setLiveNews(payload.items)
+      setNewsStatus(payload.items.length > 0 ? 'ready' : 'fallback')
+      setNewsMessage(payload.items.length > 0 ? `최근 수집 ${formatNewsTime(payload.fetchedAt ?? '')}` : '수집된 뉴스가 없습니다.')
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+
+      setLiveNews([])
+      setNewsStatus('error')
+      setNewsMessage(error instanceof Error ? error.message : '뉴스를 불러오지 못했습니다.')
+    }
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void loadLiveNews(controller.signal)
+
+    return () => controller.abort()
+  }, [loadLiveNews])
+
+  const keywordFilters = ['전체', ...newsKeywords]
+  const visibleLiveNews = activeKeyword === '전체' ? liveNews : liveNews.filter((item) => item.keyword === activeKeyword)
+  const hasLiveNews = liveNews.length > 0
+  const highImportanceCount = hasLiveNews
+    ? liveNews.filter((item) => item.importance === 'high').length
+    : keyIssues.filter((issue) => issue.importance === 'high').length
+  const linkedNewsCount = hasLiveNews
+    ? liveNews.filter((item) => holdings.some((holding) => item.relatedSymbols.includes(holding.symbol))).length
+    : keyIssues.filter((issue) => holdings.some((holding) => issue.relatedSymbols.includes(holding.symbol))).length
+  const statusLabel =
+    newsStatus === 'ready'
+      ? '네이버 API 연결'
+      : newsStatus === 'loading'
+        ? '불러오는 중'
+        : newsStatus === 'error'
+          ? '연결 오류'
+          : '모의 데이터'
+
   return (
     <PageGrid>
       <section className="grid gap-4 md:grid-cols-3">
-        <MetricCard label="핵심 이슈" value={`${keyIssues.length}건`} detail="오늘 수집" />
-        <MetricCard label="높은 중요도" value={`${keyIssues.filter((issue) => issue.importance === 'high').length}건`} detail="우선 확인" tone="warning" />
-        <MetricCard label="보유종목 연결" value={`${keyIssues.filter((issue) => holdings.some((holding) => issue.relatedSymbols.includes(holding.symbol))).length}건`} detail="포트폴리오 영향" tone="positive" />
+        <MetricCard label="뉴스 피드" value={`${hasLiveNews ? liveNews.length : keyIssues.length}건`} detail={statusLabel} tone={newsStatus === 'error' ? 'negative' : hasLiveNews ? 'positive' : 'neutral'} />
+        <MetricCard label="높은 중요도" value={`${highImportanceCount}건`} detail="우선 확인" tone="warning" />
+        <MetricCard label="보유종목 연결" value={`${linkedNewsCount}건`} detail="포트폴리오 영향" tone="positive" />
       </section>
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
         <Card>
           <CardHeader>
-            <CardTitle>이슈 피드</CardTitle>
-            <CardDescription>종목, 섹터, 영향 방향을 함께 표시</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {keyIssues.map((issue) => (
-              <div key={issue.id} className="rounded-md border border-border bg-muted/15 p-4">
-                <div className="mb-3 flex flex-wrap items-center gap-2">
-                  <Badge variant="neutral">{issue.time}</Badge>
-                  <Badge variant={directionVariant(issue.direction)}>{directionLabel[issue.direction]}</Badge>
-                  <Badge variant={issue.importance === 'high' ? 'warning' : 'neutral'}>중요도 {importanceLabel[issue.importance]}</Badge>
-                  <Badge variant="secondary">신뢰도 {confidenceLabel[issue.confidence]}</Badge>
-                </div>
-                <div className="text-sm font-semibold">{issue.title}</div>
-                <div className="mt-2 text-sm leading-6 text-muted-foreground">{issue.expectedImpact}</div>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {[...issue.relatedSymbols, ...issue.sectors].map((tag) => (
-                    <Badge key={tag} variant="secondary">
-                      {tag}
-                    </Badge>
-                  ))}
-                </div>
+            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+              <div>
+                <CardTitle>네이버 뉴스 피드</CardTitle>
+                <CardDescription>키워드별 최신 뉴스와 예상 영향을 함께 표시</CardDescription>
               </div>
-            ))}
+              <Button type="button" variant="outline" size="sm" onClick={() => void loadLiveNews()} disabled={newsStatus === 'loading'}>
+                <RefreshCw className={cn('size-4', newsStatus === 'loading' && 'animate-spin')} />
+                새로고침
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap gap-2">
+              {keywordFilters.map((keyword) => (
+                <Button
+                  key={keyword}
+                  type="button"
+                  size="sm"
+                  variant={activeKeyword === keyword ? 'secondary' : 'ghost'}
+                  onClick={() => setActiveKeyword(keyword)}
+                >
+                  {keyword}
+                </Button>
+              ))}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant={newsStatus === 'ready' ? 'positive' : newsStatus === 'error' ? 'negative' : 'neutral'}>
+                {statusLabel}
+              </Badge>
+              {newsMessage ? <span className="text-xs text-muted-foreground">{newsMessage}</span> : null}
+            </div>
+
+            {hasLiveNews ? (
+              <div className="space-y-3">
+                {(visibleLiveNews.length > 0 ? visibleLiveNews : liveNews).map((item) => (
+                  <a
+                    key={item.id}
+                    href={item.link}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block rounded-md border border-border bg-muted/15 p-4 transition hover:border-primary/45 hover:bg-muted/25"
+                  >
+                    <div className="mb-3 flex flex-wrap items-center gap-2">
+                      <Badge variant="neutral">{formatNewsTime(item.publishedAt)}</Badge>
+                      <Badge variant={directionVariant(item.direction)}>{directionLabel[item.direction]}</Badge>
+                      <Badge variant={item.importance === 'high' ? 'warning' : 'neutral'}>중요도 {importanceLabel[item.importance]}</Badge>
+                      <Badge variant="secondary">{item.keyword}</Badge>
+                      <Badge variant="secondary">{item.source}</Badge>
+                    </div>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="text-sm font-semibold leading-6">{item.title}</div>
+                      <ExternalLink className="mt-1 size-4 shrink-0 text-muted-foreground" />
+                    </div>
+                    <div className="mt-2 line-clamp-2 text-sm leading-6 text-muted-foreground">{item.description}</div>
+                    <div className="mt-2 text-sm leading-6 text-foreground/85">{item.expectedImpact}</div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {[...item.relatedSymbols, ...item.sectors].map((tag) => (
+                        <Badge key={tag} variant="secondary">
+                          {tag}
+                        </Badge>
+                      ))}
+                    </div>
+                  </a>
+                ))}
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {keyIssues.map((issue) => (
+                  <div key={issue.id} className="rounded-md border border-border bg-muted/15 p-4">
+                    <div className="mb-3 flex flex-wrap items-center gap-2">
+                      <Badge variant="neutral">{issue.time}</Badge>
+                      <Badge variant={directionVariant(issue.direction)}>{directionLabel[issue.direction]}</Badge>
+                      <Badge variant={issue.importance === 'high' ? 'warning' : 'neutral'}>중요도 {importanceLabel[issue.importance]}</Badge>
+                      <Badge variant="secondary">신뢰도 {confidenceLabel[issue.confidence]}</Badge>
+                    </div>
+                    <div className="text-sm font-semibold">{issue.title}</div>
+                    <div className="mt-2 text-sm leading-6 text-muted-foreground">{issue.expectedImpact}</div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {[...issue.relatedSymbols, ...issue.sectors].map((tag) => (
+                        <Badge key={tag} variant="secondary">
+                          {tag}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader>
             <CardTitle>영향 분포</CardTitle>
-            <CardDescription>오늘 이슈 방향성</CardDescription>
+            <CardDescription>오늘 뉴스와 이슈 방향성</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             {(['positive', 'negative', 'mixed'] as Direction[]).map((direction) => {
-              const count = keyIssues.filter((issue) => issue.direction === direction).length
+              const count = hasLiveNews
+                ? liveNews.filter((item) => item.direction === direction).length
+                : keyIssues.filter((issue) => issue.direction === direction).length
+              const total = hasLiveNews ? liveNews.length : keyIssues.length
               return (
                 <div key={direction} className="space-y-2">
                   <div className="flex items-center justify-between text-sm">
                     <span>{directionLabel[direction]}</span>
                     <Badge variant={directionVariant(direction)}>{count}건</Badge>
                   </div>
-                  <Progress value={(count / keyIssues.length) * 100} />
+                  <Progress value={total > 0 ? (count / total) * 100 : 0} />
                 </div>
               )
             })}
