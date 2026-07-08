@@ -11,7 +11,7 @@ const DEFAULT_QUOTES = [
   { symbol: 'SOX', sourceSymbol: '^SOX', name: '필라델피아 반도체', market: 'US', type: 'indicator' },
   { symbol: 'VIX', sourceSymbol: '^VIX', name: '변동성 지수', market: 'US', type: 'indicator' },
   { symbol: 'DXY', sourceSymbol: 'DX-Y.NYB', name: '달러 인덱스', market: 'US', type: 'indicator' },
-  { symbol: 'US10Y', sourceSymbol: '^TNX', name: '미국 10년물 금리', market: 'US', type: 'indicator', valueScale: 0.1 },
+  { symbol: 'US10Y', sourceSymbol: '^TNX', name: '미국 10년물 금리', market: 'US', type: 'indicator' },
   { symbol: 'USD/KRW', sourceSymbol: 'KRW=X', name: '달러/원', market: 'KR', type: 'indicator' },
 ]
 
