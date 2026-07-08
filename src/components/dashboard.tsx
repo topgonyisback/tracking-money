@@ -67,6 +67,7 @@ import type {
   DataReliability,
   Direction,
   DisclosureItem,
+  ForecastReview,
   Holding,
   InvestmentJournal,
   LiveNewsItem,
@@ -241,6 +242,7 @@ type DashboardSnapshot = {
   portfolioPlaybook: PortfolioPlaybook
   morningBrief: MorningBrief
   dataReliability: DataReliability
+  forecastReview: ForecastReview
   actionQueue: ActionQueueItem[]
   journal: InvestmentJournal
 }
@@ -248,6 +250,8 @@ type DashboardSnapshot = {
 const storageKey = 'tracking-money-dashboard-v1'
 
 const indicatorSymbols = [
+  'KOSPI',
+  'KOSDAQ',
   'NQ=F',
   'ES=F',
   'SOX',
@@ -260,6 +264,8 @@ const indicatorSymbols = [
 const inverseIndicators = new Set(['VIX', 'DXY', 'US10Y', 'USD/KRW'])
 
 const liveIndicatorNotes: Record<string, string> = {
+  KOSPI: '국내 대형주 실제 마감 흐름과 예측 검증 기준',
+  KOSDAQ: '성장주와 개인 수급 체감 흐름 확인',
   'NQ=F': '국내 성장주와 코스닥 심리에 선행 반영',
   'ES=F': '미국 전체 위험선호의 기본 온도',
   SOX: '삼성전자와 SK하이닉스에 가장 직접적인 선행 신호',
@@ -2468,6 +2474,179 @@ function buildDataReliability({
   }
 }
 
+function directionFromForecastScore(score: number): Direction {
+  if (score >= 58) return 'positive'
+  if (score <= 43) return 'negative'
+  return 'neutral'
+}
+
+function directionFromMarketChange(change: number): Direction {
+  if (change >= 0.35) return 'positive'
+  if (change <= -0.35) return 'negative'
+  return 'neutral'
+}
+
+function directionReviewLabel(direction: Direction) {
+  if (direction === 'positive') return '상승 우위'
+  if (direction === 'negative') return '하락 압력'
+  if (direction === 'mixed') return '혼재'
+  return '보합권'
+}
+
+function forecastReviewTone(score: number): ForecastReview['tone'] {
+  if (score >= 78) return 'positive'
+  if (score >= 52) return 'warning'
+  return 'negative'
+}
+
+function forecastReviewLabel(score: number) {
+  if (score >= 82) return '예측 적중'
+  if (score >= 62) return '부분 적중'
+  if (score >= 42) return '방향 재점검'
+  return '예측 빗나감'
+}
+
+function weightedHoldingChange(holdingsData: Holding[]) {
+  const totalWeight = holdingsData.reduce((sum, holding) => sum + Math.max(0, holding.portfolioWeight), 0)
+  if (totalWeight <= 0) return 0
+  return holdingsData.reduce((sum, holding) => sum + holding.dayChange * Math.max(0, holding.portfolioWeight), 0) / totalWeight
+}
+
+function buildForecastReview({
+  forecast,
+  holdingsData,
+  indicators,
+  quoteMap,
+  dataReliability,
+  actionQueue,
+  journal,
+}: {
+  forecast: MarketForecast
+  holdingsData: Holding[]
+  indicators: MarketIndicator[]
+  quoteMap: Map<string, MarketQuote>
+  dataReliability: DataReliability
+  actionQueue: ActionQueueItem[]
+  journal: InvestmentJournal
+}): ForecastReview {
+  const generatedAt = new Date().toISOString()
+  const kospiQuote = getQuote(quoteMap, 'KOSPI')
+  const kosdaqQuote = getQuote(quoteMap, 'KOSDAQ')
+  const kospiChange = kospiQuote?.changePercent ?? null
+  const holdingChange = weightedHoldingChange(holdingsData)
+  const actualChange = kospiChange ?? holdingChange
+  const actualSource = kospiChange !== null ? 'KOSPI' : '보유종목 가중 평균'
+  const predictedDirection = directionFromForecastScore(forecast.baseScore)
+  const actualDirection = directionFromMarketChange(actualChange)
+  const directionMatched =
+    predictedDirection === actualDirection ||
+    (predictedDirection === 'neutral' && Math.abs(actualChange) < 0.55) ||
+    (actualDirection === 'neutral' && forecast.baseScore >= 45 && forecast.baseScore <= 58)
+  const oppositeDirection =
+    (predictedDirection === 'positive' && actualDirection === 'negative') ||
+    (predictedDirection === 'negative' && actualDirection === 'positive')
+  const completedCount = journal.completedActionIds.filter((id) => actionQueue.some((item) => item.id === id)).length
+  const actionCompletion = actionQueue.length > 0 ? Math.round((completedCount / actionQueue.length) * 100) : 100
+  const reliabilityAdjustment = dataReliability.score >= 78 ? 8 : dataReliability.score < 45 ? -10 : 0
+  const score = clamp(
+    (directionMatched ? 74 : oppositeDirection ? 32 : 54) +
+      (Math.abs(actualChange) <= 0.25 && predictedDirection === 'neutral' ? 10 : 0) +
+      Math.round((actionCompletion - 50) * 0.12) +
+      reliabilityAdjustment,
+    0,
+    100,
+  )
+  const topImpact = forecast.impacts[0]
+  const topRisk = forecast.impacts.find((item) => item.impact < 0)
+  const topPositive = forecast.impacts.find((item) => item.impact > 0)
+  const strongestIndicator = [...indicators]
+    .filter((indicator) => indicator.symbol !== 'KOSPI' && indicator.symbol !== 'KOSDAQ')
+    .sort((a, b) => Math.abs(b.change) - Math.abs(a.change))[0]
+  const strongestHolding = [...holdingsData].sort((a, b) => b.dayChange - a.dayChange)[0]
+  const weakestHolding = [...holdingsData].sort((a, b) => a.dayChange - b.dayChange)[0]
+  const kosdaqText = kosdaqQuote?.changePercent !== null && kosdaqQuote?.changePercent !== undefined ? formatChange(kosdaqQuote.changePercent) : '수집 대기'
+  const summary = directionMatched
+    ? `${forecast.openingBias} 예측과 ${actualSource} 흐름이 대체로 맞았습니다.`
+    : oppositeDirection
+      ? `${forecast.openingBias} 예측과 ${actualSource} 흐름이 반대로 움직였습니다. 핵심 변수 재점검이 필요합니다.`
+      : `${forecast.openingBias} 예측은 일부만 맞았습니다. 실제 움직임은 보합권에 가까웠습니다.`
+  const signals: ForecastReview['signals'] = [
+    {
+      id: 'predicted-direction',
+      label: '예측 방향',
+      value: directionReviewLabel(predictedDirection),
+      tone: directionVariant(predictedDirection),
+      summary: `방향점수 ${forecast.baseScore}/100, 예상 출발 ${forecast.expectedOpenRange}`,
+    },
+    {
+      id: 'actual-direction',
+      label: actualSource,
+      value: formatChange(actualChange),
+      tone: directionVariant(actualDirection),
+      summary: kospiQuote ? `KOSPI ${formatIndicatorValue('KOSPI', kospiQuote.price)} 기준` : 'KOSPI 수집 전에는 보유종목 흐름으로 대체합니다.',
+    },
+    {
+      id: 'kosdaq',
+      label: 'KOSDAQ',
+      value: kosdaqText,
+      tone: kosdaqQuote?.changePercent === null || kosdaqQuote?.changePercent === undefined ? 'neutral' : directionVariant(directionFromMarketChange(kosdaqQuote.changePercent)),
+      summary: '성장주 체감 흐름과 관심종목 판단 보조 기준입니다.',
+    },
+    {
+      id: 'portfolio',
+      label: '보유종목 체감',
+      value: formatChange(holdingChange),
+      tone: directionVariant(directionFromMarketChange(holdingChange)),
+      summary: strongestHolding && weakestHolding ? `강세 ${strongestHolding.name} ${formatChange(strongestHolding.dayChange)} / 약세 ${weakestHolding.name} ${formatChange(weakestHolding.dayChange)}` : '보유종목 수집 대기',
+    },
+    {
+      id: 'leading-indicator',
+      label: '주요 선행지표',
+      value: strongestIndicator ? `${strongestIndicator.symbol} ${formatChange(strongestIndicator.change)}` : '수집 대기',
+      tone: strongestIndicator ? directionVariant(strongestIndicator.direction) : 'neutral',
+      summary: strongestIndicator?.note ?? '야간 지표 수집 대기',
+    },
+    {
+      id: 'action-completion',
+      label: '액션 실행',
+      value: `${completedCount}/${actionQueue.length}`,
+      tone: actionCompletion >= 70 ? 'positive' : actionCompletion > 0 ? 'warning' : 'neutral',
+      summary: '체크리스트 완료율은 예측보다 실행 품질을 보여줍니다.',
+    },
+  ]
+  const reviewLines = [
+    `[${getKstDateKey()} 예측 검증]`,
+    `판정: ${forecastReviewLabel(score)} (${score}/100)`,
+    `예측: ${forecast.openingBias} / 실제: ${actualSource} ${formatChange(actualChange)}`,
+    `데이터 신뢰도: ${dataReliability.score}/100 (${dataReliability.label})`,
+    topImpact ? `핵심 변수: ${topImpact.label} (${topImpact.impact > 0 ? '+' : ''}${topImpact.impact}점) - ${topImpact.reason}` : null,
+    topPositive ? `맞은 근거: ${topPositive.label} 유지 여부를 확인` : null,
+    topRisk ? `놓치기 쉬운 리스크: ${topRisk.label} 확대 여부 확인` : null,
+    strongestHolding && weakestHolding ? `보유 체감: 강세 ${strongestHolding.name} ${formatChange(strongestHolding.dayChange)}, 약세 ${weakestHolding.name} ${formatChange(weakestHolding.dayChange)}` : null,
+    `액션 실행: ${completedCount}/${actionQueue.length}개 완료`,
+    directionMatched ? '다음 개선: 같은 조건이 반복되면 포지션 크기를 조금 더 명확히 정한다.' : '다음 개선: 예측과 반대로 움직인 지표/뉴스/수급 변수를 장전 체크리스트에 추가한다.',
+  ].filter((line): line is string => Boolean(line))
+
+  return {
+    generatedAt,
+    score,
+    label: forecastReviewLabel(score),
+    tone: forecastReviewTone(score),
+    predictedDirection,
+    actualDirection,
+    predictedLabel: directionReviewLabel(predictedDirection),
+    actualLabel: `${actualSource} ${formatChange(actualChange)}`,
+    summary,
+    signals,
+    reviewDraft: reviewLines.join('\n'),
+    nextQuestions: [
+      directionMatched ? '오늘 맞았던 핵심 변수는 내일도 반복 가능한 조건인가?' : '예측과 반대로 움직인 가장 큰 원인은 지표, 뉴스, 수급 중 무엇인가?',
+      '개장 30분 판단과 종가 결과 사이에 달라진 변수가 있었나?',
+      '체크리스트에서 실제 매매 결정에 도움 된 항목과 불필요한 항목은 무엇인가?',
+    ],
+  }
+}
+
 function buildDashboardSnapshot({
   baseHoldings,
   baseWatchlist,
@@ -2585,6 +2764,15 @@ function buildDashboardSnapshot({
     marketStatusData: marketStatusView,
     dataReliability,
   })
+  const forecastReview = buildForecastReview({
+    forecast,
+    holdingsData: liveHoldings,
+    indicators: liveIndicators,
+    quoteMap,
+    dataReliability,
+    actionQueue,
+    journal,
+  })
 
   return {
     holdings: liveHoldings,
@@ -2623,6 +2811,7 @@ function buildDashboardSnapshot({
     portfolioPlaybook,
     morningBrief,
     dataReliability,
+    forecastReview,
     actionQueue,
     journal,
   }
@@ -2888,6 +3077,105 @@ function MorningBriefPanel({ brief, compact = false }: { brief: MorningBrief; co
             ))}
           </div>
         ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+function ForecastReviewPanel({
+  review,
+  onApplyReview,
+}: {
+  review: ForecastReview
+  onApplyReview?: () => void
+}) {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
+
+  function copyReviewFallback(text: string) {
+    const textArea = document.createElement('textarea')
+    textArea.value = text
+    textArea.setAttribute('readonly', '')
+    textArea.style.position = 'fixed'
+    textArea.style.left = '-9999px'
+    textArea.style.top = '0'
+    document.body.appendChild(textArea)
+    textArea.focus()
+    textArea.select()
+    textArea.setSelectionRange(0, textArea.value.length)
+    const copied = document.execCommand('copy')
+    textArea.remove()
+    if (!copied) throw new Error('fallback copy failed')
+  }
+
+  async function copyReview() {
+    try {
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable')
+        await navigator.clipboard.writeText(review.reviewDraft)
+      } catch {
+        copyReviewFallback(review.reviewDraft)
+      }
+      setCopyState('copied')
+      window.setTimeout(() => setCopyState('idle'), 1800)
+    } catch {
+      setCopyState('error')
+      window.setTimeout(() => setCopyState('idle'), 2400)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>예측 검증 리포트</CardTitle>
+            <CardDescription>{review.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={review.tone}>{review.label}</Badge>
+            <Badge variant="secondary">{review.score}/100</Badge>
+            <Button type="button" variant="outline" size="sm" onClick={() => void copyReview()}>
+              {copyState === 'copied' ? <Check className="size-4" /> : <Copy className="size-4" />}
+              {copyState === 'copied' ? '복사됨' : copyState === 'error' ? '복사 실패' : '초안 복사'}
+            </Button>
+            {onApplyReview ? (
+              <Button type="button" size="sm" onClick={onApplyReview}>
+                <Save className="size-4" />
+                장후 리뷰에 적용
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+          {review.signals.map((signal) => (
+            <div key={signal.id} className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="mb-2 flex items-start justify-between gap-2">
+                <div className="text-sm font-semibold">{signal.label}</div>
+                <Badge variant={signal.tone}>{signal.value}</Badge>
+              </div>
+              <div className="text-xs leading-5 text-muted-foreground">{signal.summary}</div>
+            </div>
+          ))}
+        </div>
+
+        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="rounded-md border border-border bg-background/70 p-4">
+            <div className="mb-2 text-sm font-semibold">장후 리뷰 초안</div>
+            <pre className="whitespace-pre-wrap font-sans text-sm leading-7 text-muted-foreground">{review.reviewDraft}</pre>
+          </div>
+          <div className="rounded-md border border-border bg-background/70 p-4">
+            <div className="mb-2 text-sm font-semibold">내일 개선 질문</div>
+            <div className="space-y-2">
+              {review.nextQuestions.map((question) => (
+                <div key={question} className="text-sm leading-6 text-muted-foreground">
+                  {question}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </CardContent>
     </Card>
   )
@@ -4520,6 +4808,7 @@ function NotesPage({
   biasScoreData,
   marketStatusData,
   morningBrief,
+  forecastReview,
   onUpdateJournal,
   onToggleJournalAction,
   onResetJournal,
@@ -4529,6 +4818,7 @@ function NotesPage({
   biasScoreData: BiasScore
   marketStatusData: MarketStatusView
   morningBrief: MorningBrief
+  forecastReview: ForecastReview
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
   onResetJournal: () => void
@@ -4553,6 +4843,11 @@ function NotesPage({
       />
 
       <MorningBriefPanel brief={morningBrief} />
+
+      <ForecastReviewPanel
+        review={forecastReview}
+        onApplyReview={() => onUpdateJournal({ afterMarketReview: forecastReview.reviewDraft })}
+      />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
         <Card>
@@ -5508,6 +5803,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         biasScoreData={snapshot.biasScore}
         marketStatusData={snapshot.marketStatus}
         morningBrief={snapshot.morningBrief}
+        forecastReview={snapshot.forecastReview}
         onUpdateJournal={actions.onUpdateJournal}
         onToggleJournalAction={actions.onToggleJournalAction}
         onResetJournal={actions.onResetJournal}

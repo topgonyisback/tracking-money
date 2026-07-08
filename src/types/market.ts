@@ -262,6 +262,29 @@ export type DataReliability = {
   nextActions: string[]
 }
 
+export type ForecastReviewSignal = {
+  id: string
+  label: string
+  value: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  summary: string
+}
+
+export type ForecastReview = {
+  generatedAt: string
+  score: number
+  label: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  predictedDirection: Direction
+  actualDirection: Direction
+  predictedLabel: string
+  actualLabel: string
+  summary: string
+  signals: ForecastReviewSignal[]
+  reviewDraft: string
+  nextQuestions: string[]
+}
+
 export type InvestmentJournal = {
   date: string
   preMarketPlan: string

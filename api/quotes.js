@@ -6,6 +6,8 @@ const DEFAULT_QUOTES = [
   { symbol: 'AAPL', sourceSymbol: 'AAPL', name: 'Apple', market: 'US', type: 'stock' },
   { symbol: 'TSLA', sourceSymbol: 'TSLA', name: 'Tesla', market: 'US', type: 'stock' },
   { symbol: 'NVDA', sourceSymbol: 'NVDA', name: 'NVIDIA', market: 'US', type: 'stock' },
+  { symbol: 'KOSPI', sourceSymbol: '^KS11', name: 'KOSPI', market: 'KR', type: 'indicator' },
+  { symbol: 'KOSDAQ', sourceSymbol: '^KQ11', name: 'KOSDAQ', market: 'KR', type: 'indicator' },
   { symbol: 'NQ=F', sourceSymbol: 'NQ=F', name: '나스닥100 선물', market: 'US', type: 'indicator' },
   { symbol: 'ES=F', sourceSymbol: 'ES=F', name: 'S&P500 선물', market: 'US', type: 'indicator' },
   { symbol: 'SOX', sourceSymbol: '^SOX', name: '필라델피아 반도체', market: 'US', type: 'indicator' },
