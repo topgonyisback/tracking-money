@@ -187,6 +187,42 @@ export type ForecastSensitivity = {
   transitionChecklist: string[]
 }
 
+export type PreMarketCommandStep = {
+  id: string
+  order: number
+  timeLabel: string
+  title: string
+  priority: 'critical' | 'high' | 'medium' | 'low'
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  trigger: string
+  action: string
+  evidence: string
+  relatedSymbols: string[]
+}
+
+export type PreMarketCommandMetric = {
+  label: string
+  value: string
+  detail: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+}
+
+export type PreMarketCommandCenter = {
+  generatedAt: string
+  mode: 'risk-on' | 'balanced' | 'defensive'
+  modeLabel: string
+  gateLabel: string
+  gateTone: 'positive' | 'negative' | 'warning' | 'neutral'
+  summary: string
+  primaryDecision: string
+  metrics: PreMarketCommandMetric[]
+  steps: PreMarketCommandStep[]
+  goConditions: string[]
+  stopConditions: string[]
+  focusSymbols: string[]
+  copyText: string
+}
+
 export type CalendarEvent = {
   id: string
   date: string

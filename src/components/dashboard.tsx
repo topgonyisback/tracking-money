@@ -81,6 +81,7 @@ import type {
   MorningBrief,
   NewsImpactBoard,
   PortfolioPlaybook,
+  PreMarketCommandCenter,
   SignalAudit,
   SignalAuditSource,
   TriggeredAlert,
@@ -258,6 +259,7 @@ type DashboardSnapshot = {
   forecastSensitivity: ForecastSensitivity
   forecastReview: ForecastReview
   executionPlan: ExecutionPlan
+  preMarketCommand: PreMarketCommandCenter
   actionQueue: ActionQueueItem[]
   journal: InvestmentJournal
 }
@@ -2814,6 +2816,175 @@ function buildMorningBrief({
   }
 }
 
+function buildPreMarketCommandCenter({
+  forecast,
+  forecastSensitivity,
+  koreaMarketBridge,
+  newsImpactBoard,
+  portfolioPlaybook,
+  actionQueue,
+  executionPlan,
+  dataReliability,
+  marketStatusData,
+}: {
+  forecast: MarketForecast
+  forecastSensitivity: ForecastSensitivity
+  koreaMarketBridge: KoreaMarketBridge
+  newsImpactBoard: NewsImpactBoard
+  portfolioPlaybook: PortfolioPlaybook
+  actionQueue: ActionQueueItem[]
+  executionPlan: ExecutionPlan
+  dataReliability: DataReliability
+  marketStatusData: MarketStatusView
+}): PreMarketCommandCenter {
+  const mode: PreMarketCommandCenter['mode'] =
+    forecast.baseScore >= 62 && koreaMarketBridge.riskLevel === 'low'
+      ? 'risk-on'
+      : forecast.baseScore <= 43 || portfolioPlaybook.stance === 'defensive' || koreaMarketBridge.riskLevel === 'high'
+        ? 'defensive'
+        : 'balanced'
+  const gateTone: PreMarketCommandCenter['gateTone'] = mode === 'risk-on' ? 'positive' : mode === 'defensive' ? 'negative' : 'warning'
+  const modeLabel = mode === 'risk-on' ? '선별 공격' : mode === 'defensive' ? '방어 우선' : '확인 후 진입'
+  const topAction = actionQueue[0]
+  const topExecution = executionPlan.items[0]
+  const topNews = newsImpactBoard.items[0]
+  const topBridgeRisk = koreaMarketBridge.signals.find((signal) => signal.impact < 0) ?? koreaMarketBridge.signals[0]
+  const primaryDecision =
+    mode === 'risk-on'
+      ? '첫 30분 상대강도가 확인된 종목만 분할 접근'
+      : mode === 'defensive'
+        ? '신규 매수보다 고비중 종목 리스크와 환율·선물 확인 우선'
+        : '시초가 추격 금지, 선행지표와 대장주 반응을 확인한 뒤 판단'
+  const metrics: PreMarketCommandCenter['metrics'] = [
+    {
+      label: '방향점수',
+      value: `${forecast.baseScore}/100`,
+      detail: forecast.openingBias,
+      tone: forecast.baseScore >= 62 ? 'positive' : forecast.baseScore <= 43 ? 'negative' : 'warning',
+    },
+    {
+      label: '브리지',
+      value: `${koreaMarketBridge.score}/100`,
+      detail: koreaMarketBridge.label,
+      tone: koreaMarketBridge.tone,
+    },
+    {
+      label: '민감도',
+      value: forecastSensitivity.upsideGap === 0 ? '상방권' : `+${forecastSensitivity.upsideGap}`,
+      detail: forecastSensitivity.downsideGap === 0 ? '방어 전환' : `방어까지 -${forecastSensitivity.downsideGap}`,
+      tone: forecastSensitivity.downsideGap === 0 ? 'negative' : forecastSensitivity.upsideGap === 0 ? 'positive' : 'warning',
+    },
+    {
+      label: '데이터',
+      value: `${dataReliability.score}/100`,
+      detail: dataReliability.label,
+      tone: dataReliability.tone,
+    },
+  ]
+  const steps: PreMarketCommandCenter['steps'] = [
+    {
+      id: 'market-temperature',
+      order: 1,
+      timeLabel: '08:45',
+      title: '미국 선물·환율 온도 확인',
+      priority: koreaMarketBridge.riskLevel === 'high' ? 'critical' : 'high',
+      tone: koreaMarketBridge.tone,
+      trigger: `${forecastSensitivity.topUpsideFactor} 개선 / ${forecastSensitivity.topDownsideFactor} 악화 여부`,
+      action: koreaMarketBridge.openBias,
+      evidence: `${marketStatusData.usdKrw} · VIX ${marketStatusData.vix}`,
+      relatedSymbols: ['NQ=F', 'SOX', 'USD/KRW', 'VIX'],
+    },
+    {
+      id: 'leader-check',
+      order: 2,
+      timeLabel: '09:00',
+      title: '대장주 상대강도 확인',
+      priority: topNews && Math.abs(topNews.score) >= 45 ? 'high' : 'medium',
+      tone: topNews?.tone ?? 'neutral',
+      trigger: topNews ? `${topNews.symbol} 뉴스 점수 ${topNews.score > 0 ? '+' : ''}${topNews.score}` : '뉴스 영향 종목 확인',
+      action: topNews?.suggestedAction ?? '삼성전자, SK하이닉스, NAVER, 관심종목의 지수 대비 강도를 확인합니다.',
+      evidence: topNews ? topNews.topHeadline : newsImpactBoard.summary,
+      relatedSymbols: topNews ? [topNews.symbol, ...topNews.catalysts].slice(0, 6) : newsImpactBoard.hotSymbols,
+    },
+    {
+      id: 'risk-gate',
+      order: 3,
+      timeLabel: '09:15',
+      title: '매수/방어 게이트 결정',
+      priority: mode === 'defensive' ? 'critical' : mode === 'risk-on' ? 'medium' : 'high',
+      tone: gateTone,
+      trigger: primaryDecision,
+      action: topAction?.suggestedAction ?? primaryDecision,
+      evidence: topAction?.evidence ?? forecast.summary,
+      relatedSymbols: topAction?.relatedSymbols.slice(0, 6) ?? forecastSensitivity.factors.slice(0, 4).map((factor) => factor.symbol),
+    },
+    {
+      id: 'execution-filter',
+      order: 4,
+      timeLabel: '09:30',
+      title: '실행 후보 필터링',
+      priority: topExecution?.priority ?? 'medium',
+      tone: topExecution?.side === 'buy' ? 'positive' : topExecution?.side === 'sell' ? 'warning' : 'neutral',
+      trigger: topExecution ? `${topExecution.symbol} ${executionSideLabel(topExecution.side)} 조건` : '실행 후보 확인',
+      action: topExecution ? `${topExecution.quantityGuide}, ${topExecution.priceBand}` : '실행 후보가 없으면 관찰만 유지합니다.',
+      evidence: topExecution?.reason ?? executionPlan.summary,
+      relatedSymbols: topExecution ? [topExecution.symbol, ...topExecution.relatedSignals].slice(0, 6) : executionPlan.items.slice(0, 4).map((item) => item.symbol),
+    },
+  ]
+  const goConditions = uniqueBriefItems(
+    [
+      mode === 'risk-on' ? '방향점수와 브리지가 모두 상방권 유지' : null,
+      `상방 전환: ${forecastSensitivity.transitionChecklist[0]?.replace('상방 전환: ', '') ?? 'NQ/SOX 유지와 환율 안정'}`,
+      topNews && topNews.score > 0 ? `${topNews.symbol} 우호 뉴스에 거래량 동반` : null,
+      topExecution ? `${topExecution.symbol} ${topExecution.trigger}` : null,
+    ],
+    4,
+  )
+  const stopConditions = uniqueBriefItems(
+    [
+      mode === 'defensive' ? '이미 방어 모드: 신규 진입은 첫 반등 확인 전까지 보류' : null,
+      `하방 전환: ${forecastSensitivity.transitionChecklist[1]?.replace('하방 전환: ', '') ?? '환율, VIX, 금리 급등'}`,
+      topBridgeRisk ? `${topBridgeRisk.symbol} 부담 확대` : null,
+      portfolioPlaybook.riskSignals[0] ? portfolioPlaybook.riskSignals[0].suggestedAction : null,
+    ],
+    4,
+  )
+  const focusSymbols = uniqueBriefItems(
+    [...steps.flatMap((step) => step.relatedSymbols), ...koreaMarketBridge.watchSymbols, ...newsImpactBoard.hotSymbols],
+    10,
+  )
+  const summary = `${modeLabel}: ${primaryDecision}. 핵심은 ${forecastSensitivity.topUpsideFactor}/${forecastSensitivity.topDownsideFactor} 전환과 ${topNews?.symbol ?? '뉴스 영향 종목'} 반응입니다.`
+  const copyText = [
+    `[장전 운전석] ${modeLabel}`,
+    summary,
+    '',
+    '[순서]',
+    ...steps.map((step) => `${step.order}. ${step.timeLabel} ${step.title} - ${step.action}`),
+    '',
+    '[진입 조건]',
+    ...goConditions.map((item) => `- ${item}`),
+    '',
+    '[보류/방어 조건]',
+    ...stopConditions.map((item) => `- ${item}`),
+  ].join('\n')
+
+  return {
+    generatedAt: new Date().toISOString(),
+    mode,
+    modeLabel,
+    gateLabel: primaryDecision,
+    gateTone,
+    summary,
+    primaryDecision,
+    metrics,
+    steps,
+    goConditions,
+    stopConditions,
+    focusSymbols,
+    copyText,
+  }
+}
+
 function alertSeverityFromDistance(distance: number): TriggeredAlert['severity'] {
   if (distance >= 8) return 'critical'
   if (distance >= 4) return 'high'
@@ -3781,6 +3952,17 @@ function buildDashboardSnapshot({
     dataReliability,
     executionPlan,
   })
+  const preMarketCommand = buildPreMarketCommandCenter({
+    forecast,
+    forecastSensitivity,
+    koreaMarketBridge,
+    newsImpactBoard,
+    portfolioPlaybook,
+    actionQueue,
+    executionPlan,
+    dataReliability,
+    marketStatusData: marketStatusView,
+  })
   const forecastReview = buildForecastReview({
     forecast,
     holdingsData: liveHoldings,
@@ -3835,6 +4017,7 @@ function buildDashboardSnapshot({
     forecastSensitivity,
     forecastReview,
     executionPlan,
+    preMarketCommand,
     actionQueue,
     journal,
   }
@@ -3861,6 +4044,144 @@ function MetricCard({
             {detail}
           </Badge>
         ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+function PreMarketCommandCenterPanel({ command, compact = false }: { command: PreMarketCommandCenter; compact?: boolean }) {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
+  const visibleSteps = compact ? command.steps.slice(0, 4) : command.steps
+
+  function copyCommandFallback(text: string) {
+    const textArea = document.createElement('textarea')
+    textArea.value = text
+    textArea.setAttribute('readonly', '')
+    textArea.style.position = 'fixed'
+    textArea.style.left = '-9999px'
+    textArea.style.top = '0'
+    document.body.appendChild(textArea)
+    textArea.focus()
+    textArea.select()
+    textArea.setSelectionRange(0, textArea.value.length)
+    const copied = document.execCommand('copy')
+    textArea.remove()
+    if (!copied) throw new Error('fallback copy failed')
+  }
+
+  async function copyCommand() {
+    try {
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable')
+        await navigator.clipboard.writeText(command.copyText)
+      } catch {
+        copyCommandFallback(command.copyText)
+      }
+      setCopyState('copied')
+      window.setTimeout(() => setCopyState('idle'), 1800)
+    } catch {
+      setCopyState('error')
+      window.setTimeout(() => setCopyState('idle'), 2400)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>장전 운전석</CardTitle>
+            <CardDescription>{command.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={command.gateTone}>{command.modeLabel}</Badge>
+            <Badge variant="secondary">{formatNewsTime(command.generatedAt)}</Badge>
+            <Button type="button" variant="outline" size="sm" onClick={() => void copyCommand()}>
+              {copyState === 'copied' ? <Check className="size-4" /> : <Copy className="size-4" />}
+              {copyState === 'copied' ? '복사됨' : copyState === 'error' ? '복사 실패' : '복사'}
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          {command.metrics.map((metric) => (
+            <div key={metric.label} className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">{metric.label}</div>
+              <div className="mt-2 text-xl font-semibold">{metric.value}</div>
+              <Badge className="mt-3" variant={metric.tone}>
+                {metric.detail}
+              </Badge>
+            </div>
+          ))}
+        </div>
+
+        <div className={cn('grid gap-4', compact ? 'xl:grid-cols-[minmax(0,1fr)_300px]' : 'xl:grid-cols-[minmax(0,1fr)_360px]')}>
+          <div className="grid gap-3">
+            {visibleSteps.map((step) => (
+              <div key={step.id} className="rounded-md border border-border bg-muted/10 p-3">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="secondary">{step.order}</Badge>
+                      <Badge variant={step.tone}>{step.timeLabel}</Badge>
+                      <Badge variant={actionPriorityVariant(step.priority)}>{actionPriorityLabel[step.priority]}</Badge>
+                      <span className="text-sm font-semibold">{step.title}</span>
+                    </div>
+                    <div className="mt-2 text-sm leading-5">{step.action}</div>
+                    {!compact ? <div className="mt-2 text-xs leading-5 text-muted-foreground">{step.trigger}</div> : null}
+                  </div>
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Clock3 className="size-4" />
+                    <span>{step.evidence}</span>
+                  </div>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  {step.relatedSymbols.map((symbol) => (
+                    <Badge key={symbol} variant="secondary">
+                      {symbol}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid content-start gap-3">
+            <div className="rounded-md border border-positive/25 bg-positive/10 p-3">
+              <div className="text-xs font-medium text-positive">진입 조건</div>
+              <div className="mt-3 grid gap-2 text-sm leading-5">
+                {command.goConditions.map((item) => (
+                  <div key={item} className="flex gap-2">
+                    <Check className="mt-0.5 size-4 shrink-0 text-positive" />
+                    <span>{item}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-md border border-negative/25 bg-negative/10 p-3">
+              <div className="text-xs font-medium text-negative">보류·방어 조건</div>
+              <div className="mt-3 grid gap-2 text-sm leading-5">
+                {command.stopConditions.map((item) => (
+                  <div key={item} className="flex gap-2">
+                    <X className="mt-0.5 size-4 shrink-0 text-negative" />
+                    <span>{item}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">집중 심볼</div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {command.focusSymbols.map((symbol) => (
+                  <Badge key={symbol} variant="neutral">
+                    {symbol}
+                  </Badge>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
       </CardContent>
     </Card>
   )
@@ -5439,6 +5760,7 @@ function ForecastPage({
   dataReliability,
   signalAudit,
   forecastSensitivity,
+  preMarketCommand,
   executionPlan,
 }: {
   forecast: MarketForecast
@@ -5447,6 +5769,7 @@ function ForecastPage({
   dataReliability: DataReliability
   signalAudit: SignalAudit
   forecastSensitivity: ForecastSensitivity
+  preMarketCommand: PreMarketCommandCenter
   executionPlan: ExecutionPlan
 }) {
   const topImpact = forecast.impacts[0]
@@ -5461,6 +5784,8 @@ function ForecastPage({
         <MetricCard label="예측 신뢰도" value={confidenceLabel[forecast.confidence]} detail="데이터 연결 기준" tone={forecast.confidence === 'high' ? 'positive' : forecast.confidence === 'medium' ? 'warning' : 'neutral'} />
         <MetricCard label="핵심 변수" value={topImpact?.label ?? '확인 대기'} detail={topImpact ? `${topImpact.impact > 0 ? '+' : ''}${topImpact.impact}점` : '데이터 대기'} tone={topImpact ? directionVariant(topImpact.direction) : 'neutral'} />
       </section>
+
+      <PreMarketCommandCenterPanel command={preMarketCommand} />
 
       <DataReliabilityPanel reliability={dataReliability} compact />
 
@@ -7623,6 +7948,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         dataReliability={snapshot.dataReliability}
         signalAudit={snapshot.signalAudit}
         forecastSensitivity={snapshot.forecastSensitivity}
+        preMarketCommand={snapshot.preMarketCommand}
         executionPlan={snapshot.executionPlan}
       />
     )
@@ -8459,6 +8785,8 @@ export function Dashboard() {
                 </CardContent>
               </Card>
             </section>
+
+            <PreMarketCommandCenterPanel command={snapshot.preMarketCommand} compact />
 
             <NewsImpactBoardPanel board={snapshot.newsImpactBoard} compact />
 
