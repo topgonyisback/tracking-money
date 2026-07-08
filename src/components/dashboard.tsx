@@ -84,6 +84,29 @@ type PageId = (typeof navItems)[number]['id']
 type QuoteStatus = 'idle' | 'loading' | 'ready' | 'partial' | 'fallback' | 'error'
 type CalendarStatus = 'idle' | 'loading' | 'ready' | 'fallback' | 'error'
 type NewsStatus = 'idle' | 'loading' | 'ready' | 'fallback' | 'error'
+type DataHealthStatus = 'idle' | 'loading' | 'ready' | 'partial' | 'fallback' | 'error' | 'missing' | 'planned' | 'local'
+
+type DataHealthService = {
+  id: string
+  name: string
+  status: DataHealthStatus
+  configured: boolean
+  source: string
+  cadence: string
+  coverage: string[]
+  summary: string
+  nextAction: string
+}
+
+type HealthApiResponse = {
+  configured: boolean
+  source: string
+  environment: string
+  fetchedAt: string
+  status: 'ready' | 'partial'
+  services: DataHealthService[]
+  message?: string
+}
 
 type QuotesApiResponse = {
   configured: boolean
@@ -214,6 +237,25 @@ const watchStatusLabel = {
   near: '근접',
   waiting: '대기',
   alert: '확인',
+}
+
+const dataHealthStatusLabel: Record<DataHealthStatus, string> = {
+  idle: '대기',
+  loading: '확인 중',
+  ready: '연결',
+  partial: '부분 연결',
+  fallback: '대체 데이터',
+  error: '오류',
+  missing: '설정 필요',
+  planned: '예정',
+  local: '로컬 저장',
+}
+
+function dataHealthVariant(status: DataHealthStatus): 'positive' | 'negative' | 'warning' | 'neutral' {
+  if (status === 'ready' || status === 'local') return 'positive'
+  if (status === 'partial' || status === 'fallback' || status === 'planned' || status === 'loading') return 'warning'
+  if (status === 'error' || status === 'missing') return 'negative'
+  return 'neutral'
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -2187,6 +2229,16 @@ function SettingsPage({
   holdingsData,
   watchlistData,
   leadingIndicatorsData,
+  quoteStatus,
+  quoteMessage,
+  liveQuoteCount,
+  fetchedAt,
+  calendarStatus,
+  calendarMessage,
+  calendarEventCount,
+  newsStatus,
+  newsMessage,
+  liveNewsCount,
   backupData,
   onImportDashboardData,
   onResetDashboardData,
@@ -2194,6 +2246,16 @@ function SettingsPage({
   holdingsData: Holding[]
   watchlistData: WatchItem[]
   leadingIndicatorsData: MarketIndicator[]
+  quoteStatus: QuoteStatus
+  quoteMessage: string
+  liveQuoteCount: number
+  fetchedAt: string | null
+  calendarStatus: CalendarStatus
+  calendarMessage: string
+  calendarEventCount: number
+  newsStatus: NewsStatus
+  newsMessage: string
+  liveNewsCount: number
   backupData: StoredDashboardData
   onImportDashboardData: (data: StoredDashboardData) => void
   onResetDashboardData: () => void
@@ -2201,6 +2263,9 @@ function SettingsPage({
   const [backupText, setBackupText] = useState('')
   const [backupMessage, setBackupMessage] = useState('현재 브라우저에 저장된 개인 데이터를 백업하거나 복원할 수 있습니다.')
   const [backupTone, setBackupTone] = useState<'positive' | 'negative' | 'neutral'>('neutral')
+  const [healthResponse, setHealthResponse] = useState<HealthApiResponse | null>(null)
+  const [healthStatus, setHealthStatus] = useState<DataHealthStatus>('idle')
+  const [healthMessage, setHealthMessage] = useState('서버 진단 대기')
   const sources = [
     { name: '네이버 뉴스 API', cost: '무료 시작', priority: '우선' },
     { name: 'Yahoo Finance chart', cost: '무료 시작', priority: '우선' },
@@ -2215,6 +2280,78 @@ function SettingsPage({
     { label: '투자노트', value: backupData.journal.date },
   ]
   const backupMessageVariant = backupTone === 'positive' ? 'positive' : backupTone === 'negative' ? 'negative' : 'neutral'
+  const runtimeSources = [
+    {
+      id: 'runtime-quotes',
+      name: '현재 시세/지수',
+      status: quoteStatus as DataHealthStatus,
+      source: '대시보드 수신 상태',
+      metric: `${liveQuoteCount}개`,
+      summary: quoteMessage,
+      detail: fetchedAt ? `마지막 수신 ${formatMarketTime(fetchedAt)}` : '아직 수신 전',
+      coverage: ['보유종목', '관심종목', '선행지표'],
+    },
+    {
+      id: 'runtime-news',
+      name: '현재 뉴스 피드',
+      status: newsStatus as DataHealthStatus,
+      source: '네이버 뉴스 수신 상태',
+      metric: `${liveNewsCount}건`,
+      summary: newsMessage,
+      detail: liveNewsCount > 0 ? '실제 뉴스 기반 영향도 반영 중' : '뉴스가 없으면 기본 이슈 카드로 대체',
+      coverage: ['키워드 뉴스', '영향도 분류', '액션 큐'],
+    },
+    {
+      id: 'runtime-calendar',
+      name: '현재 캘린더',
+      status: calendarStatus as DataHealthStatus,
+      source: '이벤트 캘린더 수신 상태',
+      metric: `${calendarEventCount}개`,
+      summary: calendarMessage,
+      detail: '장전 점검과 이벤트가 액션 큐에 반영됩니다.',
+      coverage: ['매크로', '정책', '실적 구간'],
+    },
+  ]
+
+  const loadHealth = useCallback(async (signal?: AbortSignal) => {
+    setHealthStatus('loading')
+
+    try {
+      const response = await fetch('/api/health', { signal })
+      const contentType = response.headers.get('content-type') ?? ''
+
+      if (!contentType.includes('application/json')) {
+        throw new Error('서버 진단 API 응답을 확인할 수 없습니다.')
+      }
+
+      const payload = (await response.json()) as HealthApiResponse
+
+      if (!response.ok) {
+        setHealthStatus('error')
+        setHealthMessage(payload.message ?? '서버 진단 API 호출에 실패했습니다.')
+        return
+      }
+
+      setHealthResponse(payload)
+      setHealthStatus(payload.status)
+      setHealthMessage(payload.message ?? '실데이터 연결 상태를 확인했습니다.')
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+
+      setHealthResponse(null)
+      setHealthStatus('error')
+      setHealthMessage(error instanceof Error ? error.message : '서버 진단을 불러오지 못했습니다.')
+    }
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void loadHealth(controller.signal)
+
+    return () => {
+      controller.abort()
+    }
+  }, [loadHealth])
 
   const handleBuildBackup = () => {
     setBackupText(formatDashboardBackup(backupData))
@@ -2256,6 +2393,83 @@ function SettingsPage({
 
   return (
     <PageGrid>
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+        <Card>
+          <CardHeader>
+            <CardTitle>실데이터 수신 상태</CardTitle>
+            <CardDescription>지금 화면이 실제로 받은 시세, 뉴스, 캘린더 상태</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {runtimeSources.map((source) => (
+              <div key={source.id} className="rounded-md border border-border bg-muted/15 p-4">
+                <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <div className="text-sm font-semibold">{source.name}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">{source.source}</div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Badge variant={dataHealthVariant(source.status)}>{dataHealthStatusLabel[source.status]}</Badge>
+                    <Badge variant="secondary">{source.metric}</Badge>
+                  </div>
+                </div>
+                <div className="text-sm leading-6 text-foreground/85">{source.summary}</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">{source.detail}</div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {source.coverage.map((item) => (
+                    <Badge key={item} variant="secondary">
+                      {item}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <CardTitle>서버 연결 진단</CardTitle>
+                <CardDescription>Vercel 함수와 환경변수 준비 상태</CardDescription>
+              </div>
+              <Button type="button" variant="outline" size="sm" onClick={() => void loadHealth()} disabled={healthStatus === 'loading'}>
+                <RefreshCw className={cn('size-4', healthStatus === 'loading' && 'animate-spin')} />
+                진단
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant={dataHealthVariant(healthStatus)}>{dataHealthStatusLabel[healthStatus]}</Badge>
+              {healthResponse?.environment ? <Badge variant="secondary">{healthResponse.environment}</Badge> : null}
+            </div>
+            <div className="text-sm leading-6 text-muted-foreground">{healthMessage}</div>
+            {healthResponse?.services.map((service) => (
+              <div key={service.id} className="rounded-md border border-border bg-muted/15 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium">{service.name}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">{service.source}</div>
+                  </div>
+                  <Badge variant={dataHealthVariant(service.status)}>{dataHealthStatusLabel[service.status]}</Badge>
+                </div>
+                <div className="mt-3 text-xs leading-5 text-foreground/80">{service.summary}</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">{service.nextAction}</div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Badge variant="secondary">{service.cadence}</Badge>
+                  {service.coverage.slice(0, 3).map((item) => (
+                    <Badge key={item} variant="secondary">
+                      {item}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      </section>
+
       <section className="grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
@@ -2473,6 +2687,16 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         holdingsData={snapshot.holdings}
         watchlistData={snapshot.watchlist}
         leadingIndicatorsData={snapshot.leadingIndicators}
+        quoteStatus={snapshot.quoteStatus}
+        quoteMessage={snapshot.quoteMessage}
+        liveQuoteCount={snapshot.liveQuoteCount}
+        fetchedAt={snapshot.fetchedAt}
+        calendarStatus={snapshot.calendarStatus}
+        calendarMessage={snapshot.calendarMessage}
+        calendarEventCount={snapshot.calendarEvents.length}
+        newsStatus={snapshot.newsStatus}
+        newsMessage={snapshot.newsMessage}
+        liveNewsCount={snapshot.liveNews.length}
         backupData={snapshot.storedData}
         onImportDashboardData={actions.onImportDashboardData}
         onResetDashboardData={actions.onResetDashboardData}
