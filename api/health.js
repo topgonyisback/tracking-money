@@ -58,7 +58,7 @@ export default async function handler(req, res) {
       configured: true,
       source: 'Browser localStorage + JSON backup',
       cadence: '입력 즉시 저장',
-      coverage: ['보유종목', '관심종목', '뉴스 키워드', '알림 규칙', '투자노트'],
+      coverage: ['보유종목', '관심종목', '뉴스 키워드', '알림 규칙', '알림 기록', '투자노트'],
       summary: '개인 입력 데이터는 현재 브라우저에 저장됩니다.',
       nextAction: '다른 기기와 동기화하려면 서버 동기화 환경변수를 설정합니다.',
     },
@@ -69,7 +69,7 @@ export default async function handler(req, res) {
       configured: profileSyncConfigured,
       source: 'Upstash Redis REST',
       cadence: '사용자가 저장/불러오기 실행',
-      coverage: ['보유종목', '관심종목', '뉴스 키워드', '알림 규칙', '투자노트'],
+      coverage: ['보유종목', '관심종목', '뉴스 키워드', '알림 규칙', '알림 기록', '투자노트'],
       summary: profileSyncConfigured ? '서버 프로필 동기화 저장소가 설정되어 있습니다.' : '서버 프로필 동기화 저장소가 설정되지 않았습니다.',
       nextAction: profileSyncConfigured
         ? '설정 화면에서 동기화 키를 입력해 현재 프로필을 저장하거나 불러올 수 있습니다.'

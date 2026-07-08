@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Activity,
   Bell,
@@ -58,6 +58,8 @@ import { cn } from '@/lib/utils'
 import type {
   ActionQueueItem,
   AlertRule,
+  AlertHistoryItem,
+  AlertSettings,
   BiasScore,
   CalendarEvent,
   Direction,
@@ -195,6 +197,8 @@ type StoredDashboardData = {
   watchlist: WatchItem[]
   newsKeywords: string[]
   alertRules: AlertRule[]
+  alertSettings: AlertSettings
+  alertHistory: AlertHistoryItem[]
   journal: InvestmentJournal
 }
 
@@ -209,6 +213,8 @@ type DashboardSnapshot = {
   watchlist: WatchItem[]
   newsKeywords: string[]
   alertRules: AlertRule[]
+  alertSettings: AlertSettings
+  alertHistory: AlertHistoryItem[]
   triggeredAlerts: TriggeredAlert[]
   storedData: StoredDashboardData
   leadingIndicators: MarketIndicator[]
@@ -383,6 +389,11 @@ const defaultAlertRules: AlertRule[] = [
   },
 ]
 
+const defaultAlertSettings: AlertSettings = {
+  browserNotifications: false,
+  minimumSeverity: 'medium',
+}
+
 const symbolProfiles: Record<string, { sector: string; sensitivity: string[] }> = {
   '005930': { sector: '반도체', sensitivity: ['SOX', 'USD/KRW', 'NQ=F'] },
   '000660': { sector: '반도체', sensitivity: ['SOX', 'USD/KRW', 'NQ=F'] },
@@ -544,6 +555,42 @@ function dedupeAlertRules(items: AlertRule[]) {
   return Array.from(new Map(items.map((item) => [item.id, item])).values())
 }
 
+function severityRank(severity: TriggeredAlert['severity']) {
+  if (severity === 'critical') return 4
+  if (severity === 'high') return 3
+  if (severity === 'medium') return 2
+  return 1
+}
+
+function normalizeAlertSeverity(value: unknown): TriggeredAlert['severity'] {
+  return value === 'critical' || value === 'high' || value === 'medium' || value === 'low' ? value : 'medium'
+}
+
+function normalizeAlertSettings(value: unknown): AlertSettings {
+  if (!isRecord(value)) return defaultAlertSettings
+
+  return {
+    browserNotifications: typeof value.browserNotifications === 'boolean' ? value.browserNotifications : defaultAlertSettings.browserNotifications,
+    minimumSeverity: normalizeAlertSeverity(value.minimumSeverity),
+  }
+}
+
+function alertDedupeKey(alert: Pick<TriggeredAlert, 'id' | 'evidence'>) {
+  return `${alert.id}:${simpleHash(alert.evidence)}`
+}
+
+function simpleHash(value: string) {
+  let hash = 0
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0
+  }
+  return hash.toString(36)
+}
+
+function dedupeAlertHistory(items: AlertHistoryItem[]) {
+  return Array.from(new Map(items.map((item) => [item.dedupeKey, item])).values())
+}
+
 function normalizeImportedHolding(value: unknown): Holding | null {
   if (!isRecord(value)) return null
 
@@ -612,6 +659,34 @@ function normalizeImportedAlertRule(value: unknown): AlertRule | null {
   }
 }
 
+function normalizeImportedAlertHistoryItem(value: unknown): AlertHistoryItem | null {
+  if (!isRecord(value)) return null
+
+  const id = textValue(value.id)
+  const ruleId = textValue(value.ruleId)
+  const title = textValue(value.title)
+  const evidence = textValue(value.evidence)
+  if (!id || !ruleId || !title || !evidence) return null
+
+  const alert = {
+    id,
+    ruleId,
+    title,
+    summary: textValue(value.summary),
+    severity: normalizeAlertSeverity(value.severity),
+    evidence,
+    relatedSymbols: stringArrayValue(value.relatedSymbols),
+  } satisfies TriggeredAlert
+
+  return {
+    ...alert,
+    dedupeKey: textValue(value.dedupeKey, alertDedupeKey(alert)),
+    triggeredAt: typeof value.triggeredAt === 'string' ? value.triggeredAt : new Date().toISOString(),
+    read: typeof value.read === 'boolean' ? value.read : false,
+    notificationSent: typeof value.notificationSent === 'boolean' ? value.notificationSent : false,
+  }
+}
+
 function normalizeStoredDashboardData(value: unknown): StoredDashboardData | null {
   const candidate = isRecord(value) && isRecord(value.data) ? value.data : value
   if (!isRecord(candidate) || !Array.isArray(candidate.holdings) || !Array.isArray(candidate.watchlist)) return null
@@ -623,6 +698,10 @@ function normalizeStoredDashboardData(value: unknown): StoredDashboardData | nul
     alertRules: Array.isArray(candidate.alertRules)
       ? dedupeAlertRules(candidate.alertRules.map(normalizeImportedAlertRule).filter((item): item is AlertRule => item !== null))
       : defaultAlertRules,
+    alertSettings: normalizeAlertSettings(candidate.alertSettings),
+    alertHistory: Array.isArray(candidate.alertHistory)
+      ? dedupeAlertHistory(candidate.alertHistory.map(normalizeImportedAlertHistoryItem).filter((item): item is AlertHistoryItem => item !== null)).slice(0, 100)
+      : [],
     journal: normalizeJournal(candidate.journal),
   }
 }
@@ -653,7 +732,7 @@ function parseDashboardBackup(rawJson: string): { ok: true; data: StoredDashboar
     return {
       ok: true,
       data,
-      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 뉴스 키워드 ${data.newsKeywords.length}개, 알림 ${data.alertRules.length}개, 투자노트를 가져왔습니다.`,
+      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 뉴스 키워드 ${data.newsKeywords.length}개, 알림 ${data.alertRules.length}개, 기록 ${data.alertHistory.length}개, 투자노트를 가져왔습니다.`,
     }
   } catch {
     return {
@@ -725,6 +804,44 @@ function formatMarketTime(value: string | null) {
     minute: '2-digit',
     timeZone: 'Asia/Seoul',
   })
+}
+
+type NotificationPermissionState = NotificationPermission | 'unsupported'
+
+function getNotificationPermissionState(): NotificationPermissionState {
+  if (typeof window === 'undefined' || !('Notification' in window)) return 'unsupported'
+  return window.Notification.permission
+}
+
+function shouldDeliverBrowserNotification(severity: TriggeredAlert['severity'], settings: AlertSettings) {
+  return settings.browserNotifications && severityRank(severity) >= severityRank(settings.minimumSeverity)
+}
+
+function createAlertHistoryItem(alert: TriggeredAlert, notificationSent: boolean): AlertHistoryItem {
+  return {
+    ...alert,
+    dedupeKey: alertDedupeKey(alert),
+    triggeredAt: new Date().toISOString(),
+    read: false,
+    notificationSent,
+  }
+}
+
+function sendBrowserNotification(alert: TriggeredAlert, settings: AlertSettings) {
+  if (!shouldDeliverBrowserNotification(alert.severity, settings)) return false
+  if (getNotificationPermissionState() !== 'granted') return false
+
+  try {
+    const notification = new window.Notification(`Tracking Money · ${alert.title}`, {
+      body: `${alertSeverityLabel[alert.severity]} · ${alert.summary}`,
+      tag: alertDedupeKey(alert),
+      requireInteraction: alert.severity === 'critical',
+    })
+    notification.onclick = () => window.focus()
+    return true
+  } catch {
+    return false
+  }
 }
 
 function getKoreaOpenText(now = new Date()) {
@@ -2070,6 +2187,8 @@ function buildDashboardSnapshot({
   baseWatchlist,
   newsKeywordsData,
   alertRulesData,
+  alertSettingsData,
+  alertHistoryData,
   quotes,
   fetchedAt,
   quoteStatus,
@@ -2089,6 +2208,8 @@ function buildDashboardSnapshot({
   baseWatchlist: WatchItem[]
   newsKeywordsData: string[]
   alertRulesData: AlertRule[]
+  alertSettingsData: AlertSettings
+  alertHistoryData: AlertHistoryItem[]
   quotes: MarketQuote[]
   fetchedAt: string | null
   quoteStatus: QuoteStatus
@@ -2156,12 +2277,16 @@ function buildDashboardSnapshot({
     watchlist: liveWatchlist,
     newsKeywords: newsKeywordsData,
     alertRules: alertRulesData,
+    alertSettings: alertSettingsData,
+    alertHistory: alertHistoryData,
     triggeredAlerts,
     storedData: {
       holdings: baseHoldings,
       watchlist: baseWatchlist,
       newsKeywords: newsKeywordsData,
       alertRules: alertRulesData,
+      alertSettings: alertSettingsData,
+      alertHistory: alertHistoryData,
       journal,
     },
     leadingIndicators: liveIndicators,
@@ -3532,19 +3657,33 @@ function formToAlertRule(form: AlertRuleFormState, existing?: AlertRule): AlertR
 function AlertsPage({
   actionQueue,
   alertRules,
+  alertSettings,
+  alertHistory,
+  notificationPermission,
   triggeredAlerts,
   onSaveAlertRule,
   onDeleteAlertRule,
   onToggleAlertRule,
   onResetAlertRules,
+  onUpdateAlertSettings,
+  onRequestBrowserNotifications,
+  onMarkAlertHistoryRead,
+  onClearAlertHistory,
 }: {
   actionQueue: ActionQueueItem[]
   alertRules: AlertRule[]
+  alertSettings: AlertSettings
+  alertHistory: AlertHistoryItem[]
+  notificationPermission: NotificationPermissionState
   triggeredAlerts: TriggeredAlert[]
   onSaveAlertRule: (rule: AlertRule, previousId?: string) => void
   onDeleteAlertRule: (id: string) => void
   onToggleAlertRule: (id: string) => void
   onResetAlertRules: () => void
+  onUpdateAlertSettings: (patch: Partial<AlertSettings>) => void
+  onRequestBrowserNotifications: () => Promise<void>
+  onMarkAlertHistoryRead: () => void
+  onClearAlertHistory: () => void
 }) {
   const [form, setForm] = useState<AlertRuleFormState>(emptyAlertRuleForm)
   const criticalCount = actionQueue.filter((item) => item.priority === 'critical').length
@@ -3552,6 +3691,17 @@ function AlertsPage({
   const watchlistCount = actionQueue.filter((item) => item.category === 'watchlist').length
   const enabledRuleCount = alertRules.filter((rule) => rule.enabled).length
   const highTriggeredCount = triggeredAlerts.filter((item) => item.severity === 'critical' || item.severity === 'high').length
+  const unreadHistoryCount = alertHistory.filter((item) => !item.read).length
+  const notificationStatusLabel =
+    notificationPermission === 'unsupported'
+      ? '미지원'
+      : notificationPermission === 'granted'
+        ? alertSettings.browserNotifications
+          ? '켜짐'
+          : '꺼짐'
+        : notificationPermission === 'denied'
+          ? '차단됨'
+          : '권한 필요'
 
   function clearForm() {
     setForm(emptyAlertRuleForm)
@@ -3574,14 +3724,14 @@ function AlertsPage({
         <MetricCard label="긴급 알림" value={`${criticalCount}개`} detail="즉시 확인" tone={criticalCount > 0 ? 'negative' : 'neutral'} />
         <MetricCard label="높은 우선순위" value={`${highCount}개`} detail="오늘 처리" tone={highCount > 0 ? 'warning' : 'neutral'} />
         <MetricCard label="관심가/트리거" value={`${watchlistCount}개`} detail="가격 조건" tone={watchlistCount > 0 ? 'positive' : 'neutral'} />
-        <MetricCard label="사용자 조건" value={`${triggeredAlerts.length}/${enabledRuleCount}`} detail="발동/활성" tone={highTriggeredCount > 0 ? 'negative' : triggeredAlerts.length > 0 ? 'warning' : 'neutral'} />
+        <MetricCard label="알림 기록" value={`${unreadHistoryCount}/${alertHistory.length}`} detail={notificationStatusLabel} tone={highTriggeredCount > 0 ? 'negative' : unreadHistoryCount > 0 ? 'warning' : 'neutral'} />
       </section>
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
         <Card>
           <CardHeader>
             <CardTitle>조건 알림</CardTitle>
-            <CardDescription>내가 정한 가격, 등락률, 뉴스, 방향점수 조건</CardDescription>
+            <CardDescription>활성 조건 {enabledRuleCount}개 기준으로 가격, 등락률, 뉴스, 방향점수를 확인합니다</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             {triggeredAlerts.length > 0 ? (
@@ -3608,61 +3758,153 @@ function AlertsPage({
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>{form.id ? '알림 조건 수정' : '알림 조건 추가'}</CardTitle>
-            <CardDescription>조건은 브라우저 저장, 백업, 서버 동기화에 포함됩니다</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <input
-              value={form.name}
-              onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
-              placeholder="조건 이름"
-              className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition placeholder:text-muted-foreground focus:border-primary"
-            />
-            <select
-              value={form.type}
-              onChange={(event) => setForm((current) => ({ ...current, type: event.target.value as AlertRule['type'] }))}
-              className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition focus:border-primary"
-            >
-              {Object.entries(alertRuleTypeLabel).map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-            </select>
-            <input
-              value={form.type === 'bias-above' || form.type === 'bias-below' ? 'KOSPI' : form.target}
-              onChange={(event) => setForm((current) => ({ ...current, target: event.target.value }))}
-              disabled={form.type === 'bias-above' || form.type === 'bias-below'}
-              placeholder="대상: 005930, VIX, AI"
-              className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition placeholder:text-muted-foreground focus:border-primary disabled:text-muted-foreground"
-            />
-            {form.type !== 'news-keyword' ? (
+        <div className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>브라우저 알림</CardTitle>
+              <CardDescription>조건이 새로 발동되면 기기 알림으로 표시</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant={notificationPermission === 'granted' && alertSettings.browserNotifications ? 'positive' : notificationPermission === 'denied' ? 'negative' : 'warning'}>
+                  {notificationStatusLabel}
+                </Badge>
+                <Badge variant="secondary">{alertSeverityLabel[alertSettings.minimumSeverity]} 이상</Badge>
+              </div>
+              <select
+                className={inputClassName}
+                value={alertSettings.minimumSeverity}
+                onChange={(event) => onUpdateAlertSettings({ minimumSeverity: event.target.value as TriggeredAlert['severity'] })}
+              >
+                {(['low', 'medium', 'high', 'critical'] as const).map((severity) => (
+                  <option key={severity} value={severity}>
+                    {alertSeverityLabel[severity]} 이상
+                  </option>
+                ))}
+              </select>
+              <div className="flex flex-wrap gap-2">
+                {notificationPermission === 'granted' ? (
+                  <Button
+                    type="button"
+                    variant={alertSettings.browserNotifications ? 'outline' : 'default'}
+                    onClick={() => onUpdateAlertSettings({ browserNotifications: !alertSettings.browserNotifications })}
+                  >
+                    <Bell className="size-4" />
+                    {alertSettings.browserNotifications ? '알림 끄기' : '알림 켜기'}
+                  </Button>
+                ) : (
+                  <Button type="button" onClick={() => void onRequestBrowserNotifications()} disabled={notificationPermission === 'unsupported' || notificationPermission === 'denied'}>
+                    <Bell className="size-4" />
+                    권한 요청
+                  </Button>
+                )}
+              </div>
+              <div className="text-xs leading-5 text-muted-foreground">
+                같은 조건과 같은 근거는 한 번만 기록합니다. 브라우저 알림은 권한 허용 후 새로 발동되는 조건부터 보냅니다.
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>{form.id ? '알림 조건 수정' : '알림 조건 추가'}</CardTitle>
+              <CardDescription>조건은 브라우저 저장, 백업, 서버 동기화에 포함됩니다</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
               <input
-                value={form.threshold}
-                onChange={(event) => setForm((current) => ({ ...current, threshold: event.target.value }))}
-                placeholder={form.type.startsWith('price') ? '기준 가격' : form.type.startsWith('bias') ? '기준 점수' : '기준 등락률 %'}
+                value={form.name}
+                onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
+                placeholder="조건 이름"
                 className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition placeholder:text-muted-foreground focus:border-primary"
               />
-            ) : null}
+              <select
+                value={form.type}
+                onChange={(event) => setForm((current) => ({ ...current, type: event.target.value as AlertRule['type'] }))}
+                className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition focus:border-primary"
+              >
+                {Object.entries(alertRuleTypeLabel).map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+              <input
+                value={form.type === 'bias-above' || form.type === 'bias-below' ? 'KOSPI' : form.target}
+                onChange={(event) => setForm((current) => ({ ...current, target: event.target.value }))}
+                disabled={form.type === 'bias-above' || form.type === 'bias-below'}
+                placeholder="대상: 005930, VIX, AI"
+                className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition placeholder:text-muted-foreground focus:border-primary disabled:text-muted-foreground"
+              />
+              {form.type !== 'news-keyword' ? (
+                <input
+                  value={form.threshold}
+                  onChange={(event) => setForm((current) => ({ ...current, threshold: event.target.value }))}
+                  placeholder={form.type.startsWith('price') ? '기준 가격' : form.type.startsWith('bias') ? '기준 점수' : '기준 등락률 %'}
+                  className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition placeholder:text-muted-foreground focus:border-primary"
+                />
+              ) : null}
+              <div className="flex flex-wrap gap-2">
+                <Button type="button" onClick={submitRule} disabled={!form.target && form.type !== 'bias-above' && form.type !== 'bias-below'}>
+                  <Save className="size-4" />
+                  저장
+                </Button>
+                <Button type="button" variant="outline" onClick={clearForm}>
+                  <X className="size-4" />
+                  취소
+                </Button>
+                <Button type="button" variant="outline" onClick={onResetAlertRules}>
+                  <RefreshCw className="size-4" />
+                  기본값
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      </section>
+
+      <Card>
+        <CardHeader>
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div>
+              <CardTitle>알림 히스토리</CardTitle>
+              <CardDescription>조건이 실제로 발동된 시점과 근거</CardDescription>
+            </div>
             <div className="flex flex-wrap gap-2">
-              <Button type="button" onClick={submitRule} disabled={!form.target && form.type !== 'bias-above' && form.type !== 'bias-below'}>
-                <Save className="size-4" />
-                저장
+              <Button type="button" variant="outline" size="sm" onClick={onMarkAlertHistoryRead} disabled={alertHistory.length === 0}>
+                전체 읽음
               </Button>
-              <Button type="button" variant="outline" onClick={clearForm}>
-                <X className="size-4" />
-                취소
-              </Button>
-              <Button type="button" variant="outline" onClick={onResetAlertRules}>
-                <RefreshCw className="size-4" />
-                기본값
+              <Button type="button" variant="ghost" size="sm" className="text-negative hover:text-negative" onClick={onClearAlertHistory} disabled={alertHistory.length === 0}>
+                기록 비우기
               </Button>
             </div>
-          </CardContent>
-        </Card>
-      </section>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-3 lg:grid-cols-2">
+          {alertHistory.length > 0 ? (
+            alertHistory.slice(0, 8).map((item) => (
+              <div key={item.dedupeKey} className="rounded-md border border-border bg-muted/15 p-4">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <Badge variant={item.read ? 'neutral' : portfolioVariantFromSeverity(item.severity)}>{item.read ? '읽음' : alertSeverityLabel[item.severity]}</Badge>
+                  <Badge variant={item.notificationSent ? 'positive' : 'secondary'}>{item.notificationSent ? '기기 알림' : '기록'}</Badge>
+                  <Badge variant="secondary">{formatMarketTime(item.triggeredAt)}</Badge>
+                  {item.relatedSymbols.slice(0, 3).map((symbol) => (
+                    <Badge key={symbol} variant="secondary">
+                      {symbol}
+                    </Badge>
+                  ))}
+                </div>
+                <div className="text-sm font-semibold">{item.title}</div>
+                <div className="mt-2 text-sm leading-6 text-foreground/85">{item.summary}</div>
+                <div className="mt-2 text-xs leading-5 text-muted-foreground">{item.evidence}</div>
+              </div>
+            ))
+          ) : (
+            <div className="rounded-md border border-border bg-muted/15 p-4 text-sm leading-6 text-muted-foreground">
+              아직 기록된 조건 발동 내역이 없습니다. 조건이 새로 발동되면 이곳에 시간과 근거가 남습니다.
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>
@@ -4012,6 +4254,7 @@ function SettingsPage({
     { label: '관심종목', value: `${backupData.watchlist.length}개` },
     { label: '뉴스 키워드', value: `${backupData.newsKeywords.length}개` },
     { label: '알림 규칙', value: `${backupData.alertRules.length}개` },
+    { label: '알림 기록', value: `${backupData.alertHistory.length}개` },
     { label: '투자노트', value: backupData.journal.date },
   ]
   const backupMessageVariant = backupTone === 'positive' ? 'positive' : backupTone === 'negative' ? 'negative' : 'neutral'
@@ -4155,6 +4398,8 @@ function SettingsPage({
       watchlist,
       newsKeywords: defaultNewsKeywords,
       alertRules: defaultAlertRules,
+      alertSettings: defaultAlertSettings,
+      alertHistory: [],
       journal: createDefaultJournal(),
     }
     onResetDashboardData()
@@ -4520,7 +4765,7 @@ function SettingsPage({
           <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
             <div>
               <CardTitle>서버 동기화</CardTitle>
-              <CardDescription>다른 기기에서도 같은 보유종목, 관심종목, 뉴스 키워드, 알림 규칙, 투자노트 사용</CardDescription>
+              <CardDescription>다른 기기에서도 같은 보유종목, 관심종목, 뉴스 키워드, 알림 규칙, 알림 기록, 투자노트 사용</CardDescription>
             </div>
             <Button type="button" variant="outline" size="sm" onClick={() => void loadProfileSyncStatus()} disabled={profileSyncBusy}>
               <RefreshCw className={cn('size-4', profileSyncStatus === 'checking' && 'animate-spin')} />
@@ -4556,7 +4801,7 @@ function SettingsPage({
           <div className="grid gap-3 md:grid-cols-4">
             <div className="rounded-md border border-border bg-muted/15 p-3">
               <div className="text-xs text-muted-foreground">저장 대상</div>
-              <div className="mt-2 text-sm font-semibold">보유/관심/키워드/알림/노트</div>
+              <div className="mt-2 text-sm font-semibold">보유/관심/키워드/알림/기록/노트</div>
             </div>
             <div className="rounded-md border border-border bg-muted/15 p-3">
               <div className="text-xs text-muted-foreground">서버 저장소</div>
@@ -4580,7 +4825,7 @@ function SettingsPage({
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
                 <CardTitle>데이터 백업</CardTitle>
-                <CardDescription>보유종목, 관심종목, 뉴스 키워드, 알림 규칙, 투자노트를 JSON 파일로 보관</CardDescription>
+                <CardDescription>보유종목, 관심종목, 뉴스 키워드, 알림 규칙, 알림 기록, 투자노트를 JSON 파일로 보관</CardDescription>
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button type="button" variant="outline" size="sm" onClick={handleDownloadBackup}>
@@ -4643,6 +4888,7 @@ function SettingsPage({
 }
 
 type DashboardActions = {
+  notificationPermission: NotificationPermissionState
   onSaveHolding: (holding: Holding, previousSymbol?: string) => void
   onDeleteHolding: (symbol: string) => void
   onResetHoldings: () => void
@@ -4657,6 +4903,10 @@ type DashboardActions = {
   onDeleteAlertRule: (id: string) => void
   onToggleAlertRule: (id: string) => void
   onResetAlertRules: () => void
+  onUpdateAlertSettings: (patch: Partial<AlertSettings>) => void
+  onRequestBrowserNotifications: () => Promise<void>
+  onMarkAlertHistoryRead: () => void
+  onClearAlertHistory: () => void
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
   onResetJournal: () => void
@@ -4725,11 +4975,18 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
       <AlertsPage
         actionQueue={snapshot.actionQueue}
         alertRules={snapshot.alertRules}
+        alertSettings={snapshot.alertSettings}
+        alertHistory={snapshot.alertHistory}
+        notificationPermission={actions.notificationPermission}
         triggeredAlerts={snapshot.triggeredAlerts}
         onSaveAlertRule={actions.onSaveAlertRule}
         onDeleteAlertRule={actions.onDeleteAlertRule}
         onToggleAlertRule={actions.onToggleAlertRule}
         onResetAlertRules={actions.onResetAlertRules}
+        onUpdateAlertSettings={actions.onUpdateAlertSettings}
+        onRequestBrowserNotifications={actions.onRequestBrowserNotifications}
+        onMarkAlertHistoryRead={actions.onMarkAlertHistoryRead}
+        onClearAlertHistory={actions.onClearAlertHistory}
       />
     )
   }
@@ -4782,6 +5039,12 @@ export function Dashboard() {
   const [userWatchlist, setUserWatchlist] = useState<WatchItem[]>(watchlist)
   const [userNewsKeywords, setUserNewsKeywords] = useState<string[]>(defaultNewsKeywords)
   const [userAlertRules, setUserAlertRules] = useState<AlertRule[]>(defaultAlertRules)
+  const [userAlertSettings, setUserAlertSettings] = useState<AlertSettings>(defaultAlertSettings)
+  const [alertHistory, setAlertHistory] = useState<AlertHistoryItem[]>([])
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermissionState>(() =>
+    typeof window === 'undefined' ? 'unsupported' : getNotificationPermissionState(),
+  )
+  const alertHistoryRef = useRef<AlertHistoryItem[]>([])
   const [journal, setJournal] = useState<InvestmentJournal>(() => createDefaultJournal())
   const [storageLoaded, setStorageLoaded] = useState(false)
   const [quoteResponse, setQuoteResponse] = useState<QuotesApiResponse | null>(null)
@@ -4967,6 +5230,8 @@ export function Dashboard() {
       setUserWatchlist(stored.watchlist)
       setUserNewsKeywords(stored.newsKeywords)
       setUserAlertRules(stored.alertRules)
+      setUserAlertSettings(stored.alertSettings)
+      setAlertHistory(stored.alertHistory)
       setJournal(stored.journal)
     }
     setStorageLoaded(true)
@@ -4979,9 +5244,15 @@ export function Dashboard() {
       watchlist: userWatchlist,
       newsKeywords: userNewsKeywords,
       alertRules: userAlertRules,
+      alertSettings: userAlertSettings,
+      alertHistory,
       journal,
     })
-  }, [journal, storageLoaded, userAlertRules, userHoldings, userNewsKeywords, userWatchlist])
+  }, [alertHistory, journal, storageLoaded, userAlertRules, userAlertSettings, userHoldings, userNewsKeywords, userWatchlist])
+
+  useEffect(() => {
+    alertHistoryRef.current = alertHistory
+  }, [alertHistory])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -5043,6 +5314,8 @@ export function Dashboard() {
         baseWatchlist: userWatchlist,
         newsKeywordsData: userNewsKeywords,
         alertRulesData: userAlertRules,
+        alertSettingsData: userAlertSettings,
+        alertHistoryData: alertHistory,
         fetchedAt: quoteResponse?.fetchedAt ?? null,
         quoteStatus,
         quoteMessage,
@@ -5071,7 +5344,9 @@ export function Dashboard() {
       quoteMessage,
       quoteResponse,
       quoteStatus,
+      alertHistory,
       userAlertRules,
+      userAlertSettings,
       userHoldings,
       userNewsKeywords,
       userWatchlist,
@@ -5088,8 +5363,27 @@ export function Dashboard() {
         : snapshot.quoteStatus === 'error'
           ? 'negative'
           : 'neutral'
+
+  useEffect(() => {
+    setNotificationPermission(getNotificationPermissionState())
+  }, [])
+
+  useEffect(() => {
+    if (!storageLoaded || snapshot.triggeredAlerts.length === 0) return
+
+    const existingKeys = new Set(alertHistoryRef.current.map((item) => item.dedupeKey))
+    const additions = snapshot.triggeredAlerts
+      .filter((alert) => !existingKeys.has(alertDedupeKey(alert)))
+      .map((alert) => createAlertHistoryItem(alert, sendBrowserNotification(alert, userAlertSettings)))
+
+    if (additions.length === 0) return
+
+    setAlertHistory((current) => dedupeAlertHistory([...additions, ...current]).slice(0, 100))
+  }, [snapshot.triggeredAlerts, storageLoaded, userAlertSettings])
+
   const actions = useMemo<DashboardActions>(
     () => ({
+      notificationPermission,
       onSaveHolding: (holding, previousSymbol) => {
         setUserHoldings((current) => {
           const previous = previousSymbol ? normalizeUserSymbol(previousSymbol) : holding.symbol
@@ -5144,6 +5438,34 @@ export function Dashboard() {
       onResetAlertRules: () => {
         setUserAlertRules(defaultAlertRules)
       },
+      onUpdateAlertSettings: (patch) => {
+        setUserAlertSettings((current) => normalizeAlertSettings({ ...current, ...patch }))
+      },
+      onRequestBrowserNotifications: async () => {
+        if (typeof window === 'undefined' || !('Notification' in window)) {
+          setNotificationPermission('unsupported')
+          setUserAlertSettings((current) => ({ ...current, browserNotifications: false }))
+          return
+        }
+
+        try {
+          const permission = await window.Notification.requestPermission()
+          setNotificationPermission(permission)
+          setUserAlertSettings((current) => ({
+            ...current,
+            browserNotifications: permission === 'granted',
+          }))
+        } catch {
+          setNotificationPermission(getNotificationPermissionState())
+          setUserAlertSettings((current) => ({ ...current, browserNotifications: false }))
+        }
+      },
+      onMarkAlertHistoryRead: () => {
+        setAlertHistory((current) => current.map((item) => ({ ...item, read: true })))
+      },
+      onClearAlertHistory: () => {
+        setAlertHistory([])
+      },
       onUpdateJournal: (patch) => {
         setJournal((current) => ({
           ...normalizeJournal(current),
@@ -5179,6 +5501,8 @@ export function Dashboard() {
         setUserWatchlist(data.watchlist)
         setUserNewsKeywords(data.newsKeywords)
         setUserAlertRules(data.alertRules)
+        setUserAlertSettings(data.alertSettings)
+        setAlertHistory(data.alertHistory)
         setJournal(data.journal)
         saveStoredDashboardData(data)
       },
@@ -5188,17 +5512,21 @@ export function Dashboard() {
         setUserWatchlist(watchlist)
         setUserNewsKeywords(defaultNewsKeywords)
         setUserAlertRules(defaultAlertRules)
+        setUserAlertSettings(defaultAlertSettings)
+        setAlertHistory([])
         setJournal(nextJournal)
         saveStoredDashboardData({
           holdings,
           watchlist,
           newsKeywords: defaultNewsKeywords,
           alertRules: defaultAlertRules,
+          alertSettings: defaultAlertSettings,
+          alertHistory: [],
           journal: nextJournal,
         })
       },
     }),
-    [loadCalendar, loadDisclosures, loadLiveNews],
+    [loadCalendar, loadDisclosures, loadLiveNews, notificationPermission],
   )
 
   return (

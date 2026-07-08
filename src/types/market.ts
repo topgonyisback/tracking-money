@@ -164,6 +164,18 @@ export type TriggeredAlert = {
   relatedSymbols: string[]
 }
 
+export type AlertSettings = {
+  browserNotifications: boolean
+  minimumSeverity: TriggeredAlert['severity']
+}
+
+export type AlertHistoryItem = TriggeredAlert & {
+  dedupeKey: string
+  triggeredAt: string
+  read: boolean
+  notificationSent: boolean
+}
+
 export type PortfolioExposure = {
   id: string
   label: string
