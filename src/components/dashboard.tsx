@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
   Activity,
   Bell,
@@ -48,7 +48,7 @@ import {
   watchlist,
 } from '@/data/mock-dashboard'
 import { cn } from '@/lib/utils'
-import type { Direction, LiveNewsItem } from '@/types/market'
+import type { BiasScore, Direction, Holding, LiveNewsItem, MarketIndicator, MarketQuote, WatchItem } from '@/types/market'
 
 const navItems = [
   { id: 'dashboard', label: '대시보드', subtitle: '국내장 예열과 포트폴리오 영향', icon: LayoutDashboard },
@@ -63,18 +63,60 @@ const navItems = [
 
 type PageId = (typeof navItems)[number]['id']
 
-const indicatorChartData = leadingIndicators.map((indicator) => ({
-  symbol: indicator.symbol,
-  change: indicator.change,
-}))
+type QuoteStatus = 'idle' | 'loading' | 'ready' | 'partial' | 'fallback' | 'error'
 
-const biasTimeline = [
-  { time: '23:00', score: 42 },
-  { time: '01:00', score: 51 },
-  { time: '03:00', score: 58 },
-  { time: '05:00', score: 61 },
-  { time: '08:00', score: biasScore.score },
+type QuotesApiResponse = {
+  configured: boolean
+  source: string
+  fetchedAt: string
+  status: 'ready' | 'partial' | 'fallback'
+  quotes: MarketQuote[]
+  errors: { symbol: string; sourceSymbol: string; message: string }[]
+  message?: string
+}
+
+type MarketStatusView = typeof marketStatus
+
+type DashboardSnapshot = {
+  holdings: Holding[]
+  watchlist: WatchItem[]
+  leadingIndicators: MarketIndicator[]
+  biasScore: BiasScore
+  marketStatus: MarketStatusView
+  quoteStatus: QuoteStatus
+  quoteMessage: string
+  liveQuoteCount: number
+  fetchedAt: string | null
+}
+
+const quoteSymbols = [
+  '005930',
+  '000660',
+  '035420',
+  '373220',
+  'AAPL',
+  'TSLA',
+  'NVDA',
+  'NQ=F',
+  'ES=F',
+  'SOX',
+  'VIX',
+  'DXY',
+  'US10Y',
+  'USD/KRW',
 ]
+
+const inverseIndicators = new Set(['VIX', 'DXY', 'US10Y', 'USD/KRW'])
+
+const liveIndicatorNotes: Record<string, string> = {
+  'NQ=F': '국내 성장주와 코스닥 심리에 선행 반영',
+  'ES=F': '미국 전체 위험선호의 기본 온도',
+  SOX: '삼성전자와 SK하이닉스에 가장 직접적인 선행 신호',
+  VIX: '하락하면 위험선호, 상승하면 변동성 부담',
+  DXY: '강달러는 외국인 수급과 환율에 부담',
+  US10Y: '금리 상승은 성장주 밸류에이션 부담',
+  'USD/KRW': '달러/원 상승은 국내장 수급의 핵심 부담',
+}
 
 const confidenceLabel = {
   low: '낮음',
@@ -99,6 +141,103 @@ const watchStatusLabel = {
   near: '근접',
   waiting: '대기',
   alert: '확인',
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max)
+}
+
+function round(value: number, digits = 2) {
+  const factor = 10 ** digits
+  return Math.round(value * factor) / factor
+}
+
+function quoteKey(symbol: string) {
+  return symbol.toUpperCase()
+}
+
+function quoteBySymbol(quotes: MarketQuote[]) {
+  return new Map(quotes.map((quote) => [quoteKey(quote.symbol), quote]))
+}
+
+function getQuote(quoteMap: Map<string, MarketQuote>, symbol: string) {
+  return quoteMap.get(quoteKey(symbol))
+}
+
+function formatNumber(value: number, maximumFractionDigits = 2) {
+  return value.toLocaleString('en-US', {
+    maximumFractionDigits,
+  })
+}
+
+function formatIndicatorValue(symbol: string, value: number) {
+  if (symbol === 'US10Y') return `${value.toFixed(2)}%`
+  if (symbol === 'USD/KRW') return value.toLocaleString('ko-KR', { maximumFractionDigits: 2 })
+  if (symbol === 'VIX') return value.toFixed(2)
+  return formatNumber(value, value >= 1000 ? 2 : 3)
+}
+
+function formatMarketTime(value: string | null) {
+  if (!value) return marketStatus.lastUpdated
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return marketStatus.lastUpdated
+
+  return date.toLocaleTimeString('ko-KR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'Asia/Seoul',
+  })
+}
+
+function getKoreaOpenText(now = new Date()) {
+  const kstNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }))
+  const open = new Date(kstNow)
+  open.setHours(9, 0, 0, 0)
+
+  if (kstNow.getTime() >= open.getTime()) {
+    return '진행 중'
+  }
+
+  const diffMs = open.getTime() - kstNow.getTime()
+  const hours = Math.floor(diffMs / 3_600_000)
+  const minutes = Math.floor((diffMs % 3_600_000) / 60_000)
+  return `${hours}시간 ${minutes}분 전`
+}
+
+function getDirectionFromChange(symbol: string, changePercent: number | null | undefined): Direction {
+  if (changePercent === null || changePercent === undefined || Math.abs(changePercent) < 0.03) return 'neutral'
+  const positive = inverseIndicators.has(symbol) ? changePercent < 0 : changePercent > 0
+  return positive ? 'positive' : 'negative'
+}
+
+function getSignalFromDirection(direction: Direction): MarketIndicator['signal'] {
+  if (direction === 'positive') return 'risk-on'
+  if (direction === 'negative') return 'risk-off'
+  return 'watch'
+}
+
+function getImpactFromChange(changePercent: number | null | undefined): Direction {
+  if (changePercent === null || changePercent === undefined || Math.abs(changePercent) < 0.4) return 'neutral'
+  return changePercent > 0 ? 'positive' : 'negative'
+}
+
+function buildIndicatorChartData(indicators: MarketIndicator[]) {
+  return indicators.map((indicator) => ({
+    symbol: indicator.symbol,
+    change: indicator.change,
+  }))
+}
+
+function buildBiasTimeline(score: number) {
+  const base = clamp(score - 22, 0, 100)
+
+  return [
+    { time: '23:00', score: clamp(Math.round(base), 0, 100) },
+    { time: '01:00', score: clamp(Math.round(base + 8), 0, 100) },
+    { time: '03:00', score: clamp(Math.round(base + 14), 0, 100) },
+    { time: '05:00', score: clamp(Math.round(base + 18), 0, 100) },
+    { time: '현재', score },
+  ]
 }
 
 function directionVariant(direction: Direction) {
@@ -133,12 +272,189 @@ function formatSignedCurrency(value: number, market: 'KR' | 'US') {
     : `${prefix}$${abs.toLocaleString('en-US', { maximumFractionDigits: 2 })}`
 }
 
-function holdingProfit(holding: (typeof holdings)[number]) {
+function holdingProfit(holding: Holding) {
   return (holding.currentPrice - holding.averagePrice) * holding.quantity
 }
 
 function relatedIssues(symbol: string) {
   return keyIssues.filter((issue) => issue.relatedSymbols.includes(symbol))
+}
+
+function mergeHoldingsWithQuotes(quoteMap: Map<string, MarketQuote>) {
+  const usdKrw = getQuote(quoteMap, 'USD/KRW')?.price ?? Number(marketStatus.usdKrw.replace(/,/g, ''))
+  const updated = holdings.map((holding) => {
+    const quote = getQuote(quoteMap, holding.symbol)
+    if (!quote) return holding
+
+    const dayChange = quote.changePercent ?? holding.dayChange
+    const impact = getImpactFromChange(dayChange)
+    return {
+      ...holding,
+      currentPrice: quote.price,
+      dayChange,
+      impact,
+      impactNote:
+        impact === 'positive'
+          ? `${quote.source} 기준 가격 흐름이 우호적입니다.`
+          : impact === 'negative'
+            ? `${quote.source} 기준 가격 흐름이 부담입니다.`
+            : `${quote.source} 기준 가격은 전일 대비 큰 방향성이 없습니다.`,
+    }
+  })
+
+  const positionValues = updated.map((holding) => {
+    const marketValue = holding.currentPrice * holding.quantity
+    return holding.market === 'US' ? marketValue * usdKrw : marketValue
+  })
+  const totalValue = positionValues.reduce((sum, value) => sum + value, 0)
+
+  return updated.map((holding, index) => ({
+    ...holding,
+    portfolioWeight: totalValue > 0 ? round((positionValues[index] / totalValue) * 100, 1) : holding.portfolioWeight,
+  }))
+}
+
+function mergeWatchlistWithQuotes(quoteMap: Map<string, MarketQuote>) {
+  return watchlist.map((item) => {
+    const quote = getQuote(quoteMap, item.symbol)
+    if (!quote) return item
+
+    const distanceToBuy = round(Math.max(0, ((quote.price - item.targetBuyPrice) / item.targetBuyPrice) * 100), 1)
+    const status: WatchItem['status'] =
+      Math.abs(quote.changePercent ?? 0) >= 3 ? 'alert' : distanceToBuy <= 3 ? 'near' : 'waiting'
+
+    return {
+      ...item,
+      currentPrice: quote.price,
+      distanceToBuy,
+      status,
+    }
+  })
+}
+
+function mergeIndicatorsWithQuotes(quoteMap: Map<string, MarketQuote>) {
+  return leadingIndicators.map((indicator) => {
+    const quote = getQuote(quoteMap, indicator.symbol)
+    if (!quote) return indicator
+
+    const change = quote.changePercent ?? indicator.change
+    const direction = getDirectionFromChange(indicator.symbol, change)
+
+    return {
+      ...indicator,
+      value: formatIndicatorValue(indicator.symbol, quote.price),
+      change,
+      direction,
+      signal: getSignalFromDirection(direction),
+      note: liveIndicatorNotes[indicator.symbol] ?? indicator.note,
+    }
+  })
+}
+
+function factorImpact(symbol: string, label: string, rawChange: number | null | undefined, weight: number, limit: number) {
+  const change = rawChange ?? 0
+  const adjustedChange = inverseIndicators.has(symbol) ? -change : change
+  const impact = clamp(Math.round(adjustedChange * weight), -limit, limit)
+
+  return {
+    label,
+    impact,
+    direction: impact > 0 ? 'positive' : impact < 0 ? 'negative' : 'neutral',
+  } satisfies BiasScore['positives'][number]
+}
+
+function buildLiveBiasScore(indicators: MarketIndicator[], liveQuoteCount: number): BiasScore {
+  if (liveQuoteCount === 0) return biasScore
+
+  const indicatorMap = new Map(indicators.map((indicator) => [indicator.symbol, indicator]))
+  const factors = [
+    factorImpact('SOX', 'SOX 반도체 흐름', indicatorMap.get('SOX')?.change, 9, 24),
+    factorImpact('NQ=F', 'NQ 선물 방향', indicatorMap.get('NQ=F')?.change, 8, 18),
+    factorImpact('ES=F', 'S&P500 선물 방향', indicatorMap.get('ES=F')?.change, 5, 10),
+    factorImpact('VIX', 'VIX 변동성 압력', indicatorMap.get('VIX')?.change, 4, 12),
+    factorImpact('USD/KRW', '달러/원 환율 압력', indicatorMap.get('USD/KRW')?.change, 6, 18),
+    factorImpact('US10Y', '미국 10년물 금리 압력', indicatorMap.get('US10Y')?.change, 4, 12),
+  ]
+  const score = clamp(50 + factors.reduce((sum, factor) => sum + factor.impact, 0), 0, 100)
+  const positives = factors.filter((factor) => factor.impact >= 0)
+  const risks = factors.filter((factor) => factor.impact < 0)
+  const confidence: BiasScore['confidence'] = liveQuoteCount >= 8 ? 'high' : liveQuoteCount >= 4 ? 'medium' : 'low'
+  const stance: BiasScore['stance'] = score >= 60 ? 'favorable' : score <= 43 ? 'pressure' : 'neutral'
+  const summary =
+    stance === 'favorable'
+      ? '실시간 선행 지표는 국내장에 우호적인 쪽으로 기울어 있습니다.'
+      : stance === 'pressure'
+        ? '실시간 선행 지표는 국내장에 부담 요인이 더 큽니다.'
+        : '실시간 선행 지표는 뚜렷한 한 방향보다 중립에 가깝습니다.'
+
+  return {
+    market: 'KOSPI',
+    score,
+    stance,
+    confidence,
+    summary,
+    positives: positives.length > 0 ? positives : [{ label: '뚜렷한 긍정 요인 없음', impact: 0, direction: 'neutral' }],
+    risks: risks.length > 0 ? risks : [{ label: '뚜렷한 부담 요인 없음', impact: 0, direction: 'neutral' }],
+  }
+}
+
+function buildMarketStatusView({
+  quoteMap,
+  fetchedAt,
+  quoteStatus,
+}: {
+  quoteMap: Map<string, MarketQuote>
+  fetchedAt: string | null
+  quoteStatus: QuoteStatus
+}): MarketStatusView {
+  const usdKrw = getQuote(quoteMap, 'USD/KRW')
+  const vix = getQuote(quoteMap, 'VIX')
+  const usSession =
+    quoteStatus === 'ready'
+      ? '실시간 시세 연결'
+      : quoteStatus === 'partial'
+        ? '일부 시세 연결'
+        : quoteStatus === 'loading'
+          ? '시세 업데이트 중'
+          : marketStatus.usSession
+
+  return {
+    lastUpdated: formatMarketTime(fetchedAt),
+    usSession,
+    koreaOpenIn: getKoreaOpenText(),
+    usdKrw: usdKrw ? formatIndicatorValue('USD/KRW', usdKrw.price) : marketStatus.usdKrw,
+    vix: vix ? formatIndicatorValue('VIX', vix.price) : marketStatus.vix,
+  }
+}
+
+function buildDashboardSnapshot({
+  quotes,
+  fetchedAt,
+  quoteStatus,
+  quoteMessage,
+}: {
+  quotes: MarketQuote[]
+  fetchedAt: string | null
+  quoteStatus: QuoteStatus
+  quoteMessage: string
+}): DashboardSnapshot {
+  const quoteMap = quoteBySymbol(quotes)
+  const liveHoldings = mergeHoldingsWithQuotes(quoteMap)
+  const liveWatchlist = mergeWatchlistWithQuotes(quoteMap)
+  const liveIndicators = mergeIndicatorsWithQuotes(quoteMap)
+  const liveBiasScore = buildLiveBiasScore(liveIndicators, quotes.length)
+
+  return {
+    holdings: liveHoldings,
+    watchlist: liveWatchlist,
+    leadingIndicators: liveIndicators,
+    biasScore: liveBiasScore,
+    marketStatus: buildMarketStatusView({ quoteMap, fetchedAt, quoteStatus }),
+    quoteStatus,
+    quoteMessage,
+    liveQuoteCount: quotes.length,
+    fetchedAt,
+  }
 }
 
 function MetricCard({
@@ -171,11 +487,20 @@ function PageGrid({ children }: { children: ReactNode }) {
   return <div className="mx-auto grid max-w-[1600px] gap-4 p-4 md:p-6">{children}</div>
 }
 
-function HoldingsPage() {
-  const totalPositions = holdings.length
-  const positiveCount = holdings.filter((holding) => holding.impact === 'positive').length
-  const riskCount = holdings.filter((holding) => holding.impact === 'negative').length
-  const topWeight = holdings.reduce((top, holding) => (holding.portfolioWeight > top.portfolioWeight ? holding : top), holdings[0])
+function HoldingsPage({
+  holdingsData,
+  biasScoreData,
+}: {
+  holdingsData: Holding[]
+  biasScoreData: BiasScore
+}) {
+  const totalPositions = holdingsData.length
+  const positiveCount = holdingsData.filter((holding) => holding.impact === 'positive').length
+  const riskCount = holdingsData.filter((holding) => holding.impact === 'negative').length
+  const topWeight = holdingsData.reduce(
+    (top, holding) => (holding.portfolioWeight > top.portfolioWeight ? holding : top),
+    holdingsData[0],
+  )
 
   return (
     <PageGrid>
@@ -183,7 +508,7 @@ function HoldingsPage() {
         <MetricCard label="보유 종목" value={`${totalPositions}개`} detail={`${positiveCount}개 우호`} tone="positive" />
         <MetricCard label="최대 비중" value={`${topWeight.name}`} detail={`${topWeight.portfolioWeight}%`} tone="warning" />
         <MetricCard label="이슈 부담" value={`${riskCount}개`} detail="환율/금리 확인" tone={riskCount ? 'negative' : 'neutral'} />
-        <MetricCard label="국내장 방향점수" value={`+${biasScore.score}`} detail={`신뢰도 ${confidenceLabel[biasScore.confidence]}`} tone="positive" />
+        <MetricCard label="국내장 방향점수" value={`+${biasScoreData.score}`} detail={`신뢰도 ${confidenceLabel[biasScoreData.confidence]}`} tone={biasScoreData.stance === 'pressure' ? 'negative' : biasScoreData.stance === 'neutral' ? 'neutral' : 'positive'} />
       </section>
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
@@ -207,7 +532,7 @@ function HoldingsPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {holdings.map((holding) => {
+                {holdingsData.map((holding) => {
                   const profit = holdingProfit(holding)
                   return (
                     <TableRow key={holding.symbol}>
@@ -242,7 +567,7 @@ function HoldingsPage() {
             <CardDescription>집중도와 영향 요약</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            {holdings.map((holding) => (
+            {holdingsData.map((holding) => (
               <div key={holding.symbol} className="space-y-2">
                 <div className="flex items-center justify-between gap-3 text-sm">
                   <div>
@@ -261,17 +586,17 @@ function HoldingsPage() {
   )
 }
 
-function WatchlistPage() {
+function WatchlistPage({ watchlistData }: { watchlistData: WatchItem[] }) {
   return (
     <PageGrid>
       <section className="grid gap-4 md:grid-cols-3">
-        <MetricCard label="관심종목" value={`${watchlist.length}개`} detail="조건 추적" />
-        <MetricCard label="매수가 근접" value={`${watchlist.filter((item) => item.status === 'near').length}개`} detail="우선 확인" tone="positive" />
-        <MetricCard label="이슈 확인" value={`${watchlist.filter((item) => item.status === 'alert').length}개`} detail="뉴스 연결" tone="warning" />
+        <MetricCard label="관심종목" value={`${watchlistData.length}개`} detail="조건 추적" />
+        <MetricCard label="매수가 근접" value={`${watchlistData.filter((item) => item.status === 'near').length}개`} detail="우선 확인" tone="positive" />
+        <MetricCard label="이슈 확인" value={`${watchlistData.filter((item) => item.status === 'alert').length}개`} detail="뉴스 연결" tone="warning" />
       </section>
 
       <section className="grid gap-4 xl:grid-cols-3">
-        {watchlist.map((item) => (
+        {watchlistData.map((item) => (
           <Card key={item.symbol}>
             <CardHeader>
               <div className="flex items-start justify-between gap-3">
@@ -311,20 +636,28 @@ function WatchlistPage() {
   )
 }
 
-function MarketRadarPage() {
+function MarketRadarPage({
+  leadingIndicatorsData,
+  biasScoreData,
+}: {
+  leadingIndicatorsData: MarketIndicator[]
+  biasScoreData: BiasScore
+}) {
+  const indicatorChartData = buildIndicatorChartData(leadingIndicatorsData)
+
   return (
     <PageGrid>
       <section className="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
         <Card>
           <CardHeader>
             <CardTitle>국내장 방향점수</CardTitle>
-            <CardDescription>{biasScore.summary}</CardDescription>
+            <CardDescription>{biasScoreData.summary}</CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="mb-3 text-5xl font-semibold">+{biasScore.score}</div>
-            <Progress value={biasScore.score} />
+            <div className="mb-3 text-5xl font-semibold">+{biasScoreData.score}</div>
+            <Progress value={biasScoreData.score} />
             <div className="mt-4 grid gap-2">
-              {[...biasScore.positives, ...biasScore.risks].map((factor) => (
+              {[...biasScoreData.positives, ...biasScoreData.risks].map((factor) => (
                 <div key={factor.label} className="flex items-center justify-between rounded-md border border-border bg-muted/15 p-3 text-sm">
                   <span>{factor.label}</span>
                   <Badge variant={factor.impact >= 0 ? 'positive' : 'negative'}>{factor.impact >= 0 ? `+${factor.impact}` : factor.impact}</Badge>
@@ -361,7 +694,7 @@ function MarketRadarPage() {
       </section>
 
       <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        {leadingIndicators.map((indicator) => (
+        {leadingIndicatorsData.map((indicator) => (
           <Card key={indicator.symbol}>
             <CardContent className="p-4">
               <div className="mb-3 flex items-start justify-between gap-2">
@@ -403,7 +736,7 @@ function formatNewsTime(value: string) {
   })
 }
 
-function NewsPage() {
+function NewsPage({ holdingsData }: { holdingsData: Holding[] }) {
   const [activeKeyword, setActiveKeyword] = useState('전체')
   const [liveNews, setLiveNews] = useState<LiveNewsItem[]>([])
   const [newsStatus, setNewsStatus] = useState<'idle' | 'loading' | 'ready' | 'fallback' | 'error'>('idle')
@@ -467,8 +800,8 @@ function NewsPage() {
     ? liveNews.filter((item) => item.importance === 'high').length
     : keyIssues.filter((issue) => issue.importance === 'high').length
   const linkedNewsCount = hasLiveNews
-    ? liveNews.filter((item) => holdings.some((holding) => item.relatedSymbols.includes(holding.symbol))).length
-    : keyIssues.filter((issue) => holdings.some((holding) => issue.relatedSymbols.includes(holding.symbol))).length
+    ? liveNews.filter((item) => holdingsData.some((holding) => item.relatedSymbols.includes(holding.symbol))).length
+    : keyIssues.filter((issue) => holdingsData.some((holding) => issue.relatedSymbols.includes(holding.symbol))).length
   const statusLabel =
     newsStatus === 'ready'
       ? '네이버 API 연결'
@@ -696,9 +1029,18 @@ function NotesPage() {
   )
 }
 
-function SettingsPage() {
+function SettingsPage({
+  holdingsData,
+  watchlistData,
+  leadingIndicatorsData,
+}: {
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+  leadingIndicatorsData: MarketIndicator[]
+}) {
   const sources = [
     { name: '네이버 뉴스 API', cost: '무료 시작', priority: '우선' },
+    { name: 'Yahoo Finance chart', cost: '무료 시작', priority: '우선' },
     { name: 'OpenDART', cost: '무료 시작', priority: '우선' },
     { name: '증권사 Open API', cost: '계좌 연동', priority: '우선' },
     { name: 'FMP / Finnhub / Polygon', cost: '유료 후보', priority: '후순위' },
@@ -716,7 +1058,7 @@ function SettingsPage() {
             <div>
               <div className="mb-2 text-xs text-muted-foreground">보유종목</div>
               <div className="flex flex-wrap gap-2">
-                {holdings.map((holding) => (
+                {holdingsData.map((holding) => (
                   <Badge key={holding.symbol} variant="secondary">
                     {holding.symbol}
                   </Badge>
@@ -726,7 +1068,7 @@ function SettingsPage() {
             <div>
               <div className="mb-2 text-xs text-muted-foreground">관심종목</div>
               <div className="flex flex-wrap gap-2">
-                {watchlist.map((item) => (
+                {watchlistData.map((item) => (
                   <Badge key={item.symbol} variant="secondary">
                     {item.symbol}
                   </Badge>
@@ -736,7 +1078,7 @@ function SettingsPage() {
             <div>
               <div className="mb-2 text-xs text-muted-foreground">선행 지표</div>
               <div className="flex flex-wrap gap-2">
-                {leadingIndicators.map((indicator) => (
+                {leadingIndicatorsData.map((indicator) => (
                   <Badge key={indicator.symbol} variant="neutral">
                     {indicator.symbol}
                   </Badge>
@@ -778,20 +1120,100 @@ function SettingsPage() {
   )
 }
 
-function renderPage(page: PageId) {
-  if (page === 'holdings') return <HoldingsPage />
-  if (page === 'watchlist') return <WatchlistPage />
-  if (page === 'radar') return <MarketRadarPage />
-  if (page === 'news') return <NewsPage />
+function renderPage(page: PageId, snapshot: DashboardSnapshot) {
+  if (page === 'holdings') return <HoldingsPage holdingsData={snapshot.holdings} biasScoreData={snapshot.biasScore} />
+  if (page === 'watchlist') return <WatchlistPage watchlistData={snapshot.watchlist} />
+  if (page === 'radar') return <MarketRadarPage leadingIndicatorsData={snapshot.leadingIndicators} biasScoreData={snapshot.biasScore} />
+  if (page === 'news') return <NewsPage holdingsData={snapshot.holdings} />
   if (page === 'calendar') return <CalendarPage />
   if (page === 'notes') return <NotesPage />
-  if (page === 'settings') return <SettingsPage />
+  if (page === 'settings') {
+    return (
+      <SettingsPage
+        holdingsData={snapshot.holdings}
+        watchlistData={snapshot.watchlist}
+        leadingIndicatorsData={snapshot.leadingIndicators}
+      />
+    )
+  }
   return null
 }
 
 export function Dashboard() {
   const [activePage, setActivePage] = useState<PageId>('dashboard')
+  const [quoteResponse, setQuoteResponse] = useState<QuotesApiResponse | null>(null)
+  const [quoteStatus, setQuoteStatus] = useState<QuoteStatus>('idle')
+  const [quoteMessage, setQuoteMessage] = useState('시세 연결 대기')
   const currentPage = navItems.find((item) => item.id === activePage) ?? navItems[0]
+  const loadQuotes = useCallback(async (signal?: AbortSignal) => {
+    setQuoteStatus((status) => (status === 'idle' ? 'loading' : status))
+
+    try {
+      const params = new URLSearchParams({
+        symbols: quoteSymbols.join(','),
+      })
+      const response = await fetch(`/api/quotes?${params.toString()}`, { signal })
+      const contentType = response.headers.get('content-type') ?? ''
+
+      if (!contentType.includes('application/json')) {
+        throw new Error('시세 API 응답을 확인할 수 없습니다.')
+      }
+
+      const payload = (await response.json()) as QuotesApiResponse
+
+      if (!response.ok) {
+        setQuoteStatus('error')
+        setQuoteMessage(payload.message ?? '시세 API 호출에 실패했습니다.')
+        return
+      }
+
+      setQuoteResponse(payload)
+      setQuoteStatus(payload.status)
+      setQuoteMessage(
+        payload.message ??
+          (payload.quotes.length > 0 ? `${payload.quotes.length}개 시세 연결` : '시세 소스가 응답하지 않아 샘플 데이터를 표시합니다.'),
+      )
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+
+      setQuoteStatus('error')
+      setQuoteMessage(error instanceof Error ? error.message : '시세를 불러오지 못했습니다.')
+    }
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void loadQuotes(controller.signal)
+    const intervalId = window.setInterval(() => {
+      void loadQuotes()
+    }, 120_000)
+
+    return () => {
+      controller.abort()
+      window.clearInterval(intervalId)
+    }
+  }, [loadQuotes])
+
+  const snapshot = useMemo(
+    () =>
+      buildDashboardSnapshot({
+        quotes: quoteResponse?.quotes ?? [],
+        fetchedAt: quoteResponse?.fetchedAt ?? null,
+        quoteStatus,
+        quoteMessage,
+      }),
+    [quoteMessage, quoteResponse, quoteStatus],
+  )
+  const indicatorChartData = buildIndicatorChartData(snapshot.leadingIndicators)
+  const biasTimeline = buildBiasTimeline(snapshot.biasScore.score)
+  const quoteStatusVariant: 'positive' | 'negative' | 'warning' | 'neutral' =
+    snapshot.quoteStatus === 'ready'
+      ? 'positive'
+      : snapshot.quoteStatus === 'partial'
+        ? 'warning'
+        : snapshot.quoteStatus === 'error'
+          ? 'negative'
+          : 'neutral'
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -839,12 +1261,16 @@ export function Dashboard() {
               <div className="flex flex-wrap items-center gap-2">
                 <Badge variant="neutral">
                   <Clock3 className="mr-1 size-3" />
-                  업데이트 {marketStatus.lastUpdated}
+                  업데이트 {snapshot.marketStatus.lastUpdated}
                 </Badge>
-                <Badge variant="secondary">{marketStatus.usSession}</Badge>
-                <Badge variant="warning">국내장 개장 {marketStatus.koreaOpenIn}</Badge>
-                <Badge variant="negative">USD/KRW {marketStatus.usdKrw}</Badge>
-                <Badge variant="positive">VIX {marketStatus.vix}</Badge>
+                <Badge variant={quoteStatusVariant}>{snapshot.quoteMessage}</Badge>
+                <Badge variant="secondary">{snapshot.marketStatus.usSession}</Badge>
+                <Badge variant="warning">국내장 개장 {snapshot.marketStatus.koreaOpenIn}</Badge>
+                <Badge variant="negative">USD/KRW {snapshot.marketStatus.usdKrw}</Badge>
+                <Badge variant="positive">VIX {snapshot.marketStatus.vix}</Badge>
+                <Button size="icon" variant="outline" aria-label="시세 새로고침" onClick={() => void loadQuotes()} disabled={quoteStatus === 'loading'}>
+                  <RefreshCw className={cn('size-4', quoteStatus === 'loading' && 'animate-spin')} />
+                </Button>
                 <Button size="icon" variant="outline" aria-label="알림">
                   <Bell className="size-4" />
                 </Button>
@@ -877,29 +1303,35 @@ export function Dashboard() {
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <CardTitle>내일 국내장 방향점수</CardTitle>
-                      <CardDescription>{biasScore.summary}</CardDescription>
+                      <CardDescription>{snapshot.biasScore.summary}</CardDescription>
                     </div>
-                    <Badge variant="positive">신뢰도 {confidenceLabel[biasScore.confidence]}</Badge>
+                    <Badge variant={snapshot.biasScore.stance === 'pressure' ? 'negative' : snapshot.biasScore.stance === 'neutral' ? 'neutral' : 'positive'}>신뢰도 {confidenceLabel[snapshot.biasScore.confidence]}</Badge>
                   </div>
                 </CardHeader>
                 <CardContent className="grid gap-5 lg:grid-cols-[0.85fr_1fr]">
                   <div>
                     <div className="mb-2 flex items-end gap-3">
-                      <div className="text-5xl font-semibold leading-none text-foreground">+{biasScore.score}</div>
+                      <div className="text-5xl font-semibold leading-none text-foreground">+{snapshot.biasScore.score}</div>
                       <div className="pb-1 text-sm text-muted-foreground">/ 100</div>
                     </div>
                     <div className="mb-4 flex items-center gap-2">
                       <Gauge className="size-4 text-primary" />
-                      <span className="text-sm font-medium">우호적이지만 환율 확인 필요</span>
+                      <span className="text-sm font-medium">
+                        {snapshot.biasScore.stance === 'favorable'
+                          ? '우호적이지만 환율 확인 필요'
+                          : snapshot.biasScore.stance === 'pressure'
+                            ? '부담 우세, 장 초반 수급 확인'
+                            : '중립권, 가격 반응 확인'}
+                      </span>
                     </div>
-                    <Progress value={biasScore.score} />
+                    <Progress value={snapshot.biasScore.score} />
                   </div>
 
                   <div className="grid gap-3 2xl:grid-cols-2">
                     <div className="rounded-md border border-border bg-muted/20 p-3">
                       <div className="mb-2 text-xs font-medium text-muted-foreground">긍정 요인</div>
                       <div className="space-y-2">
-                        {biasScore.positives.map((factor) => (
+                        {snapshot.biasScore.positives.map((factor) => (
                           <div key={factor.label} className="flex items-center justify-between gap-3 text-sm">
                             <span>{factor.label}</span>
                             <Badge variant="positive">+{factor.impact}</Badge>
@@ -910,7 +1342,7 @@ export function Dashboard() {
                     <div className="rounded-md border border-border bg-muted/20 p-3">
                       <div className="mb-2 text-xs font-medium text-muted-foreground">부담 요인</div>
                       <div className="space-y-2">
-                        {biasScore.risks.map((factor) => (
+                        {snapshot.biasScore.risks.map((factor) => (
                           <div key={factor.label} className="flex items-center justify-between gap-3 text-sm">
                             <span>{factor.label}</span>
                             <Badge variant={factor.impact < 0 ? 'negative' : 'warning'}>{factor.impact}</Badge>
@@ -955,7 +1387,7 @@ export function Dashboard() {
                 </CardHeader>
                 <CardContent>
                   <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                    {leadingIndicators.map((indicator) => (
+                    {snapshot.leadingIndicators.map((indicator) => (
                       <div key={indicator.symbol} className="rounded-md border border-border bg-muted/15 p-3">
                         <div className="mb-3 flex items-start justify-between gap-2">
                           <div>
@@ -1033,7 +1465,7 @@ export function Dashboard() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {holdings.map((holding) => (
+                      {snapshot.holdings.map((holding) => (
                         <TableRow key={holding.symbol}>
                           <TableCell className="font-mono font-medium">{holding.symbol}</TableCell>
                           <TableCell>{holding.name}</TableCell>
@@ -1063,7 +1495,7 @@ export function Dashboard() {
                   <CardDescription>관심 매수가와 이슈 조건 도달 여부</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
-                  {watchlist.map((item) => (
+                  {snapshot.watchlist.map((item) => (
                     <div key={item.symbol} className="rounded-md border border-border bg-muted/15 p-3">
                       <div className="flex items-start justify-between gap-3">
                         <div>
@@ -1179,7 +1611,7 @@ export function Dashboard() {
             </Card>
           </div>
           ) : (
-            renderPage(activePage)
+            renderPage(activePage, snapshot)
           )}
         </main>
       </div>

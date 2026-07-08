@@ -12,6 +12,22 @@ export type MarketIndicator = {
   note: string
 }
 
+export type MarketQuote = {
+  symbol: string
+  sourceSymbol: string
+  name: string
+  market: 'KR' | 'US'
+  type: 'stock' | 'indicator'
+  currency: string
+  exchange: string | null
+  price: number
+  previousClose: number | null
+  change: number | null
+  changePercent: number | null
+  updatedAt: string
+  source: string
+}
+
 export type BiasFactor = {
   label: string
   impact: number
