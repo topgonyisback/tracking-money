@@ -99,11 +99,16 @@ export type LiveNewsItem = {
 export type CalendarEvent = {
   id: string
   date: string
+  absoluteDate?: string
   time: string
   title: string
   type: 'earnings' | 'macro' | 'policy' | 'company' | 'dividend'
   importance: 'low' | 'medium' | 'high'
   relatedSymbols: string[]
+  status?: 'confirmed' | 'estimated' | 'watch'
+  confidence?: Confidence
+  source?: string
+  description?: string
 }
 
 export type ActionMemo = {

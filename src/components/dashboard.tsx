@@ -43,7 +43,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import {
   actionMemo,
   biasScore,
-  calendarEvents,
+  calendarEvents as fallbackCalendarEvents,
   holdings,
   keyIssues,
   leadingIndicators,
@@ -52,7 +52,7 @@ import {
   watchlist,
 } from '@/data/mock-dashboard'
 import { cn } from '@/lib/utils'
-import type { BiasScore, Direction, Holding, LiveNewsItem, MarketIndicator, MarketQuote, WatchItem } from '@/types/market'
+import type { BiasScore, CalendarEvent, Direction, Holding, LiveNewsItem, MarketIndicator, MarketQuote, WatchItem } from '@/types/market'
 
 const navItems = [
   { id: 'dashboard', label: '대시보드', subtitle: '국내장 예열과 포트폴리오 영향', icon: LayoutDashboard },
@@ -68,6 +68,8 @@ const navItems = [
 type PageId = (typeof navItems)[number]['id']
 
 type QuoteStatus = 'idle' | 'loading' | 'ready' | 'partial' | 'fallback' | 'error'
+type CalendarStatus = 'idle' | 'loading' | 'ready' | 'fallback' | 'error'
+type NewsStatus = 'idle' | 'loading' | 'ready' | 'fallback' | 'error'
 
 type QuotesApiResponse = {
   configured: boolean
@@ -76,6 +78,15 @@ type QuotesApiResponse = {
   status: 'ready' | 'partial' | 'fallback'
   quotes: MarketQuote[]
   errors: { symbol: string; sourceSymbol: string; message: string }[]
+  message?: string
+}
+
+type CalendarApiResponse = {
+  configured: boolean
+  source: string
+  fetchedAt: string
+  status: 'ready' | 'fallback'
+  events: CalendarEvent[]
   message?: string
 }
 
@@ -95,6 +106,12 @@ type DashboardSnapshot = {
   quoteMessage: string
   liveQuoteCount: number
   fetchedAt: string | null
+  calendarEvents: CalendarEvent[]
+  calendarStatus: CalendarStatus
+  calendarMessage: string
+  liveNews: LiveNewsItem[]
+  newsStatus: NewsStatus
+  newsMessage: string
 }
 
 const storageKey = 'tracking-money-dashboard-v1'
@@ -138,6 +155,20 @@ const directionLabel = {
   negative: '부담',
   neutral: '중립',
   mixed: '혼재',
+}
+
+const calendarStatusLabel = {
+  confirmed: '확정',
+  estimated: '추정',
+  watch: '점검',
+}
+
+const calendarTypeLabel = {
+  earnings: '실적',
+  macro: '매크로',
+  policy: '정책',
+  company: '기업',
+  dividend: '배당',
 }
 
 const watchStatusLabel = {
@@ -243,6 +274,24 @@ function getKoreaOpenText(now = new Date()) {
   const hours = Math.floor(diffMs / 3_600_000)
   const minutes = Math.floor((diffMs % 3_600_000) / 60_000)
   return `${hours}시간 ${minutes}분 전`
+}
+
+function getKstDateKey(now = new Date()) {
+  const kstNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }))
+  const year = kstNow.getFullYear()
+  const month = String(kstNow.getMonth() + 1).padStart(2, '0')
+  const day = String(kstNow.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function isTodayCalendarEvent(event: CalendarEvent) {
+  return event.date === '오늘' || event.absoluteDate === getKstDateKey()
+}
+
+function calendarEventStatusVariant(event: CalendarEvent): 'positive' | 'warning' | 'neutral' {
+  if (event.status === 'confirmed') return 'positive'
+  if (event.status === 'estimated') return 'warning'
+  return 'neutral'
 }
 
 function getDirectionFromChange(symbol: string, changePercent: number | null | undefined): Direction {
@@ -439,6 +488,53 @@ function buildLiveBiasScore(indicators: MarketIndicator[], liveQuoteCount: numbe
   }
 }
 
+function newsItemImpact(item: LiveNewsItem) {
+  const importanceWeight = item.importance === 'high' ? 2 : item.importance === 'medium' ? 1.25 : 0.75
+  const confidenceWeight = item.confidence === 'high' ? 1.2 : item.confidence === 'medium' ? 1 : 0.7
+  const directionWeight =
+    item.direction === 'positive' ? 1 : item.direction === 'negative' ? -1 : item.direction === 'mixed' ? -0.35 : 0
+
+  return directionWeight * importanceWeight * confidenceWeight
+}
+
+function buildNewsBiasFactor(newsItems: LiveNewsItem[], holdingsData: Holding[], watchlistData: WatchItem[]) {
+  if (newsItems.length === 0) return null
+
+  const trackedSymbols = new Set([...holdingsData.map((holding) => holding.symbol), ...watchlistData.map((item) => item.symbol)])
+  const relatedItems = newsItems.filter((item) => item.relatedSymbols.some((symbol) => trackedSymbols.has(symbol)))
+  const targetItems = relatedItems.length > 0 ? relatedItems : newsItems.slice(0, 8)
+  const rawImpact = targetItems.reduce((sum, item) => sum + newsItemImpact(item), 0)
+  const impact = clamp(Math.round(rawImpact * 3), -14, 14)
+
+  if (impact === 0) return null
+
+  return {
+    label: relatedItems.length > 0 ? '보유/관심 뉴스 압력' : '전체 뉴스 심리',
+    impact,
+    direction: impact > 0 ? 'positive' : 'negative',
+  } satisfies BiasScore['positives'][number]
+}
+
+function applyNewsBiasFactor(score: BiasScore, factor: BiasScore['positives'][number] | null): BiasScore {
+  if (!factor) return score
+
+  const nextScore = clamp(score.score + factor.impact, 0, 100)
+  const stance: BiasScore['stance'] = nextScore >= 60 ? 'favorable' : nextScore <= 43 ? 'pressure' : 'neutral'
+  const newsSummary =
+    factor.impact > 0
+      ? '뉴스 흐름은 보유/관심종목에 우호적인 쪽으로 더해졌습니다.'
+      : '뉴스 흐름은 보유/관심종목에 부담 요인으로 더해졌습니다.'
+
+  return {
+    ...score,
+    score: nextScore,
+    stance,
+    summary: `${score.summary} ${newsSummary}`,
+    positives: factor.impact > 0 ? [...score.positives, factor] : score.positives,
+    risks: factor.impact < 0 ? [...score.risks, factor] : score.risks,
+  }
+}
+
 function buildMarketStatusView({
   quoteMap,
   fetchedAt,
@@ -475,6 +571,12 @@ function buildDashboardSnapshot({
   fetchedAt,
   quoteStatus,
   quoteMessage,
+  calendarEventsData,
+  calendarStatus,
+  calendarMessage,
+  liveNews,
+  newsStatus,
+  newsMessage,
 }: {
   baseHoldings: Holding[]
   baseWatchlist: WatchItem[]
@@ -482,12 +584,21 @@ function buildDashboardSnapshot({
   fetchedAt: string | null
   quoteStatus: QuoteStatus
   quoteMessage: string
+  calendarEventsData: CalendarEvent[]
+  calendarStatus: CalendarStatus
+  calendarMessage: string
+  liveNews: LiveNewsItem[]
+  newsStatus: NewsStatus
+  newsMessage: string
 }): DashboardSnapshot {
   const quoteMap = quoteBySymbol(quotes)
   const liveHoldings = mergeHoldingsWithQuotes(baseHoldings, quoteMap)
   const liveWatchlist = mergeWatchlistWithQuotes(baseWatchlist, quoteMap)
   const liveIndicators = mergeIndicatorsWithQuotes(quoteMap)
-  const liveBiasScore = buildLiveBiasScore(liveIndicators, quotes.length)
+  const liveBiasScore = applyNewsBiasFactor(
+    buildLiveBiasScore(liveIndicators, quotes.length),
+    buildNewsBiasFactor(liveNews, liveHoldings, liveWatchlist),
+  )
 
   return {
     holdings: liveHoldings,
@@ -499,6 +610,12 @@ function buildDashboardSnapshot({
     quoteMessage,
     liveQuoteCount: quotes.length,
     fetchedAt,
+    calendarEvents: calendarEventsData,
+    calendarStatus,
+    calendarMessage,
+    liveNews,
+    newsStatus,
+    newsMessage,
   }
 }
 
@@ -1073,62 +1190,20 @@ function formatNewsTime(value: string) {
   })
 }
 
-function NewsPage({ holdingsData }: { holdingsData: Holding[] }) {
+function NewsPage({
+  holdingsData,
+  liveNews,
+  newsStatus,
+  newsMessage,
+  onRefreshNews,
+}: {
+  holdingsData: Holding[]
+  liveNews: LiveNewsItem[]
+  newsStatus: NewsStatus
+  newsMessage: string
+  onRefreshNews: () => void
+}) {
   const [activeKeyword, setActiveKeyword] = useState('전체')
-  const [liveNews, setLiveNews] = useState<LiveNewsItem[]>([])
-  const [newsStatus, setNewsStatus] = useState<'idle' | 'loading' | 'ready' | 'fallback' | 'error'>('idle')
-  const [newsMessage, setNewsMessage] = useState('')
-
-  const loadLiveNews = useCallback(async (signal?: AbortSignal) => {
-    setNewsStatus('loading')
-    setNewsMessage('')
-
-    try {
-      const params = new URLSearchParams({
-        keywords: newsKeywords.join(','),
-        display: '3',
-      })
-      const response = await fetch(`/api/news?${params.toString()}`, { signal })
-      const contentType = response.headers.get('content-type') ?? ''
-
-      if (!contentType.includes('application/json')) {
-        throw new Error('네이버 뉴스 API 응답을 확인할 수 없습니다.')
-      }
-
-      const payload = (await response.json()) as NewsApiResponse
-
-      if (!response.ok) {
-        setLiveNews(payload.items ?? [])
-        setNewsStatus('error')
-        setNewsMessage(payload.message ?? '네이버 뉴스 API 호출에 실패했습니다.')
-        return
-      }
-
-      if (!payload.configured) {
-        setLiveNews([])
-        setNewsStatus('fallback')
-        setNewsMessage(payload.message ?? '네이버 뉴스 API 환경변수 설정이 필요합니다.')
-        return
-      }
-
-      setLiveNews(payload.items)
-      setNewsStatus(payload.items.length > 0 ? 'ready' : 'fallback')
-      setNewsMessage(payload.items.length > 0 ? `최근 수집 ${formatNewsTime(payload.fetchedAt ?? '')}` : '수집된 뉴스가 없습니다.')
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') return
-
-      setLiveNews([])
-      setNewsStatus('error')
-      setNewsMessage(error instanceof Error ? error.message : '뉴스를 불러오지 못했습니다.')
-    }
-  }, [])
-
-  useEffect(() => {
-    const controller = new AbortController()
-    void loadLiveNews(controller.signal)
-
-    return () => controller.abort()
-  }, [loadLiveNews])
 
   const keywordFilters = ['전체', ...newsKeywords]
   const visibleLiveNews = activeKeyword === '전체' ? liveNews : liveNews.filter((item) => item.keyword === activeKeyword)
@@ -1164,7 +1239,7 @@ function NewsPage({ holdingsData }: { holdingsData: Holding[] }) {
                 <CardTitle>네이버 뉴스 피드</CardTitle>
                 <CardDescription>키워드별 최신 뉴스와 예상 영향을 함께 표시</CardDescription>
               </div>
-              <Button type="button" variant="outline" size="sm" onClick={() => void loadLiveNews()} disabled={newsStatus === 'loading'}>
+              <Button type="button" variant="outline" size="sm" onClick={onRefreshNews} disabled={newsStatus === 'loading'}>
                 <RefreshCw className={cn('size-4', newsStatus === 'loading' && 'animate-spin')} />
                 새로고침
               </Button>
@@ -1279,39 +1354,81 @@ function NewsPage({ holdingsData }: { holdingsData: Holding[] }) {
   )
 }
 
-function CalendarPage() {
+function CalendarPage({
+  eventsData,
+  calendarStatus,
+  calendarMessage,
+  onRefreshCalendar,
+}: {
+  eventsData: CalendarEvent[]
+  calendarStatus: CalendarStatus
+  calendarMessage: string
+  onRefreshCalendar: () => void
+}) {
+  const todayEvents = eventsData.filter(isTodayCalendarEvent)
+  const earningsEvents = eventsData.filter((event) => event.type === 'earnings')
+  const macroEvents = eventsData.filter((event) => event.type !== 'earnings')
+  const statusLabel =
+    calendarStatus === 'ready'
+      ? '캘린더 연결'
+      : calendarStatus === 'loading'
+        ? '불러오는 중'
+        : calendarStatus === 'error'
+          ? '연결 오류'
+          : '기본 일정'
+
   return (
     <PageGrid>
       <section className="grid gap-4 md:grid-cols-3">
-        <MetricCard label="오늘 이벤트" value={`${calendarEvents.filter((event) => event.date === '오늘').length}건`} detail="장중/장후 확인" tone="warning" />
-        <MetricCard label="실적 관련" value={`${calendarEvents.filter((event) => event.type === 'earnings').length}건`} detail="보유종목 연결" tone="positive" />
-        <MetricCard label="매크로/정책" value={`${calendarEvents.filter((event) => event.type !== 'earnings').length}건`} detail="지수 영향" />
+        <MetricCard label="오늘 이벤트" value={`${todayEvents.length}건`} detail="장중/장후 확인" tone="warning" />
+        <MetricCard label="실적 관련" value={`${earningsEvents.length}건`} detail="보유/관심 연결" tone="positive" />
+        <MetricCard label="매크로/정책" value={`${macroEvents.length}건`} detail={statusLabel} tone={calendarStatus === 'error' ? 'negative' : calendarStatus === 'ready' ? 'positive' : 'neutral'} />
       </section>
 
       <Card>
         <CardHeader>
-          <CardTitle>이벤트 타임라인</CardTitle>
-          <CardDescription>종목과 지표에 연결된 일정</CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-3 lg:grid-cols-3">
-          {calendarEvents.map((event) => (
-            <div key={event.id} className="rounded-md border border-border bg-muted/15 p-4">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <div className="text-sm text-muted-foreground">
-                  {event.date} · {event.time}
-                </div>
-                <Badge variant={event.importance === 'high' ? 'warning' : 'neutral'}>{importanceLabel[event.importance]}</Badge>
-              </div>
-              <div className="font-medium">{event.title}</div>
-              <div className="mt-4 flex flex-wrap gap-2">
-                {event.relatedSymbols.map((symbol) => (
-                  <Badge key={symbol} variant="secondary">
-                    {symbol}
-                  </Badge>
-                ))}
-              </div>
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div>
+              <CardTitle>이벤트 타임라인</CardTitle>
+              <CardDescription>종목과 지표에 연결된 일정</CardDescription>
             </div>
-          ))}
+            <Button type="button" variant="outline" size="sm" onClick={onRefreshCalendar} disabled={calendarStatus === 'loading'}>
+              <RefreshCw className={cn('size-4', calendarStatus === 'loading' && 'animate-spin')} />
+              새로고침
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            <Badge variant={calendarStatus === 'ready' ? 'positive' : calendarStatus === 'error' ? 'negative' : 'neutral'}>{statusLabel}</Badge>
+            <span className="text-xs text-muted-foreground">{calendarMessage}</span>
+          </div>
+          <div className="grid gap-3 lg:grid-cols-3">
+            {eventsData.map((event) => (
+              <div key={event.id} className="rounded-md border border-border bg-muted/15 p-4">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <Badge variant="neutral">
+                    {event.date} · {event.time}
+                  </Badge>
+                  <Badge variant={event.importance === 'high' ? 'warning' : 'neutral'}>{importanceLabel[event.importance]}</Badge>
+                  <Badge variant={calendarEventStatusVariant(event)}>
+                    {event.status ? calendarStatusLabel[event.status] : '점검'}
+                  </Badge>
+                  <Badge variant="secondary">{calendarTypeLabel[event.type]}</Badge>
+                </div>
+                <div className="font-medium leading-6">{event.title}</div>
+                {event.description ? <div className="mt-2 text-sm leading-6 text-muted-foreground">{event.description}</div> : null}
+                {event.source ? <div className="mt-2 text-xs text-muted-foreground">출처: {event.source}</div> : null}
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {event.relatedSymbols.map((symbol) => (
+                    <Badge key={symbol} variant="secondary">
+                      {symbol}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
         </CardContent>
       </Card>
     </PageGrid>
@@ -1464,6 +1581,8 @@ type DashboardActions = {
   onSaveWatchItem: (item: WatchItem, previousSymbol?: string) => void
   onDeleteWatchItem: (symbol: string) => void
   onResetWatchlist: () => void
+  onRefreshNews: () => void
+  onRefreshCalendar: () => void
 }
 
 function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: DashboardActions) {
@@ -1489,8 +1608,27 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
     )
   }
   if (page === 'radar') return <MarketRadarPage leadingIndicatorsData={snapshot.leadingIndicators} biasScoreData={snapshot.biasScore} />
-  if (page === 'news') return <NewsPage holdingsData={snapshot.holdings} />
-  if (page === 'calendar') return <CalendarPage />
+  if (page === 'news') {
+    return (
+      <NewsPage
+        holdingsData={snapshot.holdings}
+        liveNews={snapshot.liveNews}
+        newsStatus={snapshot.newsStatus}
+        newsMessage={snapshot.newsMessage}
+        onRefreshNews={actions.onRefreshNews}
+      />
+    )
+  }
+  if (page === 'calendar') {
+    return (
+      <CalendarPage
+        eventsData={snapshot.calendarEvents}
+        calendarStatus={snapshot.calendarStatus}
+        calendarMessage={snapshot.calendarMessage}
+        onRefreshCalendar={actions.onRefreshCalendar}
+      />
+    )
+  }
   if (page === 'notes') return <NotesPage />
   if (page === 'settings') {
     return (
@@ -1512,6 +1650,12 @@ export function Dashboard() {
   const [quoteResponse, setQuoteResponse] = useState<QuotesApiResponse | null>(null)
   const [quoteStatus, setQuoteStatus] = useState<QuoteStatus>('idle')
   const [quoteMessage, setQuoteMessage] = useState('시세 연결 대기')
+  const [calendarResponse, setCalendarResponse] = useState<CalendarApiResponse | null>(null)
+  const [calendarStatus, setCalendarStatus] = useState<CalendarStatus>('idle')
+  const [calendarMessage, setCalendarMessage] = useState('캘린더 연결 대기')
+  const [liveNews, setLiveNews] = useState<LiveNewsItem[]>([])
+  const [newsStatus, setNewsStatus] = useState<NewsStatus>('idle')
+  const [newsMessage, setNewsMessage] = useState('뉴스 연결 대기')
   const currentPage = navItems.find((item) => item.id === activePage) ?? navItems[0]
   const trackedQuoteSymbols = useMemo(
     () =>
@@ -1559,6 +1703,81 @@ export function Dashboard() {
       setQuoteMessage(error instanceof Error ? error.message : '시세를 불러오지 못했습니다.')
     }
   }, [trackedQuoteSymbols])
+  const loadCalendar = useCallback(async (signal?: AbortSignal) => {
+    setCalendarStatus((status) => (status === 'idle' ? 'loading' : status))
+
+    try {
+      const params = new URLSearchParams({
+        symbols: trackedQuoteSymbols.join(','),
+        days: '21',
+      })
+      const response = await fetch(`/api/calendar?${params.toString()}`, { signal })
+      const contentType = response.headers.get('content-type') ?? ''
+
+      if (!contentType.includes('application/json')) {
+        throw new Error('캘린더 API 응답을 확인할 수 없습니다.')
+      }
+
+      const payload = (await response.json()) as CalendarApiResponse
+
+      if (!response.ok) {
+        setCalendarStatus('error')
+        setCalendarMessage(payload.message ?? '캘린더 API 호출에 실패했습니다.')
+        return
+      }
+
+      setCalendarResponse(payload)
+      setCalendarStatus(payload.events.length > 0 ? payload.status : 'fallback')
+      setCalendarMessage(payload.message ?? (payload.events.length > 0 ? `${payload.events.length}개 이벤트 연결` : '기본 일정으로 표시합니다.'))
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+
+      setCalendarStatus('error')
+      setCalendarMessage(error instanceof Error ? error.message : '캘린더를 불러오지 못했습니다.')
+    }
+  }, [trackedQuoteSymbols])
+  const loadLiveNews = useCallback(async (signal?: AbortSignal) => {
+    setNewsStatus((status) => (status === 'idle' ? 'loading' : status))
+
+    try {
+      const params = new URLSearchParams({
+        keywords: newsKeywords.join(','),
+        display: '3',
+      })
+      const response = await fetch(`/api/news?${params.toString()}`, { signal })
+      const contentType = response.headers.get('content-type') ?? ''
+
+      if (!contentType.includes('application/json')) {
+        throw new Error('네이버 뉴스 API 응답을 확인할 수 없습니다.')
+      }
+
+      const payload = (await response.json()) as NewsApiResponse
+
+      if (!response.ok) {
+        setLiveNews(payload.items ?? [])
+        setNewsStatus('error')
+        setNewsMessage(payload.message ?? '네이버 뉴스 API 호출에 실패했습니다.')
+        return
+      }
+
+      if (!payload.configured) {
+        setLiveNews([])
+        setNewsStatus('fallback')
+        setNewsMessage(payload.message ?? '네이버 뉴스 API 환경변수 설정이 필요합니다.')
+        return
+      }
+
+      setLiveNews(payload.items)
+      setNewsStatus(payload.items.length > 0 ? 'ready' : 'fallback')
+      setNewsMessage(payload.items.length > 0 ? `최근 수집 ${formatNewsTime(payload.fetchedAt ?? '')}` : '수집된 뉴스가 없습니다.')
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+
+      setLiveNews([])
+      setNewsStatus('error')
+      setNewsMessage(error instanceof Error ? error.message : '뉴스를 불러오지 못했습니다.')
+    }
+  }, [])
 
   useEffect(() => {
     const stored = loadStoredDashboardData()
@@ -1590,6 +1809,32 @@ export function Dashboard() {
     }
   }, [loadQuotes])
 
+  useEffect(() => {
+    const controller = new AbortController()
+    void loadCalendar(controller.signal)
+    const intervalId = window.setInterval(() => {
+      void loadCalendar()
+    }, 3_600_000)
+
+    return () => {
+      controller.abort()
+      window.clearInterval(intervalId)
+    }
+  }, [loadCalendar])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void loadLiveNews(controller.signal)
+    const intervalId = window.setInterval(() => {
+      void loadLiveNews()
+    }, 600_000)
+
+    return () => {
+      controller.abort()
+      window.clearInterval(intervalId)
+    }
+  }, [loadLiveNews])
+
   const snapshot = useMemo(
     () =>
       buildDashboardSnapshot({
@@ -1599,11 +1844,30 @@ export function Dashboard() {
         fetchedAt: quoteResponse?.fetchedAt ?? null,
         quoteStatus,
         quoteMessage,
+        calendarEventsData: calendarResponse?.events.length ? calendarResponse.events : fallbackCalendarEvents,
+        calendarStatus,
+        calendarMessage,
+        liveNews,
+        newsStatus,
+        newsMessage,
       }),
-    [quoteMessage, quoteResponse, quoteStatus, userHoldings, userWatchlist],
+    [
+      calendarMessage,
+      calendarResponse,
+      calendarStatus,
+      liveNews,
+      newsMessage,
+      newsStatus,
+      quoteMessage,
+      quoteResponse,
+      quoteStatus,
+      userHoldings,
+      userWatchlist,
+    ],
   )
   const indicatorChartData = buildIndicatorChartData(snapshot.leadingIndicators)
   const biasTimeline = buildBiasTimeline(snapshot.biasScore.score)
+  const dashboardIssues = snapshot.liveNews.length > 0 ? snapshot.liveNews.slice(0, 3) : keyIssues
   const quoteStatusVariant: 'positive' | 'negative' | 'warning' | 'neutral' =
     snapshot.quoteStatus === 'ready'
       ? 'positive'
@@ -1642,8 +1906,14 @@ export function Dashboard() {
         setUserWatchlist(watchlist)
         resetStoredDashboardData()
       },
+      onRefreshNews: () => {
+        void loadLiveNews()
+      },
+      onRefreshCalendar: () => {
+        void loadCalendar()
+      },
     }),
-    [],
+    [loadCalendar, loadLiveNews],
   )
 
   return (
@@ -1788,24 +2058,30 @@ export function Dashboard() {
               <Card>
                 <CardHeader>
                   <CardTitle>핵심 이슈</CardTitle>
-                  <CardDescription>국내장 영향 가능성이 큰 순서로 정리</CardDescription>
+                  <CardDescription>{snapshot.liveNews.length > 0 ? snapshot.newsMessage : '국내장 영향 가능성이 큰 순서로 정리'}</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
-                  {keyIssues.map((issue) => (
-                    <div key={issue.id} className="rounded-md border border-border bg-muted/15 p-3">
-                      <div className="mb-2 flex flex-wrap items-center gap-2">
-                        <Badge variant="neutral">{issue.time}</Badge>
-                        <Badge variant={directionVariant(issue.direction)}>{importanceLabel[issue.importance]}</Badge>
-                        {issue.sectors.map((sector) => (
-                          <Badge key={sector} variant="secondary">
-                            {sector}
-                          </Badge>
-                        ))}
+                  {dashboardIssues.map((issue) => {
+                    const isLiveIssue = 'publishedAt' in issue
+                    const issueTime = isLiveIssue ? formatNewsTime(issue.publishedAt) : issue.time
+                    const issueTags = isLiveIssue ? [issue.keyword, issue.source, ...issue.sectors] : issue.sectors
+
+                    return (
+                      <div key={issue.id} className="rounded-md border border-border bg-muted/15 p-3">
+                        <div className="mb-2 flex flex-wrap items-center gap-2">
+                          <Badge variant="neutral">{issueTime}</Badge>
+                          <Badge variant={directionVariant(issue.direction)}>{importanceLabel[issue.importance]}</Badge>
+                          {issueTags.map((tag) => (
+                            <Badge key={tag} variant="secondary">
+                              {tag}
+                            </Badge>
+                          ))}
+                        </div>
+                        <div className="text-sm font-medium leading-5">{issue.title}</div>
+                        <div className="mt-2 text-xs leading-5 text-muted-foreground">{issue.expectedImpact}</div>
                       </div>
-                      <div className="text-sm font-medium leading-5">{issue.title}</div>
-                      <div className="mt-2 text-xs leading-5 text-muted-foreground">{issue.expectedImpact}</div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </CardContent>
               </Card>
             </section>
@@ -1977,20 +2253,24 @@ export function Dashboard() {
               <Card>
                 <CardHeader>
                   <CardTitle>이벤트 캘린더</CardTitle>
-                  <CardDescription>매크로, 실적, 정책, 기업 이벤트</CardDescription>
+                  <CardDescription>{snapshot.calendarMessage}</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
-                  {calendarEvents.map((event) => (
+                  {snapshot.calendarEvents.slice(0, 5).map((event) => (
                     <div key={event.id} className="rounded-md border border-border bg-muted/15 p-3">
-                      <div className="mb-2 flex items-center justify-between gap-3">
-                        <div className="text-xs text-muted-foreground">
+                      <div className="mb-2 flex flex-wrap items-center gap-2">
+                        <Badge variant="neutral">
                           {event.date} · {event.time}
-                        </div>
+                        </Badge>
                         <Badge variant={event.importance === 'high' ? 'warning' : 'neutral'}>
                           {importanceLabel[event.importance]}
                         </Badge>
+                        <Badge variant={calendarEventStatusVariant(event)}>
+                          {event.status ? calendarStatusLabel[event.status] : '점검'}
+                        </Badge>
                       </div>
                       <div className="text-sm font-medium">{event.title}</div>
+                      {event.description ? <div className="mt-2 text-xs leading-5 text-muted-foreground">{event.description}</div> : null}
                       <div className="mt-2 flex flex-wrap gap-1">
                         {event.relatedSymbols.map((symbol) => (
                           <Badge key={symbol} variant="secondary">
