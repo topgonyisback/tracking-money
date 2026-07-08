@@ -58,6 +58,7 @@ import type {
   CalendarEvent,
   Direction,
   Holding,
+  InvestmentJournal,
   LiveNewsItem,
   MarketIndicator,
   MarketQuote,
@@ -105,6 +106,7 @@ type MarketStatusView = typeof marketStatus
 type StoredDashboardData = {
   holdings: Holding[]
   watchlist: WatchItem[]
+  journal: InvestmentJournal
 }
 
 type DashboardSnapshot = {
@@ -124,6 +126,7 @@ type DashboardSnapshot = {
   newsStatus: NewsStatus
   newsMessage: string
   actionQueue: ActionQueueItem[]
+  journal: InvestmentJournal
 }
 
 const storageKey = 'tracking-money-dashboard-v1'
@@ -204,6 +207,31 @@ const watchStatusLabel = {
   alert: '확인',
 }
 
+function createDefaultJournal(date = getKstDateKey()): InvestmentJournal {
+  return {
+    date,
+    preMarketPlan: '',
+    riskPlan: '',
+    afterMarketReview: '',
+    completedActionIds: [],
+    lastSavedAt: null,
+  }
+}
+
+function normalizeJournal(rawJournal: Partial<InvestmentJournal> | undefined): InvestmentJournal {
+  const today = getKstDateKey()
+  if (!rawJournal || rawJournal.date !== today) return createDefaultJournal(today)
+
+  return {
+    date: rawJournal.date,
+    preMarketPlan: rawJournal.preMarketPlan ?? '',
+    riskPlan: rawJournal.riskPlan ?? '',
+    afterMarketReview: rawJournal.afterMarketReview ?? '',
+    completedActionIds: Array.isArray(rawJournal.completedActionIds) ? rawJournal.completedActionIds : [],
+    lastSavedAt: rawJournal.lastSavedAt ?? null,
+  }
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
 }
@@ -237,6 +265,7 @@ function loadStoredDashboardData(): StoredDashboardData | null {
     return {
       holdings: parsed.holdings,
       watchlist: parsed.watchlist,
+      journal: normalizeJournal(parsed.journal),
     }
   } catch {
     return null
@@ -805,6 +834,7 @@ function buildDashboardSnapshot({
   liveNews,
   newsStatus,
   newsMessage,
+  journal,
 }: {
   baseHoldings: Holding[]
   baseWatchlist: WatchItem[]
@@ -818,6 +848,7 @@ function buildDashboardSnapshot({
   liveNews: LiveNewsItem[]
   newsStatus: NewsStatus
   newsMessage: string
+  journal: InvestmentJournal
 }): DashboardSnapshot {
   const quoteMap = quoteBySymbol(quotes)
   const liveHoldings = mergeHoldingsWithQuotes(baseHoldings, quoteMap)
@@ -853,6 +884,7 @@ function buildDashboardSnapshot({
     newsStatus,
     newsMessage,
     actionQueue,
+    journal,
   }
 }
 
@@ -980,6 +1012,9 @@ const emptyWatchForm: WatchFormState = {
 
 const inputClassName =
   'h-9 w-full min-w-0 rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none transition placeholder:text-muted-foreground focus:border-primary'
+
+const textareaClassName =
+  'min-h-28 w-full min-w-0 resize-y rounded-md border border-input bg-background px-3 py-2 text-sm leading-6 text-foreground outline-none transition placeholder:text-muted-foreground focus:border-primary'
 
 function holdingToForm(holding: Holding): HoldingFormState {
   return {
@@ -1489,6 +1524,17 @@ function formatNewsTime(value: string) {
   })
 }
 
+function formatSavedTime(value: string | null) {
+  if (!value) return '아직 저장 전'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '저장 시간 확인'
+
+  return date.toLocaleTimeString('ko-KR', {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
 function NewsPage({
   holdingsData,
   liveNews,
@@ -1756,15 +1802,192 @@ function AlertsPage({ actionQueue }: { actionQueue: ActionQueueItem[] }) {
   )
 }
 
-function NotesPage({ actionQueue }: { actionQueue: ActionQueueItem[] }) {
+function JournalActionChecklist({
+  actionQueue,
+  journal,
+  onToggleAction,
+}: {
+  actionQueue: ActionQueueItem[]
+  journal: InvestmentJournal
+  onToggleAction: (actionId: string) => void
+}) {
+  const completedIds = new Set(journal.completedActionIds)
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle>오늘 체크리스트</CardTitle>
+            <CardDescription>액션 큐를 처리하면서 완료 표시</CardDescription>
+          </div>
+          <Badge variant="neutral">
+            {journal.completedActionIds.length}/{actionQueue.length} 완료
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {actionQueue.length > 0 ? (
+          actionQueue.map((item) => {
+            const checked = completedIds.has(item.id)
+
+            return (
+              <label
+                key={item.id}
+                className={cn(
+                  'flex cursor-pointer items-start gap-3 rounded-md border border-border bg-muted/15 p-3 transition hover:border-primary/45',
+                  checked && 'bg-positive/10',
+                )}
+              >
+                <input
+                  type="checkbox"
+                  className="mt-1 size-4 shrink-0 accent-primary"
+                  checked={checked}
+                  onChange={() => onToggleAction(item.id)}
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="mb-2 flex flex-wrap items-center gap-2">
+                    <Badge variant={actionPriorityVariant(item.priority)}>{actionPriorityLabel[item.priority]}</Badge>
+                    <Badge variant="secondary">{actionCategoryLabel[item.category]}</Badge>
+                    <span className="text-xs text-muted-foreground">{item.evidence}</span>
+                  </span>
+                  <span className={cn('block text-sm font-semibold leading-6', checked && 'text-muted-foreground line-through')}>
+                    {item.title}
+                  </span>
+                  <span className="mt-1 block text-sm leading-6 text-muted-foreground">{item.suggestedAction}</span>
+                </span>
+              </label>
+            )
+          })
+        ) : (
+          <div className="rounded-md border border-border bg-muted/15 p-4 text-sm text-muted-foreground">
+            오늘 체크할 액션이 없습니다.
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function NotesPage({
+  actionQueue,
+  journal,
+  biasScoreData,
+  marketStatusData,
+  onUpdateJournal,
+  onToggleJournalAction,
+  onResetJournal,
+}: {
+  actionQueue: ActionQueueItem[]
+  journal: InvestmentJournal
+  biasScoreData: BiasScore
+  marketStatusData: MarketStatusView
+  onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
+  onToggleJournalAction: (actionId: string) => void
+  onResetJournal: () => void
+}) {
+  const completedCount = journal.completedActionIds.filter((id) => actionQueue.some((item) => item.id === id)).length
+
   return (
     <PageGrid>
+      <section className="grid gap-4 md:grid-cols-4">
+        <MetricCard label="저널 날짜" value={journal.date.slice(5).replace('-', '.')} detail="오늘 기록" />
+        <MetricCard label="액션 완료" value={`${completedCount}/${actionQueue.length}`} detail="체크리스트" tone={completedCount > 0 ? 'positive' : 'neutral'} />
+        <MetricCard label="방향점수" value={`+${biasScoreData.score}`} detail={`신뢰도 ${confidenceLabel[biasScoreData.confidence]}`} tone={biasScoreData.stance === 'pressure' ? 'negative' : biasScoreData.stance === 'neutral' ? 'neutral' : 'positive'} />
+        <MetricCard label="마지막 저장" value={formatSavedTime(journal.lastSavedAt)} detail="브라우저 저장" />
+      </section>
+
       <ActionQueuePanel
         items={actionQueue}
         title="장 시작 전 실행 순서"
         description="투자노트에 기록하기 전 먼저 볼 항목"
         maxItems={5}
         compact
+      />
+
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+        <Card>
+          <CardHeader>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <CardTitle>오늘 투자 저널</CardTitle>
+                <CardDescription>장전 계획과 장후 리뷰를 저장</CardDescription>
+              </div>
+              <Button type="button" variant="outline" size="sm" onClick={onResetJournal}>
+                <RefreshCw className="size-4" />
+                오늘 기록 초기화
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="grid gap-4">
+            <div>
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <label className="text-sm font-medium">장전 계획</label>
+                <Badge variant="secondary">
+                  <Save className="mr-1 size-3" />
+                  자동 저장
+                </Badge>
+              </div>
+              <textarea
+                className={textareaClassName}
+                placeholder="예: 반도체는 첫 30분 수급 확인, 환율 급등 시 추격 매수 보류"
+                value={journal.preMarketPlan}
+                onChange={(event) => onUpdateJournal({ preMarketPlan: event.target.value })}
+              />
+            </div>
+
+            <div>
+              <label className="mb-2 block text-sm font-medium">리스크 대응</label>
+              <textarea
+                className={textareaClassName}
+                placeholder="예: NQ/SOX 동반 약세면 보유 비중 큰 종목은 추가 매수 금지, 손절/분할 기준 기록"
+                value={journal.riskPlan}
+                onChange={(event) => onUpdateJournal({ riskPlan: event.target.value })}
+              />
+            </div>
+
+            <div>
+              <label className="mb-2 block text-sm font-medium">장후 리뷰</label>
+              <textarea
+                className={textareaClassName}
+                placeholder="예: 방향점수와 실제 시장 폭이 맞았는지, 놓친 뉴스/지표가 있었는지 기록"
+                value={journal.afterMarketReview}
+                onChange={(event) => onUpdateJournal({ afterMarketReview: event.target.value })}
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>오늘 시장 스냅샷</CardTitle>
+            <CardDescription>저널 작성 기준 상태</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">업데이트</div>
+              <div className="mt-1 font-medium">{marketStatusData.lastUpdated}</div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">USD/KRW</div>
+              <div className="mt-1 font-medium">{marketStatusData.usdKrw}</div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">VIX</div>
+              <div className="mt-1 font-medium">{marketStatusData.vix}</div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">요약</div>
+              <div className="mt-1 text-sm leading-6">{biasScoreData.summary}</div>
+            </div>
+          </CardContent>
+        </Card>
+      </section>
+
+      <JournalActionChecklist
+        actionQueue={actionQueue}
+        journal={journal}
+        onToggleAction={onToggleJournalAction}
       />
 
       <section className="grid gap-4 xl:grid-cols-3">
@@ -1912,6 +2135,9 @@ type DashboardActions = {
   onResetWatchlist: () => void
   onRefreshNews: () => void
   onRefreshCalendar: () => void
+  onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
+  onToggleJournalAction: (actionId: string) => void
+  onResetJournal: () => void
 }
 
 function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: DashboardActions) {
@@ -1959,7 +2185,19 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
     )
   }
   if (page === 'alerts') return <AlertsPage actionQueue={snapshot.actionQueue} />
-  if (page === 'notes') return <NotesPage actionQueue={snapshot.actionQueue} />
+  if (page === 'notes') {
+    return (
+      <NotesPage
+        actionQueue={snapshot.actionQueue}
+        journal={snapshot.journal}
+        biasScoreData={snapshot.biasScore}
+        marketStatusData={snapshot.marketStatus}
+        onUpdateJournal={actions.onUpdateJournal}
+        onToggleJournalAction={actions.onToggleJournalAction}
+        onResetJournal={actions.onResetJournal}
+      />
+    )
+  }
   if (page === 'settings') {
     return (
       <SettingsPage
@@ -1976,6 +2214,7 @@ export function Dashboard() {
   const [activePage, setActivePage] = useState<PageId>('dashboard')
   const [userHoldings, setUserHoldings] = useState<Holding[]>(holdings)
   const [userWatchlist, setUserWatchlist] = useState<WatchItem[]>(watchlist)
+  const [journal, setJournal] = useState<InvestmentJournal>(() => createDefaultJournal())
   const [storageLoaded, setStorageLoaded] = useState(false)
   const [quoteResponse, setQuoteResponse] = useState<QuotesApiResponse | null>(null)
   const [quoteStatus, setQuoteStatus] = useState<QuoteStatus>('idle')
@@ -2114,6 +2353,7 @@ export function Dashboard() {
     if (stored) {
       setUserHoldings(stored.holdings)
       setUserWatchlist(stored.watchlist)
+      setJournal(stored.journal)
     }
     setStorageLoaded(true)
   }, [])
@@ -2123,8 +2363,9 @@ export function Dashboard() {
     saveStoredDashboardData({
       holdings: userHoldings,
       watchlist: userWatchlist,
+      journal,
     })
-  }, [storageLoaded, userHoldings, userWatchlist])
+  }, [journal, storageLoaded, userHoldings, userWatchlist])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -2180,12 +2421,14 @@ export function Dashboard() {
         liveNews,
         newsStatus,
         newsMessage,
+        journal,
       }),
     [
       calendarMessage,
       calendarResponse,
       calendarStatus,
       liveNews,
+      journal,
       newsMessage,
       newsStatus,
       quoteMessage,
@@ -2241,6 +2484,36 @@ export function Dashboard() {
       },
       onRefreshCalendar: () => {
         void loadCalendar()
+      },
+      onUpdateJournal: (patch) => {
+        setJournal((current) => ({
+          ...normalizeJournal(current),
+          ...patch,
+          lastSavedAt: new Date().toISOString(),
+        }))
+      },
+      onToggleJournalAction: (actionId) => {
+        setJournal((current) => {
+          const normalized = normalizeJournal(current)
+          const completed = new Set(normalized.completedActionIds)
+          if (completed.has(actionId)) {
+            completed.delete(actionId)
+          } else {
+            completed.add(actionId)
+          }
+
+          return {
+            ...normalized,
+            completedActionIds: Array.from(completed),
+            lastSavedAt: new Date().toISOString(),
+          }
+        })
+      },
+      onResetJournal: () => {
+        setJournal({
+          ...createDefaultJournal(),
+          lastSavedAt: new Date().toISOString(),
+        })
       },
     }),
     [loadCalendar, loadLiveNews],

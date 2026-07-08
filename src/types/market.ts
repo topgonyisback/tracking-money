@@ -124,6 +124,15 @@ export type ActionQueueItem = {
   score: number
 }
 
+export type InvestmentJournal = {
+  date: string
+  preMarketPlan: string
+  riskPlan: string
+  afterMarketReview: string
+  completedActionIds: string[]
+  lastSavedAt: string | null
+}
+
 export type ActionMemo = {
   bullishScenario: string
   bearishScenario: string
