@@ -232,6 +232,37 @@ type ScenarioSimulationResult = {
   positions: ScenarioSimulationPosition[]
 }
 
+type CatalystSource = 'news' | 'calendar' | 'disclosure'
+
+type CatalystBucket = 'now' | 'today' | 'overnight' | 'upcoming'
+
+type CatalystRadarItem = {
+  id: string
+  source: CatalystSource
+  bucket: CatalystBucket
+  timeLabel: string
+  title: string
+  summary: string
+  score: number
+  direction: Direction
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  importance: 'low' | 'medium' | 'high'
+  relatedSymbols: string[]
+  action: string
+}
+
+type CatalystRadar = {
+  generatedAt: string
+  summary: string
+  totalCount: number
+  urgentCount: number
+  highImportanceCount: number
+  topSource: CatalystSource | 'none'
+  topSymbols: string[]
+  buckets: Record<CatalystBucket, CatalystRadarItem[]>
+  items: CatalystRadarItem[]
+}
+
 type MarketForecast = {
   baseScore: number
   openingBias: string
@@ -286,6 +317,7 @@ type DashboardSnapshot = {
   newsStatus: NewsStatus
   newsMessage: string
   newsImpactBoard: NewsImpactBoard
+  catalystRadar: CatalystRadar
   disclosures: DisclosureItem[]
   disclosureStatus: DisclosureStatus
   disclosureMessage: string
@@ -1741,6 +1773,199 @@ function applyNewsBiasFactor(score: BiasScore, factor: BiasScore['positives'][nu
     summary: `${score.summary} ${newsSummary}`,
     positives: factor.impact > 0 ? [...score.positives, factor] : score.positives,
     risks: factor.impact < 0 ? [...score.risks, factor] : score.risks,
+  }
+}
+
+const catalystBucketLabel: Record<CatalystBucket, string> = {
+  now: '즉시',
+  today: '오늘',
+  overnight: '야간',
+  upcoming: '다가오는',
+}
+
+const catalystSourceLabel: Record<CatalystSource, string> = {
+  news: '뉴스',
+  calendar: '일정',
+  disclosure: '공시',
+}
+
+function catalystTone(direction: Direction, score: number): CatalystRadarItem['tone'] {
+  if (direction === 'positive') return 'positive'
+  if (direction === 'negative') return 'negative'
+  if (direction === 'mixed' || score >= 78) return 'warning'
+  return 'neutral'
+}
+
+function catalystImportanceScore(importance: 'low' | 'medium' | 'high') {
+  if (importance === 'high') return 30
+  if (importance === 'medium') return 18
+  return 8
+}
+
+function catalystBucketScore(bucket: CatalystBucket) {
+  if (bucket === 'now') return 26
+  if (bucket === 'today') return 18
+  if (bucket === 'overnight') return 14
+  return 6
+}
+
+function disclosureDateKey(value: string) {
+  if (!/^\d{8}$/.test(value)) return ''
+  return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`
+}
+
+function newsCatalystBucket(publishedAt: string): CatalystBucket {
+  const date = new Date(publishedAt)
+  if (Number.isNaN(date.getTime())) return 'upcoming'
+  const ageHours = (Date.now() - date.getTime()) / 3_600_000
+  if (ageHours <= 6) return 'now'
+  const dateKey = getKstDateKey(date)
+  if (dateKey === getKstDateKey()) return 'today'
+  return 'upcoming'
+}
+
+function calendarCatalystBucket(event: CalendarEvent): CatalystBucket {
+  const today = getKstDateKey()
+  const tomorrow = addDaysToDateKey(today, 1)
+  const dateKey = event.absoluteDate ?? (event.date === '오늘' ? today : event.date === '내일' ? tomorrow : '')
+
+  if (dateKey === today) return event.time >= '16:00' ? 'overnight' : 'today'
+  if (dateKey === tomorrow) return 'overnight'
+  return 'upcoming'
+}
+
+function disclosureCatalystBucket(item: DisclosureItem): CatalystBucket {
+  const submittedDate = disclosureDateKey(item.submittedAt)
+  if (submittedDate === getKstDateKey()) return 'today'
+  if (submittedDate === addDaysToDateKey(getKstDateKey(), -1)) return 'overnight'
+  return 'upcoming'
+}
+
+function trackedSymbolBoost(symbols: string[], trackedSymbols: Set<string>) {
+  if (symbols.some((symbol) => trackedSymbols.has(symbol))) return 16
+  if (symbols.some((symbol) => ['SOX', 'NQ=F', 'USD/KRW', 'VIX', 'US10Y', 'KOSPI', 'KOSDAQ'].includes(symbol))) return 8
+  return 0
+}
+
+function catalystAction(item: Pick<CatalystRadarItem, 'bucket' | 'source' | 'direction' | 'relatedSymbols'>) {
+  const symbolText = item.relatedSymbols.slice(0, 2).join(', ') || '관련 종목'
+  if (item.bucket === 'now') return `${symbolText} 가격 반응과 거래량을 즉시 확인`
+  if (item.source === 'calendar') return '발표 전후 15분은 추격 주문보다 변동성 확인'
+  if (item.source === 'disclosure') return `${symbolText} 공시 원문과 장 초반 갭 반응 확인`
+  if (item.direction === 'positive') return `${symbolText}이 지수보다 강한지 확인 후 분할 접근`
+  if (item.direction === 'negative') return `${symbolText} 신규 진입 보류, 반등 실패 시 방어`
+  return `${symbolText} 방향 확정 전까지 관찰 우선`
+}
+
+function buildCatalystRadar({
+  liveNews,
+  calendarEventsData,
+  disclosures,
+  holdingsData,
+  watchlistData,
+}: {
+  liveNews: LiveNewsItem[]
+  calendarEventsData: CalendarEvent[]
+  disclosures: DisclosureItem[]
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+}): CatalystRadar {
+  const trackedSymbols = new Set([...holdingsData.map((holding) => holding.symbol), ...watchlistData.map((item) => item.symbol)])
+  const newsItems: NewsImpactSourceItem[] = liveNews.length > 0 ? liveNews : fallbackNewsImpactItems()
+  const newsCatalysts = newsItems.slice(0, 10).map((item) => {
+    const bucket = newsCatalystBucket(item.publishedAt)
+    const score = clamp(Math.round(Math.abs(newsItemImpact(item)) * 20 + catalystImportanceScore(item.importance) + catalystBucketScore(bucket) + trackedSymbolBoost(item.relatedSymbols, trackedSymbols)), 0, 100)
+    const catalyst: CatalystRadarItem = {
+      id: `news-${item.id}`,
+      source: 'news',
+      bucket,
+      timeLabel: formatNewsTime(item.publishedAt),
+      title: item.title,
+      summary: item.expectedImpact,
+      score,
+      direction: item.direction,
+      tone: catalystTone(item.direction, score),
+      importance: item.importance,
+      relatedSymbols: item.relatedSymbols.length > 0 ? item.relatedSymbols : [item.keyword],
+      action: '',
+    }
+    return { ...catalyst, action: catalystAction(catalyst) }
+  })
+  const calendarCatalysts = calendarEventsData.slice(0, 12).map((event) => {
+    const bucket = calendarCatalystBucket(event)
+    const score = clamp(catalystImportanceScore(event.importance) + catalystBucketScore(bucket) + trackedSymbolBoost(event.relatedSymbols, trackedSymbols) + (event.type === 'macro' || event.type === 'policy' ? 12 : 6), 0, 100)
+    const direction: Direction = event.type === 'macro' || event.type === 'policy' ? 'mixed' : event.importance === 'high' ? 'mixed' : 'neutral'
+    const catalyst: CatalystRadarItem = {
+      id: `calendar-${event.id}`,
+      source: 'calendar',
+      bucket,
+      timeLabel: `${event.date} ${event.time}`,
+      title: event.title,
+      summary: event.description ?? '발표 전후 변동성 확대 가능성이 있는 일정입니다.',
+      score,
+      direction,
+      tone: catalystTone(direction, score),
+      importance: event.importance,
+      relatedSymbols: event.relatedSymbols,
+      action: '',
+    }
+    return { ...catalyst, action: catalystAction(catalyst) }
+  })
+  const disclosureCatalysts = disclosures.slice(0, 8).map((item) => {
+    const bucket = disclosureCatalystBucket(item)
+    const rawImpact = disclosureImpact(item)
+    const score = clamp(Math.abs(rawImpact) * 4 + catalystImportanceScore(item.importance) + catalystBucketScore(bucket) + trackedSymbolBoost([item.symbol, item.sector], trackedSymbols), 0, 100)
+    const catalyst: CatalystRadarItem = {
+      id: `disclosure-${item.id}`,
+      source: 'disclosure',
+      bucket,
+      timeLabel: formatDisclosureDate(item.submittedAt),
+      title: `${item.corpName} ${item.reportName}`,
+      summary: item.expectedImpact,
+      score,
+      direction: item.direction,
+      tone: catalystTone(item.direction, score),
+      importance: item.importance,
+      relatedSymbols: [item.symbol, item.sector],
+      action: '',
+    }
+    return { ...catalyst, action: catalystAction(catalyst) }
+  })
+  const bucketRank: Record<CatalystBucket, number> = { now: 0, today: 1, overnight: 2, upcoming: 3 }
+  const items = [...newsCatalysts, ...calendarCatalysts, ...disclosureCatalysts]
+    .sort((left, right) => bucketRank[left.bucket] - bucketRank[right.bucket] || right.score - left.score)
+    .slice(0, 18)
+  const buckets: CatalystRadar['buckets'] = {
+    now: items.filter((item) => item.bucket === 'now'),
+    today: items.filter((item) => item.bucket === 'today'),
+    overnight: items.filter((item) => item.bucket === 'overnight'),
+    upcoming: items.filter((item) => item.bucket === 'upcoming'),
+  }
+  const topItem = items[0]
+  const sourceCounts = items.reduce<Record<CatalystSource, number>>(
+    (acc, item) => {
+      acc[item.source] += 1
+      return acc
+    },
+    { news: 0, calendar: 0, disclosure: 0 },
+  )
+  const topSource = (Object.entries(sourceCounts).sort((left, right) => right[1] - left[1])[0]?.[0] ?? 'none') as CatalystRadar['topSource']
+  const topSymbols = Array.from(new Set(items.flatMap((item) => item.relatedSymbols))).filter(Boolean).slice(0, 8)
+  const urgentCount = items.filter((item) => item.bucket === 'now' || item.bucket === 'today').length
+  const highImportanceCount = items.filter((item) => item.importance === 'high' || item.score >= 80).length
+
+  return {
+    generatedAt: new Date().toISOString(),
+    summary: topItem
+      ? `${catalystBucketLabel[topItem.bucket]} 촉매는 ${topItem.title}입니다. ${topItem.action}`
+      : '현재 확인된 뉴스, 공시, 일정 촉매가 없습니다. 데이터 새로고침 후 다시 확인합니다.',
+    totalCount: items.length,
+    urgentCount,
+    highImportanceCount,
+    topSource,
+    topSymbols,
+    buckets,
+    items,
   }
 }
 
@@ -4240,6 +4465,13 @@ function buildDashboardSnapshot({
   const liveWatchlist = mergeWatchlistWithQuotes(baseWatchlist, quoteMap)
   const liveIndicators = mergeIndicatorsWithQuotes(quoteMap)
   const newsImpactBoard = buildSymbolNewsImpactBoard(liveNews, liveHoldings, liveWatchlist)
+  const catalystRadar = buildCatalystRadar({
+    liveNews,
+    calendarEventsData,
+    disclosures,
+    holdingsData: liveHoldings,
+    watchlistData: liveWatchlist,
+  })
   const liveBiasScore = applyNewsBiasFactor(
     buildLiveBiasScore(liveIndicators, quotes.length),
     buildNewsBiasFactor(liveNews, liveHoldings, liveWatchlist),
@@ -4395,6 +4627,7 @@ function buildDashboardSnapshot({
     newsStatus,
     newsMessage,
     newsImpactBoard,
+    catalystRadar,
     disclosures,
     disclosureStatus,
     disclosureMessage,
@@ -4507,8 +4740,13 @@ function PreMarketCommandCenterPanel({ command, compact = false }: { command: Pr
           ))}
         </div>
 
-        <div className={cn('grid gap-4', compact ? 'xl:grid-cols-[minmax(0,1fr)_300px]' : 'xl:grid-cols-[minmax(0,1fr)_360px]')}>
-          <div className="grid gap-3">
+        <div
+          className={cn(
+            'grid min-w-0 gap-4',
+            compact ? '2xl:grid-cols-[minmax(0,1fr)_minmax(240px,300px)]' : 'xl:grid-cols-[minmax(0,1fr)_minmax(300px,360px)]',
+          )}
+        >
+          <div className="grid min-w-0 gap-3">
             {visibleSteps.map((step) => (
               <div key={step.id} className="rounded-md border border-border bg-muted/10 p-3">
                 <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
@@ -4728,8 +4966,13 @@ function OvernightStressTestPanel({ stress, compact = false }: { stress: Overnig
           </div>
         </div>
 
-        <div className={cn('grid gap-4', compact ? 'xl:grid-cols-[minmax(0,1fr)_300px]' : 'xl:grid-cols-[minmax(0,1fr)_360px]')}>
-          <div className="grid gap-3">
+        <div
+          className={cn(
+            'grid min-w-0 gap-4',
+            compact ? '2xl:grid-cols-[minmax(0,1fr)_minmax(240px,300px)]' : 'xl:grid-cols-[minmax(0,1fr)_minmax(300px,360px)]',
+          )}
+        >
+          <div className="grid min-w-0 gap-3">
             {visibleScenarios.map((scenario) => (
               <div key={scenario.id} className="rounded-md border border-border bg-muted/10 p-3">
                 <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
@@ -5227,6 +5470,111 @@ function NewsImpactBoardPanel({ board, compact = false }: { board: NewsImpactBoa
             보유종목이나 관심종목과 연결된 뉴스가 아직 없습니다. 뉴스 키워드에 종목명이나 섹터 키워드를 추가하면 이 영역에 바로 반영됩니다.
           </div>
         )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function CatalystRadarPanel({ radar, compact = false }: { radar: CatalystRadar; compact?: boolean }) {
+  const visibleBuckets = compact ? (['now', 'today', 'overnight'] as CatalystBucket[]) : (['now', 'today', 'overnight', 'upcoming'] as CatalystBucket[])
+  const visibleItems = compact ? radar.items.slice(0, 5) : radar.items
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>촉매 레이더</CardTitle>
+            <CardDescription>{radar.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={radar.urgentCount > 0 ? 'warning' : 'neutral'}>{radar.urgentCount}개 즉시/오늘</Badge>
+            <Badge variant="secondary">{formatNewsTime(radar.generatedAt)}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">전체 촉매</div>
+            <div className="mt-2 text-2xl font-semibold">{radar.totalCount}개</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">고중요</div>
+            <div className="mt-2 text-2xl font-semibold">{radar.highImportanceCount}개</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">주요 소스</div>
+            <div className="mt-2 text-lg font-semibold">{radar.topSource === 'none' ? '대기' : catalystSourceLabel[radar.topSource]}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">연결 심볼</div>
+            <div className="mt-2 text-sm font-semibold leading-5">{radar.topSymbols.length > 0 ? radar.topSymbols.slice(0, 4).join(', ') : '확인 대기'}</div>
+          </div>
+        </div>
+
+        <div
+          className={cn(
+            'grid min-w-0 gap-4',
+            compact ? '2xl:grid-cols-[minmax(0,1fr)_minmax(240px,300px)]' : 'xl:grid-cols-[minmax(0,1fr)_minmax(300px,360px)]',
+          )}
+        >
+          <div className="grid min-w-0 gap-3">
+            {visibleItems.length > 0 ? (
+              visibleItems.map((item) => (
+                <div key={item.id} className="rounded-md border border-border bg-muted/10 p-3">
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge variant={item.tone}>{catalystBucketLabel[item.bucket]}</Badge>
+                        <Badge variant="secondary">{catalystSourceLabel[item.source]}</Badge>
+                        <Badge variant={item.score >= 80 ? 'warning' : 'neutral'}>{item.score}점</Badge>
+                        <span className="text-xs text-muted-foreground">{item.timeLabel}</span>
+                      </div>
+                      <div className="mt-2 text-sm font-semibold leading-5">{item.title}</div>
+                      <div className="mt-2 text-sm leading-5 text-muted-foreground">{item.summary}</div>
+                      {!compact ? <div className="mt-2 text-sm leading-5">{item.action}</div> : null}
+                    </div>
+                    <div className="flex shrink-0 flex-wrap gap-1.5 lg:max-w-44 lg:justify-end">
+                      {item.relatedSymbols.slice(0, compact ? 3 : 5).map((symbol) => (
+                        <Badge key={symbol} variant="secondary">
+                          {symbol}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-md border border-border bg-muted/10 p-4 text-sm leading-6 text-muted-foreground">
+                확인된 촉매가 없습니다. 뉴스, 공시, 캘린더를 새로고침하면 이 영역에 시간순으로 정리됩니다.
+              </div>
+            )}
+          </div>
+
+          <div className="grid min-w-0 content-start gap-3">
+            {visibleBuckets.map((bucket) => (
+              <div key={bucket} className="min-w-0 rounded-md border border-border bg-muted/10 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-xs font-medium text-muted-foreground">{catalystBucketLabel[bucket]}</div>
+                  <Badge variant={radar.buckets[bucket].length > 0 ? 'warning' : 'neutral'}>{radar.buckets[bucket].length}개</Badge>
+                </div>
+                <div className="mt-3 grid gap-2">
+                  {radar.buckets[bucket].slice(0, compact ? 2 : 3).map((item) => (
+                    <div key={`${bucket}-${item.id}`} className="min-w-0 rounded-md border border-border bg-background/70 px-3 py-2">
+                      <div className="flex min-w-0 items-center justify-between gap-2">
+                        <span className="min-w-0 truncate text-sm font-medium">{item.title}</span>
+                        <Badge variant={item.tone}>{item.score}</Badge>
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">{item.action}</div>
+                    </div>
+                  ))}
+                  {radar.buckets[bucket].length === 0 ? <div className="text-xs text-muted-foreground">대기 중</div> : null}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
       </CardContent>
     </Card>
   )
@@ -6499,6 +6847,7 @@ function ForecastPage({
   holdingsData,
   leadingIndicatorsData,
   newsImpactBoard,
+  catalystRadar,
   actionQueue,
   portfolioPlaybook,
   dataReliability,
@@ -6513,6 +6862,7 @@ function ForecastPage({
   holdingsData: Holding[]
   leadingIndicatorsData: MarketIndicator[]
   newsImpactBoard: NewsImpactBoard
+  catalystRadar: CatalystRadar
   actionQueue: ActionQueueItem[]
   portfolioPlaybook: PortfolioPlaybook
   dataReliability: DataReliability
@@ -6543,6 +6893,8 @@ function ForecastPage({
       <SignalAuditPanel audit={signalAudit} />
 
       <ForecastSensitivityPanel sensitivity={forecastSensitivity} />
+
+      <CatalystRadarPanel radar={catalystRadar} />
 
       <ScenarioSimulatorPanel forecast={forecast} holdingsData={holdingsData} indicators={leadingIndicatorsData} newsImpactBoard={newsImpactBoard} usdKrw={usdKrw} />
 
@@ -8701,6 +9053,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         holdingsData={snapshot.holdings}
         leadingIndicatorsData={snapshot.leadingIndicators}
         newsImpactBoard={snapshot.newsImpactBoard}
+        catalystRadar={snapshot.catalystRadar}
         actionQueue={snapshot.actionQueue}
         portfolioPlaybook={snapshot.portfolioPlaybook}
         dataReliability={snapshot.dataReliability}
@@ -9547,6 +9900,8 @@ export function Dashboard() {
             </section>
 
             <PreMarketCommandCenterPanel command={snapshot.preMarketCommand} compact />
+
+            <CatalystRadarPanel radar={snapshot.catalystRadar} compact />
 
             <OvernightStressTestPanel stress={snapshot.overnightStressTest} compact />
 
