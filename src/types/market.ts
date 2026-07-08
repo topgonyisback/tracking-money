@@ -222,6 +222,24 @@ export type PortfolioPlaybook = {
   preMarketSteps: string[]
 }
 
+export type MorningBriefSection = {
+  id: string
+  title: string
+  items: string[]
+}
+
+export type MorningBrief = {
+  generatedAt: string
+  title: string
+  headline: string
+  stance: 'risk-on' | 'balanced' | 'defensive'
+  confidence: Confidence
+  keyMetric: string
+  topSymbols: string[]
+  sections: MorningBriefSection[]
+  copyText: string
+}
+
 export type InvestmentJournal = {
   date: string
   preMarketPlan: string

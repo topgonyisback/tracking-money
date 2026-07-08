@@ -4,7 +4,9 @@ import {
   Bell,
   CalendarDays,
   ChartCandlestick,
+  Check,
   Clock3,
+  Copy,
   Download,
   ExternalLink,
   FileText,
@@ -69,6 +71,7 @@ import type {
   LiveNewsItem,
   MarketIndicator,
   MarketQuote,
+  MorningBrief,
   PortfolioPlaybook,
   TriggeredAlert,
   WatchItem,
@@ -235,6 +238,7 @@ type DashboardSnapshot = {
   disclosureMessage: string
   forecast: MarketForecast
   portfolioPlaybook: PortfolioPlaybook
+  morningBrief: MorningBrief
   actionQueue: ActionQueueItem[]
   journal: InvestmentJournal
 }
@@ -1985,6 +1989,140 @@ function buildActionQueue({
     .slice(0, 10)
 }
 
+function briefDateLabel(value: string) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return getKstDateKey()
+
+  return date.toLocaleString('ko-KR', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'Asia/Seoul',
+  })
+}
+
+function uniqueBriefItems(items: Array<string | null | undefined>, maxItems: number) {
+  return Array.from(new Set(items.map((item) => item?.trim()).filter((item): item is string => Boolean(item)))).slice(0, maxItems)
+}
+
+function buildMorningBrief({
+  forecast,
+  portfolioPlaybook,
+  actionQueue,
+  triggeredAlerts,
+  newsItems,
+  eventsData,
+  disclosures,
+  marketStatusData,
+}: {
+  forecast: MarketForecast
+  portfolioPlaybook: PortfolioPlaybook
+  actionQueue: ActionQueueItem[]
+  triggeredAlerts: TriggeredAlert[]
+  newsItems: LiveNewsItem[]
+  eventsData: CalendarEvent[]
+  disclosures: DisclosureItem[]
+  marketStatusData: MarketStatusView
+}): MorningBrief {
+  const generatedAt = new Date().toISOString()
+  const topAction = actionQueue[0]
+  const topRisk = portfolioPlaybook.riskSignals[0]
+  const topScenario = forecast.scenarios.reduce((top, scenario) => (scenario.probability > top.probability ? scenario : top), forecast.scenarios[0])
+  const urgentAlerts = triggeredAlerts.filter((alert) => severityRank(alert.severity) >= severityRank('high'))
+  const topNews = newsItems.filter((item) => item.importance === 'high').slice(0, 2)
+  const todayEvents = eventsData.filter((event) => isTodayCalendarEvent(event)).slice(0, 2)
+  const importantDisclosures = disclosures.filter((item) => item.importance === 'high').slice(0, 2)
+  const topSymbols = uniqueBriefItems(
+    [
+      ...portfolioPlaybook.positionPlans.slice(0, 3).map((item) => item.symbol),
+      ...actionQueue.flatMap((item) => item.relatedSymbols).slice(0, 5),
+      ...urgentAlerts.flatMap((item) => item.relatedSymbols),
+    ],
+    6,
+  )
+  const headline =
+    portfolioPlaybook.stance === 'defensive'
+      ? `${forecast.openingBias}: 신규 진입보다 방어와 고비중 종목 확인이 먼저입니다.`
+      : portfolioPlaybook.stance === 'risk-on'
+        ? `${forecast.openingBias}: 강한 종목만 선별하고 관심종목은 분할 조건으로 봅니다.`
+        : `${forecast.openingBias}: 첫 30분 가격 반응을 확인한 뒤 움직이는 구간입니다.`
+
+  const sections: MorningBrief['sections'] = [
+    {
+      id: 'market',
+      title: '시장 방향',
+      items: uniqueBriefItems(
+        [
+          `방향점수 ${forecast.baseScore}/100, 예상 출발 ${forecast.expectedOpenRange}`,
+          `가장 가능성 높은 시나리오: ${topScenario.label} ${topScenario.probability}%`,
+          `USD/KRW ${marketStatusData.usdKrw}, VIX ${marketStatusData.vix}`,
+          forecast.summary,
+        ],
+        4,
+      ),
+    },
+    {
+      id: 'portfolio',
+      title: '포트폴리오 판단',
+      items: uniqueBriefItems(
+        [
+          `${portfolioPlaybook.stanceLabel}: ${portfolioPlaybook.summary}`,
+          `최대 노출 ${portfolioPlaybook.topExposureLabel}, 집중도 ${portfolioPlaybook.concentrationScore}/100`,
+          topRisk ? `${topRisk.title}: ${topRisk.suggestedAction}` : null,
+          ...portfolioPlaybook.positionPlans.slice(0, 3).map((item) => `${item.symbol} ${positionActionLabel[item.action]}: ${item.trigger}`),
+        ],
+        5,
+      ),
+    },
+    {
+      id: 'issues',
+      title: '오늘 이슈',
+      items: uniqueBriefItems(
+        [
+          ...topNews.map((item) => `${item.keyword}: ${item.title}`),
+          ...importantDisclosures.map((item) => `${item.corpName} 공시: ${item.reportName}`),
+          ...todayEvents.map((event) => `${event.time} ${event.title}`),
+          urgentAlerts.length > 0 ? `긴급/높음 알림 ${urgentAlerts.length}개 발동` : null,
+        ],
+        5,
+      ),
+    },
+    {
+      id: 'actions',
+      title: '먼저 할 일',
+      items: uniqueBriefItems(
+        [
+          topAction ? `${topAction.title}: ${topAction.suggestedAction}` : null,
+          ...portfolioPlaybook.preMarketSteps.slice(0, 3),
+          ...forecast.checklist.slice(0, 2),
+        ],
+        6,
+      ),
+    },
+  ]
+
+  const copyLines = [
+    `[Tracking Money 장전 브리핑 · ${briefDateLabel(generatedAt)}]`,
+    headline,
+    '',
+    ...sections.flatMap((section) => [`[${section.title}]`, ...section.items.map((item) => `- ${item}`), '']),
+    topSymbols.length > 0 ? `관련 종목: ${topSymbols.join(', ')}` : '',
+  ].filter((line, index, lines) => line || lines[index - 1] !== '')
+
+  return {
+    generatedAt,
+    title: '장전 브리핑',
+    headline,
+    stance: portfolioPlaybook.stance,
+    confidence: forecast.confidence,
+    keyMetric: `${forecast.openingBias} · ${forecast.expectedOpenRange}`,
+    topSymbols,
+    sections,
+    copyText: copyLines.join('\n').trim(),
+  }
+}
+
 function alertSeverityFromDistance(distance: number): TriggeredAlert['severity'] {
   if (distance >= 8) return 'critical'
   if (distance >= 4) return 'high'
@@ -2271,6 +2409,17 @@ function buildDashboardSnapshot({
     newsItems: liveNews,
     biasScoreData: liveBiasScore,
   })
+  const marketStatusView = buildMarketStatusView({ quoteMap, fetchedAt, quoteStatus })
+  const morningBrief = buildMorningBrief({
+    forecast,
+    portfolioPlaybook,
+    actionQueue,
+    triggeredAlerts,
+    newsItems: liveNews,
+    eventsData: calendarEventsData,
+    disclosures,
+    marketStatusData: marketStatusView,
+  })
 
   return {
     holdings: liveHoldings,
@@ -2291,7 +2440,7 @@ function buildDashboardSnapshot({
     },
     leadingIndicators: liveIndicators,
     biasScore: liveBiasScore,
-    marketStatus: buildMarketStatusView({ quoteMap, fetchedAt, quoteStatus }),
+    marketStatus: marketStatusView,
     quoteStatus,
     quoteMessage,
     liveQuoteCount: quotes.length,
@@ -2307,6 +2456,7 @@ function buildDashboardSnapshot({
     disclosureMessage,
     forecast,
     portfolioPlaybook,
+    morningBrief,
     actionQueue,
     journal,
   }
@@ -2395,6 +2545,91 @@ function ActionQueuePanel({
             지금은 우선 처리할 액션이 없습니다.
           </div>
         )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function MorningBriefPanel({ brief, compact = false }: { brief: MorningBrief; compact?: boolean }) {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
+  const stanceTone: 'positive' | 'negative' | 'warning' | 'neutral' =
+    brief.stance === 'risk-on' ? 'positive' : brief.stance === 'defensive' ? 'warning' : 'neutral'
+  const visibleSections = brief.sections
+
+  function copyBriefFallback(text: string) {
+    const textArea = document.createElement('textarea')
+    textArea.value = text
+    textArea.setAttribute('readonly', '')
+    textArea.style.position = 'fixed'
+    textArea.style.left = '-9999px'
+    textArea.style.top = '0'
+    document.body.appendChild(textArea)
+    textArea.focus()
+    textArea.select()
+    textArea.setSelectionRange(0, textArea.value.length)
+    const copied = document.execCommand('copy')
+    textArea.remove()
+    if (!copied) throw new Error('fallback copy failed')
+  }
+
+  async function copyBrief() {
+    try {
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable')
+        await navigator.clipboard.writeText(brief.copyText)
+      } catch {
+        copyBriefFallback(brief.copyText)
+      }
+      setCopyState('copied')
+      window.setTimeout(() => setCopyState('idle'), 1800)
+    } catch {
+      setCopyState('error')
+      window.setTimeout(() => setCopyState('idle'), 2400)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>{brief.title}</CardTitle>
+            <CardDescription>{brief.headline}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={stanceTone}>{brief.keyMetric}</Badge>
+            <Badge variant="secondary">신뢰도 {confidenceLabel[brief.confidence]}</Badge>
+            <Button type="button" variant="outline" size="sm" onClick={() => void copyBrief()}>
+              {copyState === 'copied' ? <Check className="size-4" /> : <Copy className="size-4" />}
+              {copyState === 'copied' ? '복사됨' : copyState === 'error' ? '복사 실패' : '복사'}
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 xl:grid-cols-4">
+          {visibleSections.map((section) => (
+            <div key={section.id} className="rounded-md border border-border bg-muted/15 p-4">
+              <div className="mb-3 text-sm font-semibold">{section.title}</div>
+              <div className="space-y-2">
+                {section.items.slice(0, compact ? 3 : 5).map((item) => (
+                  <div key={item} className="text-sm leading-6 text-muted-foreground">
+                    {item}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        {brief.topSymbols.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {brief.topSymbols.map((symbol) => (
+              <Badge key={symbol} variant="secondary">
+                {symbol}
+              </Badge>
+            ))}
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   )
@@ -4022,6 +4257,7 @@ function NotesPage({
   journal,
   biasScoreData,
   marketStatusData,
+  morningBrief,
   onUpdateJournal,
   onToggleJournalAction,
   onResetJournal,
@@ -4030,6 +4266,7 @@ function NotesPage({
   journal: InvestmentJournal
   biasScoreData: BiasScore
   marketStatusData: MarketStatusView
+  morningBrief: MorningBrief
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
   onResetJournal: () => void
@@ -4052,6 +4289,8 @@ function NotesPage({
         maxItems={5}
         compact
       />
+
+      <MorningBriefPanel brief={morningBrief} />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
         <Card>
@@ -4997,6 +5236,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         journal={snapshot.journal}
         biasScoreData={snapshot.biasScore}
         marketStatusData={snapshot.marketStatus}
+        morningBrief={snapshot.morningBrief}
         onUpdateJournal={actions.onUpdateJournal}
         onToggleJournalAction={actions.onToggleJournalAction}
         onResetJournal={actions.onResetJournal}
@@ -5734,6 +5974,8 @@ export function Dashboard() {
                 </div>
               </CardContent>
             </Card>
+
+            <MorningBriefPanel brief={snapshot.morningBrief} compact />
 
             <PortfolioPlaybookPanel playbook={snapshot.portfolioPlaybook} compact />
 
