@@ -5,6 +5,7 @@ import {
   CalendarDays,
   ChartCandlestick,
   Clock3,
+  Download,
   ExternalLink,
   Gauge,
   LayoutDashboard,
@@ -20,6 +21,7 @@ import {
   Trash2,
   TrendingDown,
   TrendingUp,
+  Upload,
   WalletCards,
   X,
 } from 'lucide-react'
@@ -109,9 +111,16 @@ type StoredDashboardData = {
   journal: InvestmentJournal
 }
 
+type DashboardBackup = {
+  version: 1
+  exportedAt: string
+  data: StoredDashboardData
+}
+
 type DashboardSnapshot = {
   holdings: Holding[]
   watchlist: WatchItem[]
+  storedData: StoredDashboardData
   leadingIndicators: MarketIndicator[]
   biasScore: BiasScore
   marketStatus: MarketStatusView
@@ -207,6 +216,23 @@ const watchStatusLabel = {
   alert: '확인',
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function textValue(value: unknown, fallback = '') {
+  return typeof value === 'string' ? value : fallback
+}
+
+function numberValue(value: unknown, fallback = 0) {
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value.replace(/,/g, '').trim()) : Number.NaN
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function stringArrayValue(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
 function createDefaultJournal(date = getKstDateKey()): InvestmentJournal {
   return {
     date,
@@ -218,17 +244,17 @@ function createDefaultJournal(date = getKstDateKey()): InvestmentJournal {
   }
 }
 
-function normalizeJournal(rawJournal: Partial<InvestmentJournal> | undefined): InvestmentJournal {
+function normalizeJournal(rawJournal: unknown): InvestmentJournal {
   const today = getKstDateKey()
-  if (!rawJournal || rawJournal.date !== today) return createDefaultJournal(today)
+  if (!isRecord(rawJournal) || rawJournal.date !== today) return createDefaultJournal(today)
 
   return {
-    date: rawJournal.date,
-    preMarketPlan: rawJournal.preMarketPlan ?? '',
-    riskPlan: rawJournal.riskPlan ?? '',
-    afterMarketReview: rawJournal.afterMarketReview ?? '',
-    completedActionIds: Array.isArray(rawJournal.completedActionIds) ? rawJournal.completedActionIds : [],
-    lastSavedAt: rawJournal.lastSavedAt ?? null,
+    date: textValue(rawJournal.date, today),
+    preMarketPlan: textValue(rawJournal.preMarketPlan),
+    riskPlan: textValue(rawJournal.riskPlan),
+    afterMarketReview: textValue(rawJournal.afterMarketReview),
+    completedActionIds: stringArrayValue(rawJournal.completedActionIds),
+    lastSavedAt: typeof rawJournal.lastSavedAt === 'string' ? rawJournal.lastSavedAt : null,
   }
 }
 
@@ -254,19 +280,136 @@ function defaultMarketForSymbol(symbol: string): 'KR' | 'US' {
   return /^\d{6}$/.test(symbol) ? 'KR' : 'US'
 }
 
+function normalizeMarket(value: unknown, symbol: string): 'KR' | 'US' {
+  return value === 'KR' || value === 'US' ? value : defaultMarketForSymbol(symbol)
+}
+
+function normalizeDirection(value: unknown): Direction {
+  return value === 'positive' || value === 'negative' || value === 'neutral' || value === 'mixed' ? value : 'neutral'
+}
+
+function normalizeWatchStatus(value: unknown, targetBuyPrice: number, currentPrice: number): WatchItem['status'] {
+  if (value === 'near' || value === 'waiting' || value === 'alert') return value
+  if (targetBuyPrice > 0 && currentPrice <= targetBuyPrice * 1.03) return 'near'
+  return 'waiting'
+}
+
+function dedupeBySymbol<T extends { symbol: string }>(items: T[]) {
+  return Array.from(new Map(items.map((item) => [item.symbol, item])).values())
+}
+
+function normalizeImportedHolding(value: unknown): Holding | null {
+  if (!isRecord(value)) return null
+
+  const symbol = normalizeUserSymbol(textValue(value.symbol))
+  if (!symbol) return null
+
+  const averagePrice = numberValue(value.averagePrice)
+  const currentPrice = numberValue(value.currentPrice, averagePrice)
+
+  return {
+    symbol,
+    name: textValue(value.name, symbol),
+    market: normalizeMarket(value.market, symbol),
+    quantity: Math.max(0, numberValue(value.quantity)),
+    averagePrice: Math.max(0, averagePrice),
+    currentPrice: Math.max(0, currentPrice),
+    dayChange: numberValue(value.dayChange),
+    portfolioWeight: clamp(numberValue(value.portfolioWeight), 0, 100),
+    impact: normalizeDirection(value.impact),
+    impactNote: textValue(value.impactNote, '직접 가져온 백업 데이터입니다.'),
+  }
+}
+
+function normalizeImportedWatchItem(value: unknown): WatchItem | null {
+  if (!isRecord(value)) return null
+
+  const symbol = normalizeUserSymbol(textValue(value.symbol))
+  if (!symbol) return null
+
+  const targetBuyPrice = Math.max(0, numberValue(value.targetBuyPrice))
+  const currentPrice = Math.max(0, numberValue(value.currentPrice, targetBuyPrice))
+  const distanceToBuy =
+    Number.isFinite(numberValue(value.distanceToBuy, Number.NaN)) || targetBuyPrice <= 0
+      ? numberValue(value.distanceToBuy)
+      : round(((currentPrice - targetBuyPrice) / targetBuyPrice) * 100, 1)
+
+  return {
+    symbol,
+    name: textValue(value.name, symbol),
+    targetBuyPrice,
+    currentPrice,
+    distanceToBuy,
+    trigger: textValue(value.trigger, '가져온 관심종목입니다.'),
+    status: normalizeWatchStatus(value.status, targetBuyPrice, currentPrice),
+  }
+}
+
+function normalizeStoredDashboardData(value: unknown): StoredDashboardData | null {
+  const candidate = isRecord(value) && isRecord(value.data) ? value.data : value
+  if (!isRecord(candidate) || !Array.isArray(candidate.holdings) || !Array.isArray(candidate.watchlist)) return null
+
+  return {
+    holdings: dedupeBySymbol(candidate.holdings.map(normalizeImportedHolding).filter((item): item is Holding => item !== null)),
+    watchlist: dedupeBySymbol(candidate.watchlist.map(normalizeImportedWatchItem).filter((item): item is WatchItem => item !== null)),
+    journal: normalizeJournal(candidate.journal),
+  }
+}
+
+function createDashboardBackup(data: StoredDashboardData): DashboardBackup {
+  return {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    data,
+  }
+}
+
+function formatDashboardBackup(data: StoredDashboardData) {
+  return JSON.stringify(createDashboardBackup(data), null, 2)
+}
+
+function parseDashboardBackup(rawJson: string): { ok: true; data: StoredDashboardData; message: string } | { ok: false; message: string } {
+  try {
+    const parsed = JSON.parse(rawJson) as unknown
+    const data = normalizeStoredDashboardData(parsed)
+    if (!data) {
+      return {
+        ok: false,
+        message: '백업 형식이 맞지 않습니다. holdings와 watchlist 배열이 있는 JSON을 넣어주세요.',
+      }
+    }
+
+    return {
+      ok: true,
+      data,
+      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 투자노트를 가져왔습니다.`,
+    }
+  } catch {
+    return {
+      ok: false,
+      message: 'JSON을 읽지 못했습니다. 쉼표나 따옴표가 빠졌는지 확인해주세요.',
+    }
+  }
+}
+
+function downloadDashboardBackup(data: StoredDashboardData) {
+  const blob = new Blob([formatDashboardBackup(data)], { type: 'application/json' })
+  const url = window.URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `tracking-money-backup-${getKstDateKey()}.json`
+  document.body.append(link)
+  link.click()
+  link.remove()
+  window.URL.revokeObjectURL(url)
+}
+
 function loadStoredDashboardData(): StoredDashboardData | null {
   try {
     const raw = window.localStorage.getItem(storageKey)
     if (!raw) return null
 
-    const parsed = JSON.parse(raw) as Partial<StoredDashboardData>
-    if (!Array.isArray(parsed.holdings) || !Array.isArray(parsed.watchlist)) return null
-
-    return {
-      holdings: parsed.holdings,
-      watchlist: parsed.watchlist,
-      journal: normalizeJournal(parsed.journal),
-    }
+    return normalizeStoredDashboardData(JSON.parse(raw) as unknown)
   } catch {
     return null
   }
@@ -870,6 +1013,11 @@ function buildDashboardSnapshot({
   return {
     holdings: liveHoldings,
     watchlist: liveWatchlist,
+    storedData: {
+      holdings: baseHoldings,
+      watchlist: baseWatchlist,
+      journal,
+    },
     leadingIndicators: liveIndicators,
     biasScore: liveBiasScore,
     marketStatus: buildMarketStatusView({ quoteMap, fetchedAt, quoteStatus }),
@@ -2039,11 +2187,20 @@ function SettingsPage({
   holdingsData,
   watchlistData,
   leadingIndicatorsData,
+  backupData,
+  onImportDashboardData,
+  onResetDashboardData,
 }: {
   holdingsData: Holding[]
   watchlistData: WatchItem[]
   leadingIndicatorsData: MarketIndicator[]
+  backupData: StoredDashboardData
+  onImportDashboardData: (data: StoredDashboardData) => void
+  onResetDashboardData: () => void
 }) {
+  const [backupText, setBackupText] = useState('')
+  const [backupMessage, setBackupMessage] = useState('현재 브라우저에 저장된 개인 데이터를 백업하거나 복원할 수 있습니다.')
+  const [backupTone, setBackupTone] = useState<'positive' | 'negative' | 'neutral'>('neutral')
   const sources = [
     { name: '네이버 뉴스 API', cost: '무료 시작', priority: '우선' },
     { name: 'Yahoo Finance chart', cost: '무료 시작', priority: '우선' },
@@ -2052,6 +2209,51 @@ function SettingsPage({
     { name: 'FMP / Finnhub / Polygon', cost: '유료 후보', priority: '후순위' },
     { name: 'AI 이슈 요약', cost: '사용량 기반', priority: '후순위' },
   ]
+  const backupStats = [
+    { label: '보유종목', value: `${backupData.holdings.length}개` },
+    { label: '관심종목', value: `${backupData.watchlist.length}개` },
+    { label: '투자노트', value: backupData.journal.date },
+  ]
+  const backupMessageVariant = backupTone === 'positive' ? 'positive' : backupTone === 'negative' ? 'negative' : 'neutral'
+
+  const handleBuildBackup = () => {
+    setBackupText(formatDashboardBackup(backupData))
+    setBackupTone('positive')
+    setBackupMessage('현재 저장 데이터를 JSON으로 만들었습니다.')
+  }
+
+  const handleDownloadBackup = () => {
+    downloadDashboardBackup(backupData)
+    setBackupTone('positive')
+    setBackupMessage('백업 파일 다운로드를 시작했습니다.')
+  }
+
+  const handleImportBackup = () => {
+    const result = parseDashboardBackup(backupText)
+    if (!result.ok) {
+      setBackupTone('negative')
+      setBackupMessage(result.message)
+      return
+    }
+
+    onImportDashboardData(result.data)
+    setBackupText(formatDashboardBackup(result.data))
+    setBackupTone('positive')
+    setBackupMessage(result.message)
+  }
+
+  const handleResetDashboard = () => {
+    const resetData = {
+      holdings,
+      watchlist,
+      journal: createDefaultJournal(),
+    }
+    onResetDashboardData()
+    setBackupText(formatDashboardBackup(resetData))
+    setBackupTone('positive')
+    setBackupMessage('기본 보유/관심종목과 오늘 투자노트로 복원했습니다.')
+  }
+
   return (
     <PageGrid>
       <section className="grid gap-4 lg:grid-cols-2">
@@ -2122,6 +2324,71 @@ function SettingsPage({
           </CardContent>
         </Card>
       </section>
+
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+        <Card>
+          <CardHeader>
+            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+              <div>
+                <CardTitle>데이터 백업</CardTitle>
+                <CardDescription>보유종목, 관심종목, 투자노트를 JSON 파일로 보관</CardDescription>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button type="button" variant="outline" size="sm" onClick={handleDownloadBackup}>
+                  <Download className="size-4" />
+                  다운로드
+                </Button>
+                <Button type="button" variant="secondary" size="sm" onClick={handleBuildBackup}>
+                  <Save className="size-4" />
+                  JSON 만들기
+                </Button>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Badge variant={backupMessageVariant}>{backupMessage}</Badge>
+            <textarea
+              value={backupText}
+              onChange={(event) => setBackupText(event.target.value)}
+              placeholder="백업 JSON을 붙여넣으면 가져올 수 있습니다."
+              className="min-h-56 w-full resize-y rounded-md border border-border bg-background px-3 py-3 font-mono text-xs leading-5 text-foreground outline-none transition placeholder:text-muted-foreground focus:border-primary"
+            />
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" onClick={handleImportBackup} disabled={!backupText.trim()}>
+                <Upload className="size-4" />
+                가져오기
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                className="border-negative/40 text-negative hover:bg-negative/10 hover:text-negative"
+                onClick={handleResetDashboard}
+              >
+                <RefreshCw className="size-4" />
+                전체 기본값 복원
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>현재 저장 상태</CardTitle>
+            <CardDescription>이 브라우저에 저장되는 개인 데이터</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {backupStats.map((item) => (
+              <div key={item.label} className="flex items-center justify-between rounded-md border border-border bg-muted/15 p-3">
+                <span className="text-sm text-muted-foreground">{item.label}</span>
+                <Badge variant="secondary">{item.value}</Badge>
+              </div>
+            ))}
+            <div className="rounded-md border border-border bg-muted/15 p-3 text-xs leading-5 text-muted-foreground">
+              현재 버전은 브라우저 저장소 기반입니다. 다른 기기에서 이어 쓰려면 백업 파일을 가져오거나, 다음 단계에서 서버 저장소를 붙이면 됩니다.
+            </div>
+          </CardContent>
+        </Card>
+      </section>
     </PageGrid>
   )
 }
@@ -2138,6 +2405,8 @@ type DashboardActions = {
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
   onResetJournal: () => void
+  onImportDashboardData: (data: StoredDashboardData) => void
+  onResetDashboardData: () => void
 }
 
 function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: DashboardActions) {
@@ -2204,6 +2473,9 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         holdingsData={snapshot.holdings}
         watchlistData={snapshot.watchlist}
         leadingIndicatorsData={snapshot.leadingIndicators}
+        backupData={snapshot.storedData}
+        onImportDashboardData={actions.onImportDashboardData}
+        onResetDashboardData={actions.onResetDashboardData}
       />
     )
   }
@@ -2513,6 +2785,23 @@ export function Dashboard() {
         setJournal({
           ...createDefaultJournal(),
           lastSavedAt: new Date().toISOString(),
+        })
+      },
+      onImportDashboardData: (data) => {
+        setUserHoldings(data.holdings)
+        setUserWatchlist(data.watchlist)
+        setJournal(data.journal)
+        saveStoredDashboardData(data)
+      },
+      onResetDashboardData: () => {
+        const nextJournal = createDefaultJournal()
+        setUserHoldings(holdings)
+        setUserWatchlist(watchlist)
+        setJournal(nextJournal)
+        saveStoredDashboardData({
+          holdings,
+          watchlist,
+          journal: nextJournal,
         })
       },
     }),
