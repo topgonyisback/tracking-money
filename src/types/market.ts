@@ -158,6 +158,35 @@ export type NewsImpactBoard = {
   items: SymbolNewsImpact[]
 }
 
+export type ForecastSensitivityFactor = {
+  id: string
+  label: string
+  symbol: string
+  category: 'indicator' | 'news' | 'portfolio'
+  currentImpact: number
+  upsideDelta: number
+  downsideDelta: number
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  upsideTrigger: string
+  downsideTrigger: string
+  note: string
+  watchSymbols: string[]
+}
+
+export type ForecastSensitivity = {
+  generatedAt: string
+  baseScore: number
+  upsideTarget: number
+  downsideTarget: number
+  upsideGap: number
+  downsideGap: number
+  summary: string
+  topUpsideFactor: string
+  topDownsideFactor: string
+  factors: ForecastSensitivityFactor[]
+  transitionChecklist: string[]
+}
+
 export type CalendarEvent = {
   id: string
   date: string

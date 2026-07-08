@@ -69,6 +69,7 @@ import type {
   DisclosureItem,
   ExecutionPlan,
   ExecutionPlanItem,
+  ForecastSensitivity,
   ForecastReview,
   Holding,
   InvestmentJournal,
@@ -254,6 +255,7 @@ type DashboardSnapshot = {
   dataReliability: DataReliability
   signalAudit: SignalAudit
   koreaMarketBridge: KoreaMarketBridge
+  forecastSensitivity: ForecastSensitivity
   forecastReview: ForecastReview
   executionPlan: ExecutionPlan
   actionQueue: ActionQueueItem[]
@@ -1966,6 +1968,144 @@ function buildMarketForecast({
   }
 }
 
+function sensitivityScoreLabel(score: number) {
+  if (score >= 62) return '상방 우위'
+  if (score <= 43) return '방어 전환'
+  return '중립권'
+}
+
+function indicatorUpsideTrigger(signal: KoreaMarketBridge['signals'][number]) {
+  if (signal.impact < 0) return `${signal.symbol} 부담이 절반 이하로 줄거나 플러스 전환`
+  if (signal.impact > 0) return `${signal.symbol} 우호 흐름이 장 시작 전까지 유지`
+  return `${signal.symbol} 방향이 우호 쪽으로 확정`
+}
+
+function indicatorDownsideTrigger(signal: KoreaMarketBridge['signals'][number]) {
+  if (signal.impact > 0) return `${signal.symbol} 우호 신호가 꺾이거나 음전`
+  if (signal.impact < 0) return `${signal.symbol} 부담이 추가 확대`
+  return `${signal.symbol}이 부담 방향으로 확정`
+}
+
+function buildForecastSensitivity({
+  forecast,
+  koreaMarketBridge,
+  newsImpactBoard,
+  portfolioPlaybook,
+}: {
+  forecast: MarketForecast
+  koreaMarketBridge: KoreaMarketBridge
+  newsImpactBoard: NewsImpactBoard
+  portfolioPlaybook: PortfolioPlaybook
+}): ForecastSensitivity {
+  const indicatorFactors = koreaMarketBridge.signals.slice(0, 6).map((signal) => {
+    const currentImpact = clamp(Math.round(signal.impact * 0.55), -28, 28)
+    const upsideDelta =
+      signal.impact < 0
+        ? clamp(Math.round(Math.abs(signal.impact) * 0.65 + 6), 4, 26)
+        : clamp(Math.round(signal.weight * 0.25 + Math.max(2, signal.impact * 0.18)), 3, 16)
+    const downsideDelta =
+      signal.impact > 0
+        ? -clamp(Math.round(signal.impact * 0.7 + 5), 4, 26)
+        : -clamp(Math.round(Math.abs(signal.impact) * 0.35 + 4), 3, 18)
+
+    return {
+      id: `sensitivity-${signal.symbol}`,
+      label: signal.name,
+      symbol: signal.symbol,
+      category: 'indicator' as const,
+      currentImpact,
+      upsideDelta,
+      downsideDelta,
+      tone: signal.tone,
+      upsideTrigger: indicatorUpsideTrigger(signal),
+      downsideTrigger: indicatorDownsideTrigger(signal),
+      note: signal.confirmation,
+      watchSymbols: signal.relatedSymbols,
+    }
+  })
+  const topNewsItems = newsImpactBoard.items.slice(0, 4).map((item) => {
+    const currentImpact = clamp(Math.round(item.score / 4), -24, 24)
+    const upsideDelta =
+      item.score < 0
+        ? clamp(Math.round(Math.abs(item.score) / 5 + 5), 4, 22)
+        : clamp(Math.round(item.score / 8 + item.highImportanceCount), 3, 18)
+    const downsideDelta =
+      item.score > 0
+        ? -clamp(Math.round(item.score / 6 + 5), 4, 24)
+        : -clamp(Math.round(Math.abs(item.score) / 8 + item.highImportanceCount), 3, 18)
+
+    return {
+      id: `sensitivity-news-${item.source}-${item.symbol}`,
+      label: `${item.name} 뉴스`,
+      symbol: item.symbol,
+      category: 'news' as const,
+      currentImpact,
+      upsideDelta,
+      downsideDelta,
+      tone: item.tone,
+      upsideTrigger: item.score < 0 ? `${item.name} 부담 뉴스 해소 또는 반박 기사 확인` : `${item.name} 우호 뉴스에 가격·거래량 동반`,
+      downsideTrigger: item.score > 0 ? `${item.name} 우호 뉴스가 재료 소멸로 바뀌는지 확인` : `${item.name} 부정 뉴스가 추가 확산`,
+      note: item.expectedMove,
+      watchSymbols: [item.symbol, ...item.catalysts].slice(0, 6),
+    }
+  })
+  const portfolioRisk = portfolioPlaybook.riskSignals[0]
+  const portfolioFactor: ForecastSensitivity['factors'] = portfolioRisk
+    ? [
+        {
+          id: `sensitivity-portfolio-${portfolioRisk.id}`,
+          label: portfolioRisk.title,
+          symbol: portfolioRisk.relatedSymbols[0] ?? 'PORT',
+          category: 'portfolio' as const,
+          currentImpact: portfolioRisk.severity === 'critical' ? -18 : portfolioRisk.severity === 'high' ? -13 : -8,
+          upsideDelta: portfolioRisk.severity === 'critical' ? 14 : portfolioRisk.severity === 'high' ? 10 : 7,
+          downsideDelta: portfolioRisk.severity === 'critical' ? -18 : portfolioRisk.severity === 'high' ? -13 : -8,
+          tone: portfolioRisk.severity === 'critical' || portfolioRisk.severity === 'high' ? 'negative' : 'warning',
+          upsideTrigger: `${portfolioRisk.title} 리스크가 완화되는지 확인`,
+          downsideTrigger: `${portfolioRisk.title} 리스크가 가격에 반영되는지 확인`,
+          note: portfolioRisk.suggestedAction,
+          watchSymbols: portfolioRisk.relatedSymbols,
+        },
+      ]
+    : []
+  const factors = [...indicatorFactors, ...topNewsItems, ...portfolioFactor]
+    .sort((left, right) => Math.max(Math.abs(right.upsideDelta), Math.abs(right.downsideDelta)) - Math.max(Math.abs(left.upsideDelta), Math.abs(left.downsideDelta)))
+    .slice(0, 10)
+  const upsideFactors = [...factors].sort((left, right) => right.upsideDelta - left.upsideDelta)
+  const downsideFactors = [...factors].sort((left, right) => Math.abs(right.downsideDelta) - Math.abs(left.downsideDelta))
+  const topUpsideFactor = upsideFactors[0]
+  const topDownsideFactor = downsideFactors.find((factor) => factor.id !== topUpsideFactor?.id) ?? downsideFactors[0]
+  const upsideTarget = 62
+  const downsideTarget = 43
+  const upsideGap = Math.max(0, upsideTarget - forecast.baseScore)
+  const downsideGap = Math.max(0, forecast.baseScore - downsideTarget)
+  const summary =
+    upsideGap === 0
+      ? `${sensitivityScoreLabel(forecast.baseScore)} 상태입니다. 상방 유지에는 ${topDownsideFactor?.symbol ?? '핵심 변수'} 이탈 여부가 중요합니다.`
+      : downsideGap === 0
+        ? `${sensitivityScoreLabel(forecast.baseScore)} 상태입니다. 방어 해제에는 ${topUpsideFactor?.symbol ?? '핵심 변수'} 개선이 필요합니다.`
+        : `상방 전환까지 ${upsideGap}점, 방어 전환까지 ${downsideGap}점 남았습니다. ${topUpsideFactor?.symbol ?? '상방 변수'}와 ${topDownsideFactor?.symbol ?? '하방 변수'}를 먼저 봅니다.`
+  const transitionChecklist = [
+    topUpsideFactor ? `상방 전환: ${topUpsideFactor.upsideTrigger}` : '상방 전환: NQ/SOX 유지와 환율 안정 확인',
+    topDownsideFactor ? `하방 전환: ${topDownsideFactor.downsideTrigger}` : '하방 전환: 환율, VIX, 금리 급등 여부 확인',
+    '전환 신호가 나오면 09:00~09:30 대장주 상대강도와 외국인 선물 수급으로 재확인',
+  ]
+
+  return {
+    generatedAt: new Date().toISOString(),
+    baseScore: forecast.baseScore,
+    upsideTarget,
+    downsideTarget,
+    upsideGap,
+    downsideGap,
+    summary,
+    topUpsideFactor: topUpsideFactor?.symbol ?? '확인 대기',
+    topDownsideFactor: topDownsideFactor?.symbol ?? '확인 대기',
+    factors,
+    transitionChecklist,
+  }
+}
+
 function getSymbolProfile(symbol: string, name: string) {
   const normalized = symbol.toUpperCase()
   const knownProfile = symbolProfiles[normalized]
@@ -3576,6 +3716,12 @@ function buildDashboardSnapshot({
     disclosures,
     usdKrw: getQuote(quoteMap, 'USD/KRW')?.price ?? Number(marketStatus.usdKrw.replace(/,/g, '')),
   })
+  const forecastSensitivity = buildForecastSensitivity({
+    forecast,
+    koreaMarketBridge,
+    newsImpactBoard,
+    portfolioPlaybook,
+  })
   const actionQueue = buildActionQueue({
     biasScoreData: liveBiasScore,
     holdingsData: liveHoldings,
@@ -3686,6 +3832,7 @@ function buildDashboardSnapshot({
     dataReliability,
     signalAudit,
     koreaMarketBridge,
+    forecastSensitivity,
     forecastReview,
     executionPlan,
     actionQueue,
@@ -3714,6 +3861,108 @@ function MetricCard({
             {detail}
           </Badge>
         ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+const sensitivityCategoryLabel: Record<ForecastSensitivity['factors'][number]['category'], string> = {
+  indicator: '지표',
+  news: '뉴스',
+  portfolio: '보유',
+}
+
+function ForecastSensitivityPanel({ sensitivity, compact = false }: { sensitivity: ForecastSensitivity; compact?: boolean }) {
+  const visibleFactors = compact ? sensitivity.factors.slice(0, 4) : sensitivity.factors
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>예측 민감도·전환조건</CardTitle>
+            <CardDescription>{sensitivity.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={sensitivity.upsideGap === 0 ? 'positive' : 'neutral'}>상방 {sensitivity.upsideTarget}</Badge>
+            <Badge variant={sensitivity.downsideGap === 0 ? 'negative' : 'neutral'}>방어 {sensitivity.downsideTarget}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">현재 점수</div>
+            <div className="mt-2 text-2xl font-semibold">{sensitivity.baseScore}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">상방 전환까지</div>
+            <div className="mt-2 text-2xl font-semibold">{sensitivity.upsideGap === 0 ? '도달' : `+${sensitivity.upsideGap}`}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">방어 전환까지</div>
+            <div className="mt-2 text-2xl font-semibold">{sensitivity.downsideGap === 0 ? '진입' : `-${sensitivity.downsideGap}`}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">핵심 전환 변수</div>
+            <div className="mt-2 text-sm font-semibold leading-5">
+              {sensitivity.topUpsideFactor} / {sensitivity.topDownsideFactor}
+            </div>
+          </div>
+        </div>
+
+        <div className={cn('grid gap-4', compact ? 'xl:grid-cols-[minmax(0,1fr)_280px]' : 'xl:grid-cols-[minmax(0,1fr)_340px]')}>
+          <div className="grid gap-2">
+            {visibleFactors.map((factor) => (
+              <div key={factor.id} className="rounded-md border border-border bg-muted/10 p-3">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-sm font-semibold">{factor.symbol}</span>
+                      <span className="text-sm font-medium">{factor.label}</span>
+                      <Badge variant="secondary">{sensitivityCategoryLabel[factor.category]}</Badge>
+                      <Badge variant={factor.tone}>{factor.currentImpact > 0 ? `+${factor.currentImpact}` : factor.currentImpact}</Badge>
+                    </div>
+                    <div className="mt-2 text-sm leading-5 text-muted-foreground">{factor.note}</div>
+                  </div>
+                  <div className="flex shrink-0 flex-wrap gap-2">
+                    <Badge variant="positive">상방 +{factor.upsideDelta}</Badge>
+                    <Badge variant="negative">하방 {factor.downsideDelta}</Badge>
+                  </div>
+                </div>
+                {!compact ? (
+                  <div className="mt-3 grid gap-2 md:grid-cols-2">
+                    <div className="rounded-md border border-positive/20 bg-positive/10 p-2 text-xs leading-5">
+                      {factor.upsideTrigger}
+                    </div>
+                    <div className="rounded-md border border-negative/20 bg-negative/10 p-2 text-xs leading-5">
+                      {factor.downsideTrigger}
+                    </div>
+                  </div>
+                ) : null}
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  {factor.watchSymbols.slice(0, compact ? 4 : 6).map((symbol) => (
+                    <Badge key={symbol} variant="secondary">
+                      {symbol}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="rounded-md border border-border bg-muted/10 p-3">
+            <div className="text-xs font-medium text-muted-foreground">전환 체크리스트</div>
+            <div className="mt-3 grid gap-2 text-sm leading-5">
+              {sensitivity.transitionChecklist.map((item) => (
+                <div key={item} className="flex gap-2">
+                  <Check className="mt-0.5 size-4 shrink-0 text-primary" />
+                  <span>{item}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </CardContent>
     </Card>
   )
@@ -5189,6 +5438,7 @@ function ForecastPage({
   portfolioPlaybook,
   dataReliability,
   signalAudit,
+  forecastSensitivity,
   executionPlan,
 }: {
   forecast: MarketForecast
@@ -5196,6 +5446,7 @@ function ForecastPage({
   portfolioPlaybook: PortfolioPlaybook
   dataReliability: DataReliability
   signalAudit: SignalAudit
+  forecastSensitivity: ForecastSensitivity
   executionPlan: ExecutionPlan
 }) {
   const topImpact = forecast.impacts[0]
@@ -5214,6 +5465,8 @@ function ForecastPage({
       <DataReliabilityPanel reliability={dataReliability} compact />
 
       <SignalAuditPanel audit={signalAudit} />
+
+      <ForecastSensitivityPanel sensitivity={forecastSensitivity} />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
         <Card>
@@ -7369,6 +7622,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         portfolioPlaybook={snapshot.portfolioPlaybook}
         dataReliability={snapshot.dataReliability}
         signalAudit={snapshot.signalAudit}
+        forecastSensitivity={snapshot.forecastSensitivity}
         executionPlan={snapshot.executionPlan}
       />
     )
@@ -8211,6 +8465,8 @@ export function Dashboard() {
             <DataReliabilityPanel reliability={snapshot.dataReliability} onRefreshAll={refreshAllData} refreshing={dataRefreshBusy} compact />
 
             <SignalAuditPanel audit={snapshot.signalAudit} compact />
+
+            <ForecastSensitivityPanel sensitivity={snapshot.forecastSensitivity} compact />
 
             <KoreaMarketBridgePanel bridge={snapshot.koreaMarketBridge} compact />
 
