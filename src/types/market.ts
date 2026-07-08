@@ -164,6 +164,52 @@ export type TriggeredAlert = {
   relatedSymbols: string[]
 }
 
+export type PortfolioExposure = {
+  id: string
+  label: string
+  value: number
+  percent: number
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  symbols: string[]
+  note: string
+}
+
+export type PortfolioRiskSignal = {
+  id: string
+  title: string
+  severity: 'critical' | 'high' | 'medium' | 'low'
+  summary: string
+  evidence: string
+  suggestedAction: string
+  relatedSymbols: string[]
+}
+
+export type PositionPlaybookItem = {
+  id: string
+  symbol: string
+  name: string
+  action: 'hold' | 'observe' | 'add-ready' | 'trim-watch' | 'avoid'
+  priority: 'critical' | 'high' | 'medium' | 'low'
+  reason: string
+  trigger: string
+  priceGuide: string
+}
+
+export type PortfolioPlaybook = {
+  totalValueKrw: number
+  dayPnlKrw: number
+  dayPnlPercent: number
+  stance: 'risk-on' | 'balanced' | 'defensive'
+  stanceLabel: string
+  summary: string
+  concentrationScore: number
+  topExposureLabel: string
+  exposures: PortfolioExposure[]
+  riskSignals: PortfolioRiskSignal[]
+  positionPlans: PositionPlaybookItem[]
+  preMarketSteps: string[]
+}
+
 export type InvestmentJournal = {
   date: string
   preMarketPlan: string

@@ -67,6 +67,7 @@ import type {
   LiveNewsItem,
   MarketIndicator,
   MarketQuote,
+  PortfolioPlaybook,
   TriggeredAlert,
   WatchItem,
 } from '@/types/market'
@@ -227,6 +228,7 @@ type DashboardSnapshot = {
   disclosureStatus: DisclosureStatus
   disclosureMessage: string
   forecast: MarketForecast
+  portfolioPlaybook: PortfolioPlaybook
   actionQueue: ActionQueueItem[]
   journal: InvestmentJournal
 }
@@ -321,6 +323,21 @@ const alertSeverityLabel: Record<TriggeredAlert['severity'], string> = {
   low: '낮음',
 }
 
+const portfolioSeverityLabel: Record<PortfolioPlaybook['riskSignals'][number]['severity'], string> = {
+  critical: '긴급',
+  high: '높음',
+  medium: '보통',
+  low: '낮음',
+}
+
+const positionActionLabel: Record<PortfolioPlaybook['positionPlans'][number]['action'], string> = {
+  hold: '보유 유지',
+  observe: '관찰',
+  'add-ready': '분할 준비',
+  'trim-watch': '축소 감시',
+  avoid: '진입 보류',
+}
+
 const watchStatusLabel = {
   near: '근접',
   waiting: '대기',
@@ -365,6 +382,16 @@ const defaultAlertRules: AlertRule[] = [
     createdAt: '2026-07-08T00:00:00.000Z',
   },
 ]
+
+const symbolProfiles: Record<string, { sector: string; sensitivity: string[] }> = {
+  '005930': { sector: '반도체', sensitivity: ['SOX', 'USD/KRW', 'NQ=F'] },
+  '000660': { sector: '반도체', sensitivity: ['SOX', 'USD/KRW', 'NQ=F'] },
+  '035420': { sector: '인터넷', sensitivity: ['US10Y', 'NQ=F'] },
+  '373220': { sector: '배터리', sensitivity: ['USD/KRW', 'TSLA'] },
+  AAPL: { sector: '빅테크', sensitivity: ['NQ=F', 'DXY'] },
+  NVDA: { sector: 'AI 반도체', sensitivity: ['SOX', 'NQ=F'] },
+  TSLA: { sector: '전기차', sensitivity: ['NQ=F', 'DXY'] },
+}
 
 const dataHealthStatusLabel: Record<DataHealthStatus, string> = {
   idle: '대기',
@@ -799,6 +826,36 @@ function formatSignedCurrency(value: number, market: 'KR' | 'US') {
   return market === 'KR'
     ? `${prefix}${abs.toLocaleString('ko-KR')}`
     : `${prefix}$${abs.toLocaleString('en-US', { maximumFractionDigits: 2 })}`
+}
+
+function formatKrwAmount(value: number) {
+  const abs = Math.abs(value)
+  const prefix = value < 0 ? '-' : ''
+
+  if (abs >= 100_000_000) return `${prefix}${round(abs / 100_000_000, 1).toLocaleString('ko-KR')}억`
+  if (abs >= 10_000) return `${prefix}${Math.round(abs / 10_000).toLocaleString('ko-KR')}만`
+  return `${prefix}${Math.round(abs).toLocaleString('ko-KR')}`
+}
+
+function portfolioVariantFromSeverity(
+  severity: PortfolioPlaybook['riskSignals'][number]['severity'],
+): 'positive' | 'negative' | 'warning' | 'neutral' {
+  if (severity === 'critical' || severity === 'high') return 'negative'
+  if (severity === 'medium') return 'warning'
+  return 'neutral'
+}
+
+function positionActionVariant(action: PortfolioPlaybook['positionPlans'][number]['action']): 'positive' | 'negative' | 'warning' | 'neutral' {
+  if (action === 'add-ready' || action === 'hold') return 'positive'
+  if (action === 'trim-watch' || action === 'avoid') return 'warning'
+  return 'neutral'
+}
+
+function playbookPriorityVariant(priority: PortfolioPlaybook['positionPlans'][number]['priority']): 'positive' | 'negative' | 'warning' | 'neutral' {
+  if (priority === 'critical') return 'negative'
+  if (priority === 'high') return 'warning'
+  if (priority === 'medium') return 'neutral'
+  return 'neutral'
 }
 
 function holdingProfit(holding: Holding) {
@@ -1241,6 +1298,342 @@ function buildMarketForecast({
     ],
     impacts,
     checklist,
+  }
+}
+
+function getSymbolProfile(symbol: string, name: string) {
+  const normalized = symbol.toUpperCase()
+  const knownProfile = symbolProfiles[normalized]
+  if (knownProfile) return knownProfile
+
+  if (/^\d{6}$/.test(normalized)) {
+    return {
+      sector: name.includes('반도체') ? '반도체' : '국내 기타',
+      sensitivity: ['USD/KRW', 'KOSPI'],
+    }
+  }
+
+  return {
+    sector: name.includes('AI') ? 'AI/성장' : '미국 기타',
+    sensitivity: ['NQ=F', 'DXY'],
+  }
+}
+
+function holdingMarketValueKrw(holding: Holding, usdKrw: number) {
+  const value = holding.currentPrice * holding.quantity
+  return holding.market === 'US' ? value * usdKrw : value
+}
+
+function indicatorPressure(indicators: MarketIndicator[], symbol: string) {
+  const indicator = indicators.find((item) => item.symbol === symbol)
+  if (!indicator) return 0
+
+  const signedChange = inverseIndicators.has(symbol) ? -indicator.change : indicator.change
+  return signedChange
+}
+
+function portfolioSeverityRank(severity: PortfolioPlaybook['riskSignals'][number]['severity']) {
+  if (severity === 'critical') return 4
+  if (severity === 'high') return 3
+  if (severity === 'medium') return 2
+  return 1
+}
+
+function playbookPriorityRank(priority: PortfolioPlaybook['positionPlans'][number]['priority']) {
+  if (priority === 'critical') return 4
+  if (priority === 'high') return 3
+  if (priority === 'medium') return 2
+  return 1
+}
+
+function buildPortfolioPlaybook({
+  holdingsData,
+  watchlistData,
+  indicators,
+  biasScoreData,
+  forecast,
+  newsItems,
+  disclosures,
+  usdKrw,
+}: {
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+  indicators: MarketIndicator[]
+  biasScoreData: BiasScore
+  forecast: MarketForecast
+  newsItems: LiveNewsItem[]
+  disclosures: DisclosureItem[]
+  usdKrw: number
+}): PortfolioPlaybook {
+  const enrichedHoldings = holdingsData.map((holding) => {
+    const profile = getSymbolProfile(holding.symbol, holding.name)
+    return {
+      ...holding,
+      marketValueKrw: holdingMarketValueKrw(holding, usdKrw),
+      sector: profile.sector,
+      sensitivity: profile.sensitivity,
+    }
+  })
+  const totalValueKrw = enrichedHoldings.reduce((sum, holding) => sum + holding.marketValueKrw, 0)
+  const dayPnlKrw = enrichedHoldings.reduce((sum, holding) => sum + holding.marketValueKrw * (holding.dayChange / 100), 0)
+  const dayPnlPercent = totalValueKrw > 0 ? round((dayPnlKrw / totalValueKrw) * 100, 2) : 0
+  const sortedHoldings = [...enrichedHoldings].sort((a, b) => b.marketValueKrw - a.marketValueKrw)
+  const topHolding = sortedHoldings[0]
+  const topTwoWeight = sortedHoldings.slice(0, 2).reduce((sum, holding) => sum + holding.portfolioWeight, 0)
+  const krWeight = enrichedHoldings.filter((holding) => holding.market === 'KR').reduce((sum, holding) => sum + holding.portfolioWeight, 0)
+  const usWeight = enrichedHoldings.filter((holding) => holding.market === 'US').reduce((sum, holding) => sum + holding.portfolioWeight, 0)
+
+  const sectorMap = new Map<string, { value: number; symbols: string[] }>()
+  for (const holding of enrichedHoldings) {
+    const existing = sectorMap.get(holding.sector) ?? { value: 0, symbols: [] }
+    existing.value += holding.marketValueKrw
+    existing.symbols.push(holding.symbol)
+    sectorMap.set(holding.sector, existing)
+  }
+  const sectorExposures = Array.from(sectorMap.entries())
+    .map(([sector, data]) => ({
+      id: `sector-${sector}`,
+      label: sector,
+      value: data.value,
+      percent: totalValueKrw > 0 ? round((data.value / totalValueKrw) * 100, 1) : 0,
+      symbols: data.symbols,
+    }))
+    .sort((a, b) => b.percent - a.percent)
+  const topSector = sectorExposures[0]
+  const soxPressure = indicatorPressure(indicators, 'SOX')
+  const nqPressure = indicatorPressure(indicators, 'NQ=F')
+  const usdKrwPressure = indicatorPressure(indicators, 'USD/KRW')
+  const vixPressure = indicatorPressure(indicators, 'VIX')
+  const concentrationScore = clamp(Math.round((topHolding?.portfolioWeight ?? 0) * 1.2 + Math.max(0, topTwoWeight - 55) * 1.4 + Math.max(0, (topSector?.percent ?? 0) - 45) * 1.2), 0, 100)
+  const riskSignals: PortfolioPlaybook['riskSignals'] = []
+
+  if ((topHolding?.portfolioWeight ?? 0) >= 35 || topTwoWeight >= 62) {
+    riskSignals.push({
+      id: 'concentration',
+      title: '상위 종목 쏠림',
+      severity: (topHolding?.portfolioWeight ?? 0) >= 42 || topTwoWeight >= 70 ? 'high' : 'medium',
+      summary: `${topHolding?.name ?? '상위 종목'} 비중이 ${topHolding?.portfolioWeight ?? 0}%이고 상위 2개 비중은 ${round(topTwoWeight, 1)}%입니다.`,
+      evidence: `집중도 ${concentrationScore}/100`,
+      suggestedAction: '장 초반 갭 방향이 맞아도 한 종목 추가 매수보다 기존 비중의 손익 방어선을 먼저 정합니다.',
+      relatedSymbols: sortedHoldings.slice(0, 2).map((holding) => holding.symbol),
+    })
+  }
+
+  if (topSector && topSector.percent >= 48) {
+    riskSignals.push({
+      id: `sector-${topSector.label}`,
+      title: `${topSector.label} 섹터 집중`,
+      severity: topSector.percent >= 60 ? 'high' : 'medium',
+      summary: `${topSector.label} 노출이 ${topSector.percent}%입니다.`,
+      evidence: `${topSector.symbols.join(', ')}`,
+      suggestedAction: topSector.label.includes('반도체')
+        ? 'SOX와 엔비디아 뉴스가 꺾이면 반도체 보유종목의 추가 매수는 보류합니다.'
+        : '섹터 대표 지표가 약하면 같은 방향 종목을 동시에 늘리지 않습니다.',
+      relatedSymbols: topSector.symbols,
+    })
+  }
+
+  if (krWeight >= 55 && usdKrwPressure < -0.2) {
+    riskSignals.push({
+      id: 'usdkrw-pressure',
+      title: '환율 부담',
+      severity: Math.abs(usdKrwPressure) >= 0.8 ? 'high' : 'medium',
+      summary: `국내 비중 ${round(krWeight, 1)}% 상태에서 달러/원 흐름이 국내장에 부담입니다.`,
+      evidence: `USD/KRW ${formatChange(Math.abs(usdKrwPressure))} 부담`,
+      suggestedAction: '개장 직후 외국인 선물과 환율 재상승을 확인하기 전에는 국내 성장주 추격을 늦춥니다.',
+      relatedSymbols: ['USD/KRW', ...enrichedHoldings.filter((holding) => holding.market === 'KR').map((holding) => holding.symbol)],
+    })
+  }
+
+  if ((topSector?.label.includes('반도체') || topSector?.label.includes('AI')) && topSector.percent >= 35 && soxPressure < -0.2) {
+    riskSignals.push({
+      id: 'sox-pressure',
+      title: '반도체 선행지표 둔화',
+      severity: Math.abs(soxPressure) >= 1 ? 'high' : 'medium',
+      summary: `${topSector.label} 노출이 큰 상태에서 SOX가 부담 방향입니다.`,
+      evidence: `SOX ${formatChange(Math.abs(soxPressure))} 부담`,
+      suggestedAction: '삼성전자, SK하이닉스, NVDA 중 지수보다 약한 종목은 첫 반등 실패 여부를 먼저 봅니다.',
+      relatedSymbols: ['SOX', ...topSector.symbols],
+    })
+  }
+
+  if (vixPressure < -1.5 || biasScoreData.stance === 'pressure') {
+    riskSignals.push({
+      id: 'market-defense',
+      title: '시장 방어 우선',
+      severity: biasScoreData.score <= 35 || vixPressure < -3 ? 'critical' : 'high',
+      summary: `${forecast.openingBias} 흐름입니다. 변동성 또는 방향점수가 방어 쪽입니다.`,
+      evidence: `방향점수 ${biasScoreData.score}/100`,
+      suggestedAction: '첫 30분은 신규 매수보다 손실 확대 종목과 고비중 종목의 대응 기준을 먼저 확인합니다.',
+      relatedSymbols: ['VIX', 'NQ=F', 'USD/KRW'],
+    })
+  }
+
+  const negativeTrackedNews = newsItems.filter(
+    (item) =>
+      (item.direction === 'negative' || item.direction === 'mixed') &&
+      item.relatedSymbols.some((symbol) => enrichedHoldings.some((holding) => holding.symbol === symbol)),
+  )
+  if (negativeTrackedNews.length > 0) {
+    const topNews = negativeTrackedNews[0]
+    riskSignals.push({
+      id: `news-${topNews.id}`,
+      title: `${topNews.keyword} 뉴스 압력`,
+      severity: topNews.importance === 'high' ? 'high' : 'medium',
+      summary: topNews.title,
+      evidence: `${formatNewsTime(topNews.publishedAt)} · ${topNews.source}`,
+      suggestedAction: '뉴스 방향을 단정하지 말고 관련 종목이 지수 대비 약한지 먼저 비교합니다.',
+      relatedSymbols: topNews.relatedSymbols,
+    })
+  }
+
+  const negativeDisclosure = disclosures.find((item) => item.direction === 'negative' || item.direction === 'mixed')
+  if (negativeDisclosure) {
+    riskSignals.push({
+      id: `disclosure-risk-${negativeDisclosure.id}`,
+      title: `${negativeDisclosure.corpName} 공시 확인`,
+      severity: negativeDisclosure.importance === 'high' ? 'high' : 'medium',
+      summary: negativeDisclosure.reportName,
+      evidence: formatDisclosureDate(negativeDisclosure.submittedAt),
+      suggestedAction: '공시 원문에서 수치, 정정 여부, 계약 조건을 확인하고 가격 반응을 기록합니다.',
+      relatedSymbols: [negativeDisclosure.symbol],
+    })
+  }
+
+  if (riskSignals.length === 0) {
+    riskSignals.push({
+      id: 'stable',
+      title: '즉시 방어 신호 낮음',
+      severity: 'low',
+      summary: '현재 조합에서는 집중도와 선행지표 부담이 과도하지 않습니다.',
+      evidence: `집중도 ${concentrationScore}/100`,
+      suggestedAction: '그래도 개장 30분 상대강도와 환율 급변은 계속 체크합니다.',
+      relatedSymbols: ['NQ=F', 'SOX', 'USD/KRW'],
+    })
+  }
+
+  const positionPlans: PortfolioPlaybook['positionPlans'] = [
+    ...enrichedHoldings.map((holding) => {
+      const highWeight = holding.portfolioWeight >= 30
+      const weakPrice = holding.dayChange <= -1 || holding.impact === 'negative'
+      const favorableMarket = biasScoreData.stance === 'favorable' && nqPressure >= -0.15
+      const action: PortfolioPlaybook['positionPlans'][number]['action'] =
+        highWeight && (weakPrice || biasScoreData.stance !== 'favorable')
+          ? 'trim-watch'
+          : weakPrice
+            ? 'observe'
+            : favorableMarket && holding.impact === 'positive'
+              ? 'hold'
+              : 'observe'
+      const priority: PortfolioPlaybook['positionPlans'][number]['priority'] =
+        action === 'trim-watch' && highWeight ? 'high' : action === 'trim-watch' || weakPrice ? 'medium' : 'low'
+
+      return {
+        id: `holding-plan-${holding.symbol}`,
+        symbol: holding.symbol,
+        name: holding.name,
+        action,
+        priority,
+        reason: `${holding.portfolioWeight}% 비중, 당일 ${formatChange(holding.dayChange)}, ${holding.sector} 노출`,
+        trigger:
+          action === 'trim-watch'
+            ? '시초가 반등 실패 또는 지수 대비 약세면 비중 확대 금지'
+            : action === 'hold'
+              ? '지수보다 강하고 거래량이 붙으면 보유 유지'
+              : '첫 30분 상대강도 확인 후 판단',
+        priceGuide: `현재 ${formatCurrency(holding.currentPrice, holding.market)} / 평단 ${formatCurrency(holding.averagePrice, holding.market)}`,
+      }
+    }),
+    ...watchlistData
+      .filter((item) => item.status !== 'waiting' || item.distanceToBuy <= 6)
+      .map((item) => {
+        const marketOk = biasScoreData.score >= 55 && (soxPressure >= -0.2 || !item.trigger.includes('AI'))
+        const action: PortfolioPlaybook['positionPlans'][number]['action'] = marketOk && item.status !== 'alert' ? 'add-ready' : 'avoid'
+        const priority: PortfolioPlaybook['positionPlans'][number]['priority'] = item.status === 'near' ? 'medium' : 'low'
+        return {
+          id: `watch-plan-${item.symbol}`,
+          symbol: item.symbol,
+          name: item.name,
+          action,
+          priority,
+          reason: `관심가까지 ${item.distanceToBuy.toFixed(1)}%`,
+          trigger: marketOk ? '관심가 근처에서 지수와 뉴스 방향이 같이 맞을 때만 분할' : '시장 조건이 맞기 전에는 진입 보류',
+          priceGuide: `현재 ${formatCurrency(item.currentPrice, item.symbol.length === 6 ? 'KR' : 'US')} / 관심가 ${formatCurrency(item.targetBuyPrice, item.symbol.length === 6 ? 'KR' : 'US')}`,
+        }
+      }),
+  ]
+    .sort((a, b) => playbookPriorityRank(b.priority) - playbookPriorityRank(a.priority))
+    .slice(0, 7)
+
+  const stance: PortfolioPlaybook['stance'] =
+    riskSignals.some((item) => item.severity === 'critical' || item.severity === 'high') || biasScoreData.score < 45
+      ? 'defensive'
+      : biasScoreData.score >= 60 && dayPnlPercent >= -0.5
+        ? 'risk-on'
+        : 'balanced'
+  const stanceLabel = stance === 'risk-on' ? '선별 공격' : stance === 'defensive' ? '방어 우선' : '균형 유지'
+  const exposures: PortfolioPlaybook['exposures'] = [
+    {
+      id: 'market-kr',
+      label: '국내 주식',
+      value: totalValueKrw * (krWeight / 100),
+      percent: round(krWeight, 1),
+      tone: krWeight >= 65 && usdKrwPressure < -0.2 ? 'warning' : 'neutral',
+      symbols: enrichedHoldings.filter((holding) => holding.market === 'KR').map((holding) => holding.symbol),
+      note: usdKrwPressure < -0.2 ? '환율 부담이 국내 비중에 직접 반영됩니다.' : '국내장 방향점수와 외국인 수급을 같이 봅니다.',
+    },
+    {
+      id: 'market-us',
+      label: '미국 주식',
+      value: totalValueKrw * (usWeight / 100),
+      percent: round(usWeight, 1),
+      tone: usWeight >= 35 && nqPressure < -0.2 ? 'warning' : 'neutral',
+      symbols: enrichedHoldings.filter((holding) => holding.market === 'US').map((holding) => holding.symbol),
+      note: nqPressure < -0.2 ? '나스닥 선물 약세가 미국 성장주에 부담입니다.' : 'NQ=F와 달러 흐름을 같이 봅니다.',
+    },
+    ...sectorExposures.slice(0, 4).map((exposure) => {
+      const tone: PortfolioPlaybook['exposures'][number]['tone'] =
+        exposure.percent >= 55
+          ? 'warning'
+          : exposure.label.includes('반도체') && soxPressure > 0.2
+            ? 'positive'
+            : exposure.label.includes('반도체') && soxPressure < -0.2
+              ? 'negative'
+              : 'neutral'
+      return {
+        ...exposure,
+        tone,
+        note:
+        exposure.label.includes('반도체') || exposure.label.includes('AI')
+          ? 'SOX, NVDA, AI 뉴스와 민감하게 움직입니다.'
+          : '섹터 뉴스와 해당 종목 상대강도를 확인합니다.',
+      }
+    }),
+  ]
+
+  return {
+    totalValueKrw,
+    dayPnlKrw,
+    dayPnlPercent,
+    stance,
+    stanceLabel,
+    summary:
+      stance === 'defensive'
+        ? '오늘은 신규 진입보다 고비중 종목과 리스크 신호를 먼저 정리하는 쪽이 유리합니다.'
+        : stance === 'risk-on'
+          ? '선행지표가 받쳐주면 강한 보유종목은 유지하고 관심종목은 분할 조건만 확인합니다.'
+          : '방향이 과하게 한쪽으로 쏠리지 않았으므로 첫 30분 가격 반응을 본 뒤 움직입니다.',
+    concentrationScore,
+    topExposureLabel: topSector ? `${topSector.label} ${topSector.percent}%` : '노출 계산 대기',
+    exposures,
+    riskSignals: riskSignals.sort((a, b) => portfolioSeverityRank(b.severity) - portfolioSeverityRank(a.severity)).slice(0, 5),
+    positionPlans,
+    preMarketSteps: [
+      `${forecast.openingBias} 기준으로 첫 30분 추격 매수 금지/허용 기준을 정합니다.`,
+      topSector ? `${topSector.label} 대표 종목이 지수보다 강한지 먼저 확인합니다.` : '보유종목 상대강도를 먼저 확인합니다.',
+      riskSignals[0] ? `${riskSignals[0].title} 신호가 완화되는지 체크합니다.` : '환율, VIX, NQ=F 급변 여부를 체크합니다.',
+      watchlistData.some((item) => item.status === 'near') ? '관심가 근접 종목은 뉴스와 거래량이 같이 맞을 때만 분할합니다.' : '관심종목은 지수 방향 확인 전까지 대기합니다.',
+    ],
   }
 }
 
@@ -1730,6 +2123,16 @@ function buildDashboardSnapshot({
     disclosureStatus,
     calendarStatus,
   })
+  const portfolioPlaybook = buildPortfolioPlaybook({
+    holdingsData: liveHoldings,
+    watchlistData: liveWatchlist,
+    indicators: liveIndicators,
+    biasScoreData: liveBiasScore,
+    forecast,
+    newsItems: liveNews,
+    disclosures,
+    usdKrw: getQuote(quoteMap, 'USD/KRW')?.price ?? Number(marketStatus.usdKrw.replace(/,/g, '')),
+  })
   const actionQueue = buildActionQueue({
     biasScoreData: liveBiasScore,
     holdingsData: liveHoldings,
@@ -1778,6 +2181,7 @@ function buildDashboardSnapshot({
     disclosureStatus,
     disclosureMessage,
     forecast,
+    portfolioPlaybook,
     actionQueue,
     journal,
   }
@@ -1866,6 +2270,135 @@ function ActionQueuePanel({
             지금은 우선 처리할 액션이 없습니다.
           </div>
         )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function PortfolioPlaybookPanel({ playbook, compact = false }: { playbook: PortfolioPlaybook; compact?: boolean }) {
+  const topRisk = playbook.riskSignals[0]
+  const stanceTone: 'positive' | 'negative' | 'warning' | 'neutral' =
+    playbook.stance === 'risk-on' ? 'positive' : playbook.stance === 'defensive' ? 'warning' : 'neutral'
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>포트폴리오 플레이북</CardTitle>
+            <CardDescription>{playbook.summary}</CardDescription>
+          </div>
+          <Badge variant={stanceTone}>{playbook.stanceLabel}</Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">평가금액</div>
+            <div className="mt-2 text-lg font-semibold">{formatKrwAmount(playbook.totalValueKrw)}원</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">오늘 추정 손익</div>
+            <div className={cn('mt-2 text-lg font-semibold', playbook.dayPnlKrw >= 0 ? 'text-positive' : 'text-negative')}>
+              {formatKrwAmount(playbook.dayPnlKrw)}원
+            </div>
+            <div className="mt-1 text-xs text-muted-foreground">{formatChange(playbook.dayPnlPercent)}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">집중도</div>
+            <div className="mt-2 text-lg font-semibold">{playbook.concentrationScore}/100</div>
+            <Progress className="mt-2" value={playbook.concentrationScore} />
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">최대 노출</div>
+            <div className="mt-2 text-lg font-semibold">{playbook.topExposureLabel}</div>
+          </div>
+        </div>
+
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(280px,0.8fr)]">
+          <div className="space-y-3">
+            <div className="text-sm font-semibold">노출 지도</div>
+            <div className="grid gap-3 md:grid-cols-2">
+              {playbook.exposures.slice(0, compact ? 4 : 6).map((exposure) => (
+                <div key={exposure.id} className="rounded-md border border-border bg-muted/15 p-3">
+                  <div className="mb-2 flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold">{exposure.label}</div>
+                      <div className="mt-1 text-xs text-muted-foreground">{formatKrwAmount(exposure.value)}원</div>
+                    </div>
+                    <Badge variant={exposure.tone}>{exposure.percent}%</Badge>
+                  </div>
+                  <Progress value={exposure.percent} />
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {exposure.symbols.slice(0, 4).map((symbol) => (
+                      <Badge key={symbol} variant="secondary">
+                        {symbol}
+                      </Badge>
+                    ))}
+                  </div>
+                  <div className="mt-2 text-xs leading-5 text-muted-foreground">{exposure.note}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <div className="text-sm font-semibold">리스크 신호</div>
+            {playbook.riskSignals.slice(0, compact ? 3 : 5).map((signal) => (
+              <div key={signal.id} className="rounded-md border border-border bg-muted/15 p-3">
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <Badge variant={portfolioVariantFromSeverity(signal.severity)}>{portfolioSeverityLabel[signal.severity]}</Badge>
+                  {signal.relatedSymbols.slice(0, 3).map((symbol) => (
+                    <Badge key={symbol} variant="secondary">
+                      {symbol}
+                    </Badge>
+                  ))}
+                </div>
+                <div className="text-sm font-semibold">{signal.title}</div>
+                <div className="mt-2 text-xs leading-5 text-muted-foreground">{signal.summary}</div>
+                {!compact ? <div className="mt-2 text-xs leading-5 text-foreground/80">{signal.suggestedAction}</div> : null}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {!compact ? (
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+            <div className="space-y-3">
+              <div className="text-sm font-semibold">종목별 행동</div>
+              <div className="grid gap-3 lg:grid-cols-2">
+                {playbook.positionPlans.map((item) => (
+                  <div key={item.id} className="rounded-md border border-border bg-muted/15 p-3">
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <Badge variant={positionActionVariant(item.action)}>{positionActionLabel[item.action]}</Badge>
+                      <Badge variant={playbookPriorityVariant(item.priority)}>{actionPriorityLabel[item.priority]}</Badge>
+                      <Badge variant="secondary">{item.symbol}</Badge>
+                    </div>
+                    <div className="text-sm font-semibold">{item.name}</div>
+                    <div className="mt-2 text-xs leading-5 text-muted-foreground">{item.reason}</div>
+                    <div className="mt-2 text-xs leading-5 text-foreground/80">{item.trigger}</div>
+                    <div className="mt-2 rounded-md bg-background/70 p-2 text-xs text-muted-foreground">{item.priceGuide}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div className="text-sm font-semibold">장전 순서</div>
+              {playbook.preMarketSteps.map((step, index) => (
+                <div key={step} className="flex gap-3 rounded-md border border-border bg-muted/15 p-3">
+                  <Badge variant={index === 0 ? 'warning' : 'secondary'}>{index + 1}</Badge>
+                  <div className="text-sm leading-6">{step}</div>
+                </div>
+              ))}
+              {topRisk ? (
+                <div className="rounded-md border border-warning/25 bg-warning/10 p-3 text-xs leading-5 text-foreground/85">
+                  핵심 확인: {topRisk.evidence}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   )
@@ -2453,7 +2986,15 @@ const forecastSourceLabel = {
   portfolio: '보유',
 }
 
-function ForecastPage({ forecast, actionQueue }: { forecast: MarketForecast; actionQueue: ActionQueueItem[] }) {
+function ForecastPage({
+  forecast,
+  actionQueue,
+  portfolioPlaybook,
+}: {
+  forecast: MarketForecast
+  actionQueue: ActionQueueItem[]
+  portfolioPlaybook: PortfolioPlaybook
+}) {
   const topImpact = forecast.impacts[0]
   const topRisk = forecast.impacts.find((item) => item.impact < 0)
   const topPositive = forecast.impacts.find((item) => item.impact > 0)
@@ -2513,6 +3054,8 @@ function ForecastPage({ forecast, actionQueue }: { forecast: MarketForecast; act
           </CardContent>
         </Card>
       </section>
+
+      <PortfolioPlaybookPanel playbook={portfolioPlaybook} />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
         <Card>
@@ -4144,7 +4687,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
     )
   }
   if (page === 'radar') return <MarketRadarPage leadingIndicatorsData={snapshot.leadingIndicators} biasScoreData={snapshot.biasScore} />
-  if (page === 'forecast') return <ForecastPage forecast={snapshot.forecast} actionQueue={snapshot.actionQueue} />
+  if (page === 'forecast') return <ForecastPage forecast={snapshot.forecast} actionQueue={snapshot.actionQueue} portfolioPlaybook={snapshot.portfolioPlaybook} />
   if (page === 'news') {
     return (
       <NewsPage
@@ -4863,6 +5406,8 @@ export function Dashboard() {
                 </div>
               </CardContent>
             </Card>
+
+            <PortfolioPlaybookPanel playbook={snapshot.portfolioPlaybook} compact />
 
             <ActionQueuePanel
               items={snapshot.actionQueue}
