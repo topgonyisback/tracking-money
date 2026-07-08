@@ -52,7 +52,17 @@ import {
   watchlist,
 } from '@/data/mock-dashboard'
 import { cn } from '@/lib/utils'
-import type { BiasScore, CalendarEvent, Direction, Holding, LiveNewsItem, MarketIndicator, MarketQuote, WatchItem } from '@/types/market'
+import type {
+  ActionQueueItem,
+  BiasScore,
+  CalendarEvent,
+  Direction,
+  Holding,
+  LiveNewsItem,
+  MarketIndicator,
+  MarketQuote,
+  WatchItem,
+} from '@/types/market'
 
 const navItems = [
   { id: 'dashboard', label: '대시보드', subtitle: '국내장 예열과 포트폴리오 영향', icon: LayoutDashboard },
@@ -61,6 +71,7 @@ const navItems = [
   { id: 'radar', label: '시장 레이더', subtitle: '선행 지표와 국내장 연결', icon: Radar },
   { id: 'news', label: '뉴스', subtitle: '종목별 이슈와 영향도', icon: Newspaper },
   { id: 'calendar', label: '캘린더', subtitle: '실적, 매크로, 정책 일정', icon: CalendarDays },
+  { id: 'alerts', label: '알림', subtitle: '오늘 우선순위 액션', icon: Bell },
   { id: 'notes', label: '투자노트', subtitle: '시나리오와 장 후 리뷰', icon: NotebookPen },
   { id: 'settings', label: '설정', subtitle: '추적 대상과 데이터 주기', icon: Settings },
 ] as const
@@ -112,6 +123,7 @@ type DashboardSnapshot = {
   liveNews: LiveNewsItem[]
   newsStatus: NewsStatus
   newsMessage: string
+  actionQueue: ActionQueueItem[]
 }
 
 const storageKey = 'tracking-money-dashboard-v1'
@@ -169,6 +181,21 @@ const calendarTypeLabel = {
   policy: '정책',
   company: '기업',
   dividend: '배당',
+}
+
+const actionPriorityLabel = {
+  critical: '긴급',
+  high: '높음',
+  medium: '보통',
+  low: '낮음',
+}
+
+const actionCategoryLabel = {
+  market: '시장',
+  portfolio: '보유',
+  watchlist: '관심',
+  news: '뉴스',
+  calendar: '일정',
 }
 
 const watchStatusLabel = {
@@ -535,6 +562,207 @@ function applyNewsBiasFactor(score: BiasScore, factor: BiasScore['positives'][nu
   }
 }
 
+function actionPriorityVariant(priority: ActionQueueItem['priority']): 'positive' | 'negative' | 'warning' | 'neutral' | 'secondary' {
+  if (priority === 'critical') return 'negative'
+  if (priority === 'high') return 'warning'
+  if (priority === 'medium') return 'neutral'
+  return 'secondary'
+}
+
+function priorityRank(priority: ActionQueueItem['priority']) {
+  if (priority === 'critical') return 4
+  if (priority === 'high') return 3
+  if (priority === 'medium') return 2
+  return 1
+}
+
+function makeActionItem(item: ActionQueueItem) {
+  return item
+}
+
+function buildMarketActionItems(biasScoreData: BiasScore, indicators: MarketIndicator[]): ActionQueueItem[] {
+  const items: ActionQueueItem[] = []
+  const riskIndicators = indicators
+    .filter((indicator) => indicator.direction === 'negative' && Math.abs(indicator.change) >= 0.5)
+    .sort((a, b) => Math.abs(b.change) - Math.abs(a.change))
+    .slice(0, 2)
+
+  if (biasScoreData.stance === 'pressure') {
+    items.push(
+      makeActionItem({
+        id: 'market-pressure',
+        priority: biasScoreData.score <= 35 ? 'critical' : 'high',
+        category: 'market',
+        title: '장 초반 방어 모드',
+        summary: '선행 지표가 국내장 부담 쪽으로 기울었습니다.',
+        reason: biasScoreData.summary,
+        suggestedAction: '첫 30~60분은 추격 매수를 줄이고 환율, 외국인 선물, 반도체 대장주 수급을 먼저 확인합니다.',
+        relatedSymbols: ['NQ=F', 'SOX', 'USD/KRW', 'US10Y'],
+        evidence: `방향점수 ${biasScoreData.score}/100`,
+        score: 100 - biasScoreData.score,
+      }),
+    )
+  }
+
+  if (biasScoreData.stance === 'favorable') {
+    items.push(
+      makeActionItem({
+        id: 'market-risk-on',
+        priority: biasScoreData.score >= 72 ? 'high' : 'medium',
+        category: 'market',
+        title: '우호 흐름 종목 우선 확인',
+        summary: '선행 지표가 위험선호 쪽으로 기울었습니다.',
+        reason: biasScoreData.summary,
+        suggestedAction: '시장 전체 추격보다 보유 반도체와 관심 성장주가 지수보다 강한지 먼저 비교합니다.',
+        relatedSymbols: ['SOX', 'NQ=F', '005930', '000660'],
+        evidence: `방향점수 ${biasScoreData.score}/100`,
+        score: biasScoreData.score,
+      }),
+    )
+  }
+
+  for (const indicator of riskIndicators) {
+    items.push(
+      makeActionItem({
+        id: `indicator-${indicator.symbol}`,
+        priority: Math.abs(indicator.change) >= 3 ? 'high' : 'medium',
+        category: 'market',
+        title: `${indicator.symbol} 부담 신호 확인`,
+        summary: `${indicator.name} 흐름이 국내장에 부담입니다.`,
+        reason: indicator.note,
+        suggestedAction: '관련 보유종목의 시초가 갭과 첫 반등 실패 여부를 같이 봅니다.',
+        relatedSymbols: [indicator.symbol],
+        evidence: `${indicator.symbol} ${formatChange(indicator.change)}`,
+        score: 55 + Math.min(30, Math.abs(indicator.change) * 4),
+      }),
+    )
+  }
+
+  return items
+}
+
+function buildPortfolioActionItems(holdingsData: Holding[]): ActionQueueItem[] {
+  return holdingsData
+    .filter((holding) => holding.impact === 'negative' || holding.portfolioWeight >= 30)
+    .map((holding) => {
+      const isLargeRisk = holding.impact === 'negative' && (holding.portfolioWeight >= 25 || holding.dayChange <= -3)
+
+      return makeActionItem({
+        id: `portfolio-${holding.symbol}`,
+        priority: isLargeRisk ? 'high' : holding.portfolioWeight >= 35 ? 'medium' : 'low',
+        category: 'portfolio',
+        title: `${holding.name} 비중/가격 압력 점검`,
+        summary: `${holding.portfolioWeight}% 비중, 당일 ${formatChange(holding.dayChange)} 흐름입니다.`,
+        reason: holding.impactNote,
+        suggestedAction: '평단 대비 손익과 오늘 첫 지지 구간을 확인하고, 추가 매수는 지수 방향이 확인된 뒤 판단합니다.',
+        relatedSymbols: [holding.symbol],
+        evidence: `비중 ${holding.portfolioWeight}%, 등락 ${formatChange(holding.dayChange)}`,
+        score: Math.round(holding.portfolioWeight + Math.abs(holding.dayChange) * 6),
+      })
+    })
+}
+
+function buildWatchlistActionItems(watchlistData: WatchItem[]): ActionQueueItem[] {
+  return watchlistData
+    .filter((item) => item.status !== 'waiting' || item.distanceToBuy <= 5)
+    .map((item) =>
+      makeActionItem({
+        id: `watchlist-${item.symbol}`,
+        priority: item.status === 'alert' ? 'high' : item.status === 'near' ? 'medium' : 'low',
+        category: 'watchlist',
+        title: `${item.name} 관심가 접근`,
+        summary: `관심가까지 ${item.distanceToBuy.toFixed(1)}% 거리입니다.`,
+        reason: item.trigger,
+        suggestedAction: '관심가 근처에서 바로 매수보다 뉴스/거래량/지수 방향이 같이 맞는지 확인합니다.',
+        relatedSymbols: [item.symbol],
+        evidence: `현재 ${formatCurrency(item.currentPrice, item.symbol.length === 6 ? 'KR' : 'US')} / 관심가 ${formatCurrency(
+          item.targetBuyPrice,
+          item.symbol.length === 6 ? 'KR' : 'US',
+        )}`,
+        score: Math.round(70 - item.distanceToBuy * 5 + (item.status === 'alert' ? 20 : 0)),
+      }),
+    )
+}
+
+function buildNewsActionItems(newsItems: LiveNewsItem[], holdingsData: Holding[], watchlistData: WatchItem[]): ActionQueueItem[] {
+  const trackedSymbols = new Set([...holdingsData.map((holding) => holding.symbol), ...watchlistData.map((item) => item.symbol)])
+
+  return newsItems
+    .filter((item) => item.importance === 'high' || item.relatedSymbols.some((symbol) => trackedSymbols.has(symbol)))
+    .slice(0, 4)
+    .map((item) =>
+      makeActionItem({
+        id: `news-${item.id}`,
+        priority: item.importance === 'high' && item.relatedSymbols.some((symbol) => trackedSymbols.has(symbol)) ? 'high' : 'medium',
+        category: 'news',
+        title: `${item.keyword} 뉴스 영향 확인`,
+        summary: item.title,
+        reason: item.expectedImpact,
+        suggestedAction:
+          item.direction === 'negative'
+            ? '관련 종목의 갭하락과 반등 실패 여부를 먼저 확인합니다.'
+            : item.direction === 'positive'
+              ? '관련 종목이 지수보다 강한지 확인하고 추격 여부는 거래량으로 필터링합니다.'
+              : '기사 방향이 애매하므로 가격 반응이 먼저 확인될 때까지 대기합니다.',
+        relatedSymbols: item.relatedSymbols.length > 0 ? item.relatedSymbols : [item.keyword],
+        evidence: `${formatNewsTime(item.publishedAt)} · ${item.source}`,
+        score: 60 + (item.importance === 'high' ? 20 : 0) + Math.abs(newsItemImpact(item) * 5),
+      }),
+    )
+}
+
+function buildCalendarActionItems(eventsData: CalendarEvent[]): ActionQueueItem[] {
+  return eventsData
+    .filter((event) => isTodayCalendarEvent(event) || event.importance === 'high')
+    .slice(0, 4)
+    .map((event) =>
+      makeActionItem({
+        id: `calendar-${event.id}`,
+        priority: isTodayCalendarEvent(event) && event.importance === 'high' ? 'high' : 'medium',
+        category: 'calendar',
+        title: `${event.title} 준비`,
+        summary: `${event.date} ${event.time} 일정입니다.`,
+        reason: event.description ?? '관련 종목과 지표 변동성이 커질 수 있는 일정입니다.',
+        suggestedAction: event.status === 'estimated' ? '공식 일정 여부를 재확인하고 발표 전 포지션 크기를 점검합니다.' : '발표 전후 관련 지표와 보유종목 반응을 기록합니다.',
+        relatedSymbols: event.relatedSymbols,
+        evidence: `${event.status ? calendarStatusLabel[event.status] : '점검'} · ${event.source ?? '캘린더'}`,
+        score: 58 + (event.importance === 'high' ? 18 : 0) + (isTodayCalendarEvent(event) ? 12 : 0),
+      }),
+    )
+}
+
+function buildActionQueue({
+  biasScoreData,
+  holdingsData,
+  watchlistData,
+  indicators,
+  newsItems,
+  eventsData,
+}: {
+  biasScoreData: BiasScore
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+  indicators: MarketIndicator[]
+  newsItems: LiveNewsItem[]
+  eventsData: CalendarEvent[]
+}) {
+  const seen = new Set<string>()
+  return [
+    ...buildMarketActionItems(biasScoreData, indicators),
+    ...buildPortfolioActionItems(holdingsData),
+    ...buildWatchlistActionItems(watchlistData),
+    ...buildNewsActionItems(newsItems, holdingsData, watchlistData),
+    ...buildCalendarActionItems(eventsData),
+  ]
+    .filter((item) => {
+      if (seen.has(item.id)) return false
+      seen.add(item.id)
+      return true
+    })
+    .sort((a, b) => priorityRank(b.priority) - priorityRank(a.priority) || b.score - a.score)
+    .slice(0, 10)
+}
+
 function buildMarketStatusView({
   quoteMap,
   fetchedAt,
@@ -599,6 +827,14 @@ function buildDashboardSnapshot({
     buildLiveBiasScore(liveIndicators, quotes.length),
     buildNewsBiasFactor(liveNews, liveHoldings, liveWatchlist),
   )
+  const actionQueue = buildActionQueue({
+    biasScoreData: liveBiasScore,
+    holdingsData: liveHoldings,
+    watchlistData: liveWatchlist,
+    indicators: liveIndicators,
+    newsItems: liveNews,
+    eventsData: calendarEventsData,
+  })
 
   return {
     holdings: liveHoldings,
@@ -616,6 +852,7 @@ function buildDashboardSnapshot({
     liveNews,
     newsStatus,
     newsMessage,
+    actionQueue,
   }
 }
 
@@ -640,6 +877,68 @@ function MetricCard({
             {detail}
           </Badge>
         ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+function ActionQueuePanel({
+  items,
+  title = '오늘 액션 큐',
+  description = '시장, 뉴스, 일정, 보유/관심종목을 합친 우선순위',
+  maxItems,
+  compact = false,
+}: {
+  items: ActionQueueItem[]
+  title?: string
+  description?: string
+  maxItems?: number
+  compact?: boolean
+}) {
+  const visibleItems = typeof maxItems === 'number' ? items.slice(0, maxItems) : items
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle>{title}</CardTitle>
+            <CardDescription>{description}</CardDescription>
+          </div>
+          <Badge variant={items.some((item) => item.priority === 'critical') ? 'negative' : items.some((item) => item.priority === 'high') ? 'warning' : 'neutral'}>
+            {items.length}개 대기
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {visibleItems.length > 0 ? (
+          visibleItems.map((item) => (
+            <div key={item.id} className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <Badge variant={actionPriorityVariant(item.priority)}>{actionPriorityLabel[item.priority]}</Badge>
+                <Badge variant="secondary">{actionCategoryLabel[item.category]}</Badge>
+                <span className="text-xs text-muted-foreground">{item.evidence}</span>
+              </div>
+              <div className="text-sm font-semibold leading-6">{item.title}</div>
+              <div className="mt-1 text-sm leading-6 text-foreground/85">{item.summary}</div>
+              {!compact ? <div className="mt-2 text-xs leading-5 text-muted-foreground">{item.reason}</div> : null}
+              <div className="mt-3 rounded-md border border-border bg-background/70 p-3 text-sm leading-6">
+                {item.suggestedAction}
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {item.relatedSymbols.map((symbol) => (
+                  <Badge key={symbol} variant="secondary">
+                    {symbol}
+                  </Badge>
+                ))}
+              </div>
+            </div>
+          ))
+        ) : (
+          <div className="rounded-md border border-border bg-muted/15 p-4 text-sm text-muted-foreground">
+            지금은 우선 처리할 액션이 없습니다.
+          </div>
+        )}
       </CardContent>
     </Card>
   )
@@ -1435,9 +1734,39 @@ function CalendarPage({
   )
 }
 
-function NotesPage() {
+function AlertsPage({ actionQueue }: { actionQueue: ActionQueueItem[] }) {
+  const criticalCount = actionQueue.filter((item) => item.priority === 'critical').length
+  const highCount = actionQueue.filter((item) => item.priority === 'high').length
+  const watchlistCount = actionQueue.filter((item) => item.category === 'watchlist').length
+
   return (
     <PageGrid>
+      <section className="grid gap-4 md:grid-cols-3">
+        <MetricCard label="긴급 알림" value={`${criticalCount}개`} detail="즉시 확인" tone={criticalCount > 0 ? 'negative' : 'neutral'} />
+        <MetricCard label="높은 우선순위" value={`${highCount}개`} detail="오늘 처리" tone={highCount > 0 ? 'warning' : 'neutral'} />
+        <MetricCard label="관심가/트리거" value={`${watchlistCount}개`} detail="가격 조건" tone={watchlistCount > 0 ? 'positive' : 'neutral'} />
+      </section>
+
+      <ActionQueuePanel
+        items={actionQueue}
+        title="알림 센터"
+        description="실시간 지표, 보유비중, 뉴스, 캘린더 이벤트를 합쳐 정렬"
+      />
+    </PageGrid>
+  )
+}
+
+function NotesPage({ actionQueue }: { actionQueue: ActionQueueItem[] }) {
+  return (
+    <PageGrid>
+      <ActionQueuePanel
+        items={actionQueue}
+        title="장 시작 전 실행 순서"
+        description="투자노트에 기록하기 전 먼저 볼 항목"
+        maxItems={5}
+        compact
+      />
+
       <section className="grid gap-4 xl:grid-cols-3">
         <Card>
           <CardHeader>
@@ -1629,7 +1958,8 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
       />
     )
   }
-  if (page === 'notes') return <NotesPage />
+  if (page === 'alerts') return <AlertsPage actionQueue={snapshot.actionQueue} />
+  if (page === 'notes') return <NotesPage actionQueue={snapshot.actionQueue} />
   if (page === 'settings') {
     return (
       <SettingsPage
@@ -1972,7 +2302,7 @@ export function Dashboard() {
                 <Button size="icon" variant="outline" aria-label="시세 새로고침" onClick={() => void loadQuotes()} disabled={quoteStatus === 'loading'}>
                   <RefreshCw className={cn('size-4', quoteStatus === 'loading' && 'animate-spin')} />
                 </Button>
-                <Button size="icon" variant="outline" aria-label="알림">
+                <Button size="icon" variant="outline" aria-label="알림" onClick={() => setActivePage('alerts')}>
                   <Bell className="size-4" />
                 </Button>
               </div>
@@ -2085,6 +2415,14 @@ export function Dashboard() {
                 </CardContent>
               </Card>
             </section>
+
+            <ActionQueuePanel
+              items={snapshot.actionQueue}
+              title="오늘 액션 큐"
+              description="지표, 뉴스, 캘린더, 보유/관심종목을 합친 우선순위"
+              maxItems={4}
+              compact
+            />
 
             <section className="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_420px]">
               <Card>

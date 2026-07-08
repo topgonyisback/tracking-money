@@ -111,6 +111,19 @@ export type CalendarEvent = {
   description?: string
 }
 
+export type ActionQueueItem = {
+  id: string
+  priority: 'critical' | 'high' | 'medium' | 'low'
+  category: 'market' | 'portfolio' | 'watchlist' | 'news' | 'calendar'
+  title: string
+  summary: string
+  reason: string
+  suggestedAction: string
+  relatedSymbols: string[]
+  evidence: string
+  score: number
+}
+
 export type ActionMemo = {
   bullishScenario: string
   bearishScenario: string
