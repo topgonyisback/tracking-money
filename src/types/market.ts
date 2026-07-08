@@ -262,6 +262,34 @@ export type DataReliability = {
   nextActions: string[]
 }
 
+export type SignalAuditSource = {
+  id: 'indicator' | 'news' | 'disclosure' | 'calendar' | 'portfolio'
+  label: string
+  itemCount: number
+  impactSum: number
+  positiveImpact: number
+  negativeImpact: number
+  contributionPct: number
+  reliabilityScore: number
+  reliabilityLabel: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  confidence: Confidence
+  summary: string
+  topEvidence: string[]
+}
+
+export type SignalAudit = {
+  generatedAt: string
+  totalPositiveImpact: number
+  totalNegativeImpact: number
+  netImpact: number
+  dominantDirection: Direction
+  summary: string
+  sources: SignalAuditSource[]
+  warnings: string[]
+  focusList: string[]
+}
+
 export type ForecastReviewSignal = {
   id: string
   label: string

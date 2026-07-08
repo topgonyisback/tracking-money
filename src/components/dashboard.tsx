@@ -77,6 +77,8 @@ import type {
   MarketQuote,
   MorningBrief,
   PortfolioPlaybook,
+  SignalAudit,
+  SignalAuditSource,
   TriggeredAlert,
   WatchItem,
 } from '@/types/market'
@@ -244,6 +246,7 @@ type DashboardSnapshot = {
   portfolioPlaybook: PortfolioPlaybook
   morningBrief: MorningBrief
   dataReliability: DataReliability
+  signalAudit: SignalAudit
   forecastReview: ForecastReview
   executionPlan: ExecutionPlan
   actionQueue: ActionQueueItem[]
@@ -2481,6 +2484,140 @@ function buildDataReliability({
   }
 }
 
+const signalAuditSourceMeta: Record<
+  ForecastImpact['source'],
+  {
+    label: string
+    reliabilityId?: DataReliability['sources'][number]['id']
+    localScore?: number
+    localLabel?: string
+  }
+> = {
+  indicator: {
+    label: '선행지표',
+    reliabilityId: 'quotes',
+  },
+  news: {
+    label: '뉴스 이슈',
+    reliabilityId: 'news',
+  },
+  disclosure: {
+    label: 'DART 공시',
+    reliabilityId: 'disclosures',
+  },
+  calendar: {
+    label: '이벤트 일정',
+    reliabilityId: 'calendar',
+  },
+  portfolio: {
+    label: '내 포트폴리오',
+    localScore: 88,
+    localLabel: '브라우저 저장',
+  },
+}
+
+function signedImpactLabel(value: number) {
+  return `${value > 0 ? '+' : ''}${value}점`
+}
+
+function signalAuditConfidence(reliabilityScore: number, itemCount: number): SignalAuditSource['confidence'] {
+  if (reliabilityScore >= 78 && itemCount >= 2) return 'high'
+  if (reliabilityScore >= 45 && itemCount > 0) return 'medium'
+  return 'low'
+}
+
+function buildSignalAudit({
+  forecast,
+  dataReliability,
+}: {
+  forecast: MarketForecast
+  dataReliability: DataReliability
+}): SignalAudit {
+  const grouped = forecast.impacts.reduce(
+    (acc, impact) => {
+      const source = acc.get(impact.source) ?? []
+      source.push(impact)
+      acc.set(impact.source, source)
+      return acc
+    },
+    new Map<ForecastImpact['source'], ForecastImpact[]>(),
+  )
+  const totalAbsoluteImpact = Math.max(
+    1,
+    forecast.impacts.reduce((sum, impact) => sum + Math.abs(impact.impact), 0),
+  )
+  const totalPositiveImpact = forecast.impacts.filter((impact) => impact.impact > 0).reduce((sum, impact) => sum + impact.impact, 0)
+  const totalNegativeImpact = Math.abs(forecast.impacts.filter((impact) => impact.impact < 0).reduce((sum, impact) => sum + impact.impact, 0))
+  const netImpact = totalPositiveImpact - totalNegativeImpact
+  const sources = (Object.keys(signalAuditSourceMeta) as ForecastImpact['source'][]).map((sourceId): SignalAuditSource => {
+    const meta = signalAuditSourceMeta[sourceId]
+    const impacts = grouped.get(sourceId) ?? []
+    const reliabilitySource = meta.reliabilityId ? dataReliability.sources.find((source) => source.id === meta.reliabilityId) : undefined
+    const impactSum = impacts.reduce((sum, impact) => sum + impact.impact, 0)
+    const positiveImpact = impacts.filter((impact) => impact.impact > 0).reduce((sum, impact) => sum + impact.impact, 0)
+    const negativeImpact = Math.abs(impacts.filter((impact) => impact.impact < 0).reduce((sum, impact) => sum + impact.impact, 0))
+    const reliabilityScore = reliabilitySource?.score ?? meta.localScore ?? 40
+    const reliabilityLabel = reliabilitySource?.statusLabel ?? meta.localLabel ?? '확인 필요'
+    const contributionPct = Math.round((impacts.reduce((sum, impact) => sum + Math.abs(impact.impact), 0) / totalAbsoluteImpact) * 100)
+    const confidence = signalAuditConfidence(reliabilityScore, impacts.length)
+    const tone = reliabilityScore < 45 ? 'warning' : impactSum > 0 ? 'positive' : impactSum < 0 ? 'negative' : 'neutral'
+
+    return {
+      id: sourceId,
+      label: meta.label,
+      itemCount: impacts.length,
+      impactSum,
+      positiveImpact,
+      negativeImpact,
+      contributionPct,
+      reliabilityScore,
+      reliabilityLabel,
+      tone,
+      confidence,
+      summary:
+        impacts.length > 0
+          ? `${meta.label} ${impacts.length}개 근거가 예측에 ${signedImpactLabel(impactSum)} 반영됐습니다.`
+          : `${meta.label}에서 현재 예측에 직접 반영된 근거는 없습니다.`,
+      topEvidence: impacts
+        .slice()
+        .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
+        .slice(0, 2)
+        .map((impact) => `${impact.label} ${signedImpactLabel(impact.impact)} · ${impact.reason}`),
+    }
+  })
+  const warnings = [
+    ...sources
+      .filter((source) => source.contributionPct >= 22 && source.reliabilityScore < 55)
+      .map((source) => `${source.label} 기여도는 ${source.contributionPct}%인데 데이터 신뢰도가 낮습니다. 원자료 확인 후 판단하세요.`),
+    totalPositiveImpact > 0 && totalNegativeImpact > 0 && Math.min(totalPositiveImpact, totalNegativeImpact) / Math.max(totalPositiveImpact, totalNegativeImpact) >= 0.55
+      ? '상방과 하방 근거가 동시에 강합니다. 개장 직후 방향 확정 전까지 추격 주문은 줄이는 편이 좋습니다.'
+      : null,
+    dataReliability.score < 55 ? '전체 데이터 신뢰도가 낮아 예측은 실행보다 체크리스트에 가깝게 보세요.' : null,
+  ].filter((item): item is string => Boolean(item))
+  const focusList = forecast.impacts
+    .slice()
+    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
+    .slice(0, 5)
+    .map((impact) => `${impact.label}: ${signedImpactLabel(impact.impact)} · ${impact.reason}`)
+
+  return {
+    generatedAt: new Date().toISOString(),
+    totalPositiveImpact,
+    totalNegativeImpact,
+    netImpact,
+    dominantDirection: signedDirection(netImpact),
+    summary:
+      netImpact > 0
+        ? `상방 근거가 하방보다 ${signedImpactLabel(netImpact)} 우세합니다.`
+        : netImpact < 0
+          ? `하방 근거가 상방보다 ${signedImpactLabel(Math.abs(netImpact))} 강합니다.`
+          : '상방과 하방 근거가 균형에 가깝습니다.',
+    sources: sources.sort((a, b) => b.contributionPct - a.contributionPct || Math.abs(b.impactSum) - Math.abs(a.impactSum)),
+    warnings: warnings.length > 0 ? warnings : ['현재 예측 근거와 데이터 품질 사이에 큰 충돌은 없습니다.'],
+    focusList: focusList.length > 0 ? focusList : ['예측에 반영할 영향 요인이 아직 충분하지 않습니다. 시세와 뉴스 새로고침을 먼저 확인하세요.'],
+  }
+}
+
 function directionFromForecastScore(score: number): Direction {
   if (score >= 58) return 'positive'
   if (score <= 43) return 'negative'
@@ -2937,6 +3074,10 @@ function buildDashboardSnapshot({
     disclosureMessage,
     disclosureCount: disclosures.length,
   })
+  const signalAudit = buildSignalAudit({
+    forecast,
+    dataReliability,
+  })
   const executionPlan = buildExecutionPlan({
     portfolioPlaybook,
     holdingsData: liveHoldings,
@@ -3004,6 +3145,7 @@ function buildDashboardSnapshot({
     portfolioPlaybook,
     morningBrief,
     dataReliability,
+    signalAudit,
     forecastReview,
     executionPlan,
     actionQueue,
@@ -3124,6 +3266,100 @@ function DataReliabilityPanel({
             </div>
           </div>
         </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function SignalAuditPanel({
+  audit,
+  compact = false,
+}: {
+  audit: SignalAudit
+  compact?: boolean
+}) {
+  const visibleSources = compact ? audit.sources.slice(0, 4) : audit.sources
+  const visibleFocus = audit.focusList.slice(0, compact ? 3 : 5)
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <CardTitle>예측 근거 감사</CardTitle>
+            <CardDescription>{audit.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={directionVariant(audit.dominantDirection)}>순영향 {signedImpactLabel(audit.netImpact)}</Badge>
+            <Badge variant="positive">상방 +{audit.totalPositiveImpact}</Badge>
+            <Badge variant="negative">하방 -{audit.totalNegativeImpact}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 lg:grid-cols-5">
+          {visibleSources.map((source) => (
+            <div key={source.id} className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="mb-3 flex items-start justify-between gap-2">
+                <div>
+                  <div className="text-sm font-semibold">{source.label}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">{source.itemCount}개 근거</div>
+                </div>
+                <Badge variant={source.tone}>{signedImpactLabel(source.impactSum)}</Badge>
+              </div>
+              <div className="mb-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+                <span>기여도 {source.contributionPct}%</span>
+                <span>{confidenceLabel[source.confidence]}</span>
+              </div>
+              <Progress value={source.contributionPct} />
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Badge variant={source.reliabilityScore >= 64 ? 'positive' : source.reliabilityScore >= 45 ? 'warning' : 'negative'}>
+                  {source.reliabilityLabel}
+                </Badge>
+                <Badge variant="secondary">{source.reliabilityScore}점</Badge>
+              </div>
+              {!compact ? <div className="mt-3 text-xs leading-5 text-muted-foreground">{source.summary}</div> : null}
+            </div>
+          ))}
+        </div>
+
+        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+          <div className="rounded-md border border-border bg-background/70 p-4">
+            <div className="mb-3 text-sm font-semibold">먼저 확인할 근거</div>
+            <div className="space-y-2">
+              {visibleFocus.map((item) => (
+                <div key={item} className="text-sm leading-6 text-muted-foreground">
+                  {item}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="rounded-md border border-border bg-background/70 p-4">
+            <div className="mb-3 text-sm font-semibold">품질 경고</div>
+            <div className="space-y-2">
+              {audit.warnings.slice(0, compact ? 2 : 4).map((warning) => (
+                <div key={warning} className="text-sm leading-6 text-muted-foreground">
+                  {warning}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {!compact ? (
+          <div className="grid gap-3 md:grid-cols-2">
+            {audit.sources
+              .flatMap((source) => source.topEvidence.map((evidence) => ({ source: source.label, evidence, tone: source.tone })))
+              .slice(0, 6)
+              .map((item) => (
+                <div key={`${item.source}-${item.evidence}`} className="rounded-md border border-border bg-muted/15 p-3">
+                  <Badge variant={item.tone}>{item.source}</Badge>
+                  <div className="mt-2 text-xs leading-5 text-muted-foreground">{item.evidence}</div>
+                </div>
+              ))}
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   )
@@ -4206,12 +4442,14 @@ function ForecastPage({
   actionQueue,
   portfolioPlaybook,
   dataReliability,
+  signalAudit,
   executionPlan,
 }: {
   forecast: MarketForecast
   actionQueue: ActionQueueItem[]
   portfolioPlaybook: PortfolioPlaybook
   dataReliability: DataReliability
+  signalAudit: SignalAudit
   executionPlan: ExecutionPlan
 }) {
   const topImpact = forecast.impacts[0]
@@ -4228,6 +4466,8 @@ function ForecastPage({
       </section>
 
       <DataReliabilityPanel reliability={dataReliability} compact />
+
+      <SignalAuditPanel audit={signalAudit} />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
         <Card>
@@ -6057,6 +6297,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         actionQueue={snapshot.actionQueue}
         portfolioPlaybook={snapshot.portfolioPlaybook}
         dataReliability={snapshot.dataReliability}
+        signalAudit={snapshot.signalAudit}
         executionPlan={snapshot.executionPlan}
       />
     )
@@ -6834,6 +7075,8 @@ export function Dashboard() {
             </section>
 
             <DataReliabilityPanel reliability={snapshot.dataReliability} onRefreshAll={refreshAllData} refreshing={dataRefreshBusy} compact />
+
+            <SignalAuditPanel audit={snapshot.signalAudit} compact />
 
             <Card>
               <CardHeader>
