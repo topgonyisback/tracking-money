@@ -124,6 +124,40 @@ export type LiveNewsItem = {
   expectedImpact: string
 }
 
+export type SymbolNewsImpact = {
+  symbol: string
+  name: string
+  market: 'KR' | 'US'
+  source: 'holding' | 'watchlist'
+  score: number
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  direction: Direction
+  issueCount: number
+  positiveCount: number
+  negativeCount: number
+  mixedCount: number
+  highImportanceCount: number
+  latestAt: string
+  topKeyword: string
+  topHeadline: string
+  expectedMove: string
+  suggestedAction: string
+  catalysts: string[]
+  relatedNewsIds: string[]
+}
+
+export type NewsImpactBoard = {
+  generatedAt: string
+  status: 'live' | 'fallback' | 'empty'
+  summary: string
+  totalLinkedNews: number
+  positiveCount: number
+  negativeCount: number
+  mixedCount: number
+  hotSymbols: string[]
+  items: SymbolNewsImpact[]
+}
+
 export type CalendarEvent = {
   id: string
   date: string

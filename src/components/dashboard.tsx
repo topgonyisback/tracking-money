@@ -78,6 +78,7 @@ import type {
   MarketIndicator,
   MarketQuote,
   MorningBrief,
+  NewsImpactBoard,
   PortfolioPlaybook,
   SignalAudit,
   SignalAuditSource,
@@ -243,6 +244,7 @@ type DashboardSnapshot = {
   liveNews: LiveNewsItem[]
   newsStatus: NewsStatus
   newsMessage: string
+  newsImpactBoard: NewsImpactBoard
   disclosures: DisclosureItem[]
   disclosureStatus: DisclosureStatus
   disclosureMessage: string
@@ -1479,13 +1481,181 @@ function buildKoreaMarketBridge(
   }
 }
 
-function newsItemImpact(item: LiveNewsItem) {
+type NewsImpactSourceItem = Pick<
+  LiveNewsItem,
+  'id' | 'keyword' | 'title' | 'source' | 'publishedAt' | 'direction' | 'importance' | 'confidence' | 'relatedSymbols' | 'sectors' | 'expectedImpact'
+>
+
+function newsItemImpact(item: Pick<LiveNewsItem, 'importance' | 'confidence' | 'direction'>) {
   const importanceWeight = item.importance === 'high' ? 2 : item.importance === 'medium' ? 1.25 : 0.75
   const confidenceWeight = item.confidence === 'high' ? 1.2 : item.confidence === 'medium' ? 1 : 0.7
   const directionWeight =
     item.direction === 'positive' ? 1 : item.direction === 'negative' ? -1 : item.direction === 'mixed' ? -0.35 : 0
 
   return directionWeight * importanceWeight * confidenceWeight
+}
+
+function fallbackNewsImpactItems(): NewsImpactSourceItem[] {
+  const now = new Date().toISOString()
+
+  return keyIssues.map((issue) => ({
+    id: issue.id,
+    keyword: issue.sectors[0] ?? issue.relatedSymbols[0] ?? '시장',
+    title: issue.title,
+    source: issue.source,
+    publishedAt: now,
+    direction: issue.direction,
+    importance: issue.importance,
+    confidence: issue.confidence,
+    relatedSymbols: issue.relatedSymbols,
+    sectors: issue.sectors,
+    expectedImpact: issue.expectedImpact,
+  }))
+}
+
+function newsTargetMatchWeight(item: NewsImpactSourceItem, target: { symbol: string; name: string; market: 'KR' | 'US' }) {
+  const profile = symbolProfiles[target.symbol]
+  const relatedSymbols = new Set(item.relatedSymbols)
+  const sectors = new Set(item.sectors)
+  const title = item.title.toLocaleLowerCase('ko-KR')
+  const keyword = item.keyword.toLocaleLowerCase('ko-KR')
+  const name = target.name.toLocaleLowerCase('ko-KR')
+
+  if (relatedSymbols.has(target.symbol) || keyword === name || title.includes(name)) return 1.15
+  if (profile?.sector && sectors.has(profile.sector)) return 0.9
+  if (profile?.sensitivity.some((symbol) => relatedSymbols.has(symbol) || sectors.has(symbol))) return 0.75
+  if (target.market === 'KR' && item.relatedSymbols.some((symbol) => ['KOSPI', 'KOSDAQ', 'USD/KRW'].includes(symbol))) return 0.5
+  if (target.market === 'US' && item.relatedSymbols.some((symbol) => ['NQ=F', 'DXY', 'US10Y', 'VIX'].includes(symbol))) return 0.45
+
+  return 0
+}
+
+function buildSymbolNewsImpactBoard(
+  liveNews: LiveNewsItem[],
+  holdingsData: Holding[],
+  watchlistData: WatchItem[],
+): NewsImpactBoard {
+  const newsItems: NewsImpactSourceItem[] = liveNews.length > 0 ? liveNews : fallbackNewsImpactItems()
+  const targets = [
+    ...holdingsData.map((holding) => ({
+      symbol: holding.symbol,
+      name: holding.name,
+      market: holding.market,
+      source: 'holding' as const,
+    })),
+    ...watchlistData.map((item) => ({
+      symbol: item.symbol,
+      name: item.name,
+      market: item.symbol.length === 6 ? ('KR' as const) : ('US' as const),
+      source: 'watchlist' as const,
+    })),
+  ]
+
+  const items = targets
+    .map((target) => {
+      const matchedItems = newsItems
+        .map((item) => ({ item, weight: newsTargetMatchWeight(item, target) }))
+        .filter(({ weight }) => weight > 0)
+
+      if (matchedItems.length === 0) return null
+
+      const weightedItems = matchedItems
+        .map(({ item, weight }) => ({
+          item,
+          weight,
+          impact: newsItemImpact(item) * weight,
+        }))
+        .sort((left, right) => Math.abs(right.impact) - Math.abs(left.impact))
+      const score = clamp(Math.round(weightedItems.reduce((sum, entry) => sum + entry.impact, 0) * 16), -100, 100)
+      const positiveCount = weightedItems.filter(({ item }) => item.direction === 'positive').length
+      const negativeCount = weightedItems.filter(({ item }) => item.direction === 'negative').length
+      const mixedCount = weightedItems.filter(({ item }) => item.direction === 'mixed').length
+      const highImportanceCount = weightedItems.filter(({ item }) => item.importance === 'high').length
+      const direction: Direction =
+        positiveCount > 0 && negativeCount > 0 && Math.abs(score) < 24
+          ? 'mixed'
+          : score > 8
+            ? 'positive'
+            : score < -8
+              ? 'negative'
+              : mixedCount > 0
+                ? 'mixed'
+                : 'neutral'
+      const tone: NewsImpactBoard['items'][number]['tone'] = direction === 'positive' ? 'positive' : direction === 'negative' ? 'negative' : direction === 'mixed' ? 'warning' : 'neutral'
+      const latestAt = weightedItems
+        .map(({ item }) => item.publishedAt)
+        .sort((left, right) => new Date(right).getTime() - new Date(left).getTime())[0]
+      const topItem = weightedItems[0]?.item
+      const catalysts = Array.from(new Set(weightedItems.flatMap(({ item }) => [item.keyword, ...item.sectors]).filter(Boolean))).slice(0, 5)
+      const expectedMove =
+        score >= 35
+          ? '단기 상승 재료가 우세합니다. 갭상승 후에도 거래대금이 붙는지 확인합니다.'
+          : score >= 12
+            ? '우호 뉴스가 더 많습니다. 지수 대비 강하면 보유/관심 유지 쪽입니다.'
+            : score <= -35
+              ? '부담 이슈가 우세합니다. 장 초반 반등 실패 시 리스크 관리가 먼저입니다.'
+              : score <= -12
+                ? '부정 뉴스 압력이 있습니다. 신규 진입은 확인 후로 미룹니다.'
+                : direction === 'mixed'
+                  ? '뉴스 방향이 엇갈립니다. 기사보다 가격 반응과 거래량 확인이 우선입니다.'
+                  : '뚜렷한 뉴스 우위는 약합니다. 다른 지표와 함께 확인합니다.'
+      const suggestedAction =
+        direction === 'positive'
+          ? target.source === 'holding'
+            ? '지수보다 강하면 보유 유지, 급등 추격은 09:30 이후 거래량으로 필터링합니다.'
+            : '관심가 근처에서 거래량이 붙을 때만 분할 접근합니다.'
+          : direction === 'negative'
+            ? target.source === 'holding'
+              ? '첫 반등 실패 시 비중 축소 기준과 손절선을 다시 확인합니다.'
+              : '신규 진입은 보류하고 뉴스 해소 또는 가격 안정 신호를 기다립니다.'
+            : '방향 확정 전까지 주문보다 관찰을 우선합니다.'
+
+      return {
+        symbol: target.symbol,
+        name: target.name,
+        market: target.market,
+        source: target.source,
+        score,
+        tone,
+        direction,
+        issueCount: weightedItems.length,
+        positiveCount,
+        negativeCount,
+        mixedCount,
+        highImportanceCount,
+        latestAt,
+        topKeyword: topItem?.keyword ?? '확인 대기',
+        topHeadline: topItem?.title ?? '관련 뉴스 확인 대기',
+        expectedMove,
+        suggestedAction,
+        catalysts,
+        relatedNewsIds: weightedItems.map(({ item }) => item.id),
+      }
+    })
+    .filter((item): item is NewsImpactBoard['items'][number] => Boolean(item))
+    .sort((left, right) => Math.abs(right.score) - Math.abs(left.score))
+
+  const uniqueNewsIds = new Set(items.flatMap((item) => item.relatedNewsIds))
+  const positiveCount = items.filter((item) => item.direction === 'positive').length
+  const negativeCount = items.filter((item) => item.direction === 'negative').length
+  const mixedCount = items.filter((item) => item.direction === 'mixed').length
+  const topItem = items[0]
+  const summary =
+    items.length === 0
+      ? '아직 보유/관심종목과 직접 연결된 뉴스가 없습니다. 키워드 추가나 뉴스 새로고침 후 다시 확인합니다.'
+      : `${topItem.symbol}(${topItem.name}) 뉴스 민감도가 가장 큽니다. ${topItem.expectedMove}`
+
+  return {
+    generatedAt: new Date().toISOString(),
+    status: liveNews.length > 0 ? 'live' : newsItems.length > 0 ? 'fallback' : 'empty',
+    summary,
+    totalLinkedNews: uniqueNewsIds.size,
+    positiveCount,
+    negativeCount,
+    mixedCount,
+    hotSymbols: items.slice(0, 5).map((item) => item.symbol),
+    items,
+  }
 }
 
 function buildNewsBiasFactor(newsItems: LiveNewsItem[], holdingsData: Holding[], watchlistData: WatchItem[]) {
@@ -3379,6 +3549,7 @@ function buildDashboardSnapshot({
   const liveHoldings = mergeHoldingsWithQuotes(baseHoldings, quoteMap)
   const liveWatchlist = mergeWatchlistWithQuotes(baseWatchlist, quoteMap)
   const liveIndicators = mergeIndicatorsWithQuotes(quoteMap)
+  const newsImpactBoard = buildSymbolNewsImpactBoard(liveNews, liveHoldings, liveWatchlist)
   const liveBiasScore = applyNewsBiasFactor(
     buildLiveBiasScore(liveIndicators, quotes.length),
     buildNewsBiasFactor(liveNews, liveHoldings, liveWatchlist),
@@ -3505,6 +3676,7 @@ function buildDashboardSnapshot({
     liveNews,
     newsStatus,
     newsMessage,
+    newsImpactBoard,
     disclosures,
     disclosureStatus,
     disclosureMessage,
@@ -3647,6 +3819,103 @@ function KoreaMarketBridgePanel({ bridge, compact = false }: { bridge: KoreaMark
             </div>
           </div>
         </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+const newsImpactBoardStatusLabel: Record<NewsImpactBoard['status'], string> = {
+  live: '실시간 뉴스',
+  fallback: '샘플 이슈',
+  empty: '대기',
+}
+
+const newsImpactSourceLabel: Record<NewsImpactBoard['items'][number]['source'], string> = {
+  holding: '보유',
+  watchlist: '관심',
+}
+
+function NewsImpactBoardPanel({ board, compact = false }: { board: NewsImpactBoard; compact?: boolean }) {
+  const visibleItems = compact ? board.items.slice(0, 4) : board.items
+  const topSymbolText = board.hotSymbols.length > 0 ? board.hotSymbols.join(', ') : '확인 대기'
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>종목별 이슈 영향판</CardTitle>
+            <CardDescription>{board.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={board.status === 'live' ? 'positive' : board.status === 'fallback' ? 'warning' : 'neutral'}>{newsImpactBoardStatusLabel[board.status]}</Badge>
+            <Badge variant="secondary">{formatNewsTime(board.generatedAt)}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">영향 종목</div>
+            <div className="mt-2 text-2xl font-semibold">{board.items.length}개</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">연결 뉴스</div>
+            <div className="mt-2 text-2xl font-semibold">{board.totalLinkedNews}건</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">상승 / 부담 / 혼재</div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Badge variant="positive">{board.positiveCount}</Badge>
+              <Badge variant="negative">{board.negativeCount}</Badge>
+              <Badge variant="warning">{board.mixedCount}</Badge>
+            </div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">집중 심볼</div>
+            <div className="mt-2 text-sm font-semibold leading-5">{topSymbolText}</div>
+          </div>
+        </div>
+
+        {visibleItems.length > 0 ? (
+          <div className="grid gap-3">
+            {visibleItems.map((item) => (
+              <div key={`${item.source}-${item.symbol}`} className="rounded-md border border-border bg-muted/10 p-3">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-sm font-semibold">{item.symbol}</span>
+                      <span className="text-sm font-medium">{item.name}</span>
+                      <Badge variant="secondary">{newsImpactSourceLabel[item.source]}</Badge>
+                      <Badge variant={item.tone}>{item.score > 0 ? `+${item.score}` : item.score}</Badge>
+                    </div>
+                    <div className="mt-2 text-sm font-medium leading-5">{item.topHeadline}</div>
+                    <div className="mt-2 text-sm leading-5 text-muted-foreground">{item.expectedMove}</div>
+                    {!compact ? <div className="mt-2 text-sm leading-5">{item.suggestedAction}</div> : null}
+                  </div>
+                  <div className="flex shrink-0 flex-wrap gap-2 lg:max-w-48 lg:justify-end">
+                    <Badge variant="neutral">{item.issueCount}건</Badge>
+                    <Badge variant="positive">상승 {item.positiveCount}</Badge>
+                    <Badge variant="negative">부담 {item.negativeCount}</Badge>
+                    {item.highImportanceCount > 0 ? <Badge variant="warning">중요 {item.highImportanceCount}</Badge> : null}
+                  </div>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  {item.catalysts.slice(0, compact ? 4 : 6).map((tag) => (
+                    <Badge key={tag} variant="secondary">
+                      {tag}
+                    </Badge>
+                  ))}
+                  <Badge variant="neutral">{formatNewsTime(item.latestAt)}</Badge>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-md border border-border bg-muted/10 p-4 text-sm leading-6 text-muted-foreground">
+            보유종목이나 관심종목과 연결된 뉴스가 아직 없습니다. 뉴스 키워드에 종목명이나 섹터 키워드를 추가하면 이 영역에 바로 반영됩니다.
+          </div>
+        )}
       </CardContent>
     </Card>
   )
@@ -5078,6 +5347,7 @@ function NewsPage({
   liveNews,
   newsStatus,
   newsMessage,
+  newsImpactBoard,
   onRefreshNews,
 }: {
   holdingsData: Holding[]
@@ -5085,6 +5355,7 @@ function NewsPage({
   liveNews: LiveNewsItem[]
   newsStatus: NewsStatus
   newsMessage: string
+  newsImpactBoard: NewsImpactBoard
   onRefreshNews: () => void
 }) {
   const [activeKeyword, setActiveKeyword] = useState('전체')
@@ -5114,6 +5385,8 @@ function NewsPage({
         <MetricCard label="높은 중요도" value={`${highImportanceCount}건`} detail="우선 확인" tone="warning" />
         <MetricCard label="보유종목 연결" value={`${linkedNewsCount}건`} detail="포트폴리오 영향" tone="positive" />
       </section>
+
+      <NewsImpactBoardPanel board={newsImpactBoard} />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
         <Card>
@@ -7108,6 +7381,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         liveNews={snapshot.liveNews}
         newsStatus={snapshot.newsStatus}
         newsMessage={snapshot.newsMessage}
+        newsImpactBoard={snapshot.newsImpactBoard}
         onRefreshNews={actions.onRefreshNews}
       />
     )
@@ -7931,6 +8205,8 @@ export function Dashboard() {
                 </CardContent>
               </Card>
             </section>
+
+            <NewsImpactBoardPanel board={snapshot.newsImpactBoard} compact />
 
             <DataReliabilityPanel reliability={snapshot.dataReliability} onRefreshAll={refreshAllData} refreshing={dataRefreshBusy} compact />
 
