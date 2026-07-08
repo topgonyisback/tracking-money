@@ -285,6 +285,38 @@ export type ForecastReview = {
   nextQuestions: string[]
 }
 
+export type ExecutionPlanItem = {
+  id: string
+  symbol: string
+  name: string
+  market: 'KR' | 'US'
+  side: 'buy' | 'sell' | 'hold' | 'wait'
+  priority: 'critical' | 'high' | 'medium' | 'low'
+  confidence: Confidence
+  budgetKrw: number
+  quantityGuide: string
+  priceBand: string
+  trigger: string
+  riskRule: string
+  reason: string
+  relatedSignals: string[]
+}
+
+export type ExecutionPlan = {
+  generatedAt: string
+  stance: 'risk-on' | 'balanced' | 'defensive'
+  stanceLabel: string
+  summary: string
+  maxNewCapitalKrw: number
+  plannedBuyKrw: number
+  plannedTrimKrw: number
+  netExposureKrw: number
+  riskBudgetKrw: number
+  guardrails: string[]
+  items: ExecutionPlanItem[]
+  copyText: string
+}
+
 export type InvestmentJournal = {
   date: string
   preMarketPlan: string

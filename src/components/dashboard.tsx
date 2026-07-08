@@ -67,6 +67,8 @@ import type {
   DataReliability,
   Direction,
   DisclosureItem,
+  ExecutionPlan,
+  ExecutionPlanItem,
   ForecastReview,
   Holding,
   InvestmentJournal,
@@ -243,6 +245,7 @@ type DashboardSnapshot = {
   morningBrief: MorningBrief
   dataReliability: DataReliability
   forecastReview: ForecastReview
+  executionPlan: ExecutionPlan
   actionQueue: ActionQueueItem[]
   journal: InvestmentJournal
 }
@@ -2024,6 +2027,7 @@ function buildMorningBrief({
   disclosures,
   marketStatusData,
   dataReliability,
+  executionPlan,
 }: {
   forecast: MarketForecast
   portfolioPlaybook: PortfolioPlaybook
@@ -2034,9 +2038,11 @@ function buildMorningBrief({
   disclosures: DisclosureItem[]
   marketStatusData: MarketStatusView
   dataReliability: DataReliability
+  executionPlan: ExecutionPlan
 }): MorningBrief {
   const generatedAt = new Date().toISOString()
   const topAction = actionQueue[0]
+  const topExecution = executionPlan.items[0]
   const topRisk = portfolioPlaybook.riskSignals[0]
   const topScenario = forecast.scenarios.reduce((top, scenario) => (scenario.probability > top.probability ? scenario : top), forecast.scenarios[0])
   const urgentAlerts = triggeredAlerts.filter((alert) => severityRank(alert.severity) >= severityRank('high'))
@@ -2105,6 +2111,7 @@ function buildMorningBrief({
       items: uniqueBriefItems(
         [
           topAction ? `${topAction.title}: ${topAction.suggestedAction}` : null,
+          topExecution ? `${topExecution.symbol} ${executionSideLabel(topExecution.side)}: ${topExecution.quantityGuide}, ${topExecution.priceBand}` : null,
           ...portfolioPlaybook.preMarketSteps.slice(0, 3),
           ...forecast.checklist.slice(0, 2),
         ],
@@ -2647,6 +2654,183 @@ function buildForecastReview({
   }
 }
 
+function executionSideLabel(side: ExecutionPlanItem['side']) {
+  if (side === 'buy') return '분할 매수'
+  if (side === 'sell') return '일부 축소'
+  if (side === 'hold') return '보유 유지'
+  return '대기'
+}
+
+function executionSideVariant(side: ExecutionPlanItem['side']): 'positive' | 'negative' | 'warning' | 'neutral' | 'secondary' {
+  if (side === 'buy') return 'positive'
+  if (side === 'sell') return 'warning'
+  if (side === 'hold') return 'neutral'
+  return 'secondary'
+}
+
+function marketValueKrwFromPrice(price: number, market: 'KR' | 'US', usdKrw: number) {
+  return market === 'US' ? price * usdKrw : price
+}
+
+function executionQuantityGuide(side: ExecutionPlanItem['side'], budgetKrw: number, price: number, market: 'KR' | 'US', usdKrw: number) {
+  if (budgetKrw <= 0 || price <= 0) return side === 'hold' ? '수량 유지' : '수량 없음'
+
+  const unitKrw = marketValueKrwFromPrice(price, market, usdKrw)
+  const quantity = budgetKrw / unitKrw
+  if (quantity < 1 && market === 'US') return `${round(quantity, 2)}주 이내`
+  return `${Math.max(1, Math.floor(quantity)).toLocaleString('ko-KR')}주 이내`
+}
+
+function executionPriceBandForHolding(holding: Holding) {
+  const reboundLine = holding.currentPrice * 1.01
+  const defenseLine = holding.averagePrice * 0.97
+  return `${formatCurrency(defenseLine, holding.market)} ~ ${formatCurrency(reboundLine, holding.market)}`
+}
+
+function executionPriceBandForWatch(item: WatchItem) {
+  const low = item.targetBuyPrice * 0.985
+  const high = item.targetBuyPrice * 1.015
+  return `${formatCurrency(low, defaultMarketForSymbol(item.symbol))} ~ ${formatCurrency(high, defaultMarketForSymbol(item.symbol))}`
+}
+
+function buildExecutionPlan({
+  portfolioPlaybook,
+  holdingsData,
+  watchlistData,
+  forecast,
+  dataReliability,
+  actionQueue,
+  usdKrw,
+}: {
+  portfolioPlaybook: PortfolioPlaybook
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+  forecast: MarketForecast
+  dataReliability: DataReliability
+  actionQueue: ActionQueueItem[]
+  usdKrw: number
+}): ExecutionPlan {
+  const generatedAt = new Date().toISOString()
+  const reliabilityScale = dataReliability.score >= 78 ? 1 : dataReliability.score >= 55 ? 0.75 : dataReliability.score >= 35 ? 0.45 : 0.2
+  const confidenceScale = forecast.confidence === 'high' ? 1 : forecast.confidence === 'medium' ? 0.8 : 0.55
+  const stanceBase =
+    portfolioPlaybook.stance === 'risk-on'
+      ? 0.08
+      : portfolioPlaybook.stance === 'balanced'
+        ? 0.045
+        : 0.012
+  const maxNewCapitalKrw = Math.round(portfolioPlaybook.totalValueKrw * stanceBase * reliabilityScale * confidenceScale)
+  const riskBudgetKrw = Math.round(
+    portfolioPlaybook.totalValueKrw *
+      (portfolioPlaybook.stance === 'defensive' ? 0.0035 : portfolioPlaybook.stance === 'balanced' ? 0.006 : 0.009),
+  )
+  const buyCandidates = portfolioPlaybook.positionPlans.filter((item) => item.action === 'add-ready')
+  const buyBudgetPerItem = buyCandidates.length > 0 ? Math.round(maxNewCapitalKrw / buyCandidates.length) : 0
+  const urgentRisk = portfolioPlaybook.riskSignals.some((signal) => signal.severity === 'critical' || signal.severity === 'high')
+
+  const items = portfolioPlaybook.positionPlans.slice(0, 8).map((plan): ExecutionPlanItem => {
+    const holding = holdingsData.find((item) => item.symbol === plan.symbol)
+    const watchItem = watchlistData.find((item) => item.symbol === plan.symbol)
+    const market = holding?.market ?? (watchItem ? defaultMarketForSymbol(watchItem.symbol) : defaultMarketForSymbol(plan.symbol))
+    const currentPrice = holding?.currentPrice ?? watchItem?.currentPrice ?? 0
+    const side: ExecutionPlanItem['side'] =
+      plan.action === 'add-ready'
+        ? portfolioPlaybook.stance === 'defensive' || dataReliability.score < 35
+          ? 'wait'
+          : 'buy'
+        : plan.action === 'trim-watch'
+          ? 'sell'
+          : plan.action === 'hold'
+            ? 'hold'
+            : 'wait'
+    const holdingValueKrw = holding ? holdingMarketValueKrw(holding, usdKrw) : 0
+    const budgetKrw =
+      side === 'buy'
+        ? Math.min(buyBudgetPerItem, Math.round(portfolioPlaybook.totalValueKrw * 0.035))
+        : side === 'sell' && holding
+          ? Math.round(holdingValueKrw * (plan.priority === 'high' || urgentRisk ? 0.18 : 0.1))
+          : 0
+    const priceBand = holding ? executionPriceBandForHolding(holding) : watchItem ? executionPriceBandForWatch(watchItem) : '가격 확인'
+    const quantityGuide = executionQuantityGuide(side, budgetKrw, currentPrice, market, usdKrw)
+    const confidence: ExecutionPlanItem['confidence'] =
+      dataReliability.score >= 75 && forecast.confidence !== 'low'
+        ? 'high'
+        : dataReliability.score >= 45
+          ? 'medium'
+          : 'low'
+
+    return {
+      id: `execution-${plan.id}`,
+      symbol: plan.symbol,
+      name: plan.name,
+      market,
+      side,
+      priority: plan.priority,
+      confidence,
+      budgetKrw,
+      quantityGuide,
+      priceBand,
+      trigger: plan.trigger,
+      riskRule:
+        side === 'buy'
+          ? '체결 후 지수 대비 약세 전환 또는 가격대 하단 이탈 시 추가 매수 중단'
+          : side === 'sell'
+            ? '시초가 반등 실패, 환율/VIX 재상승, 지수 대비 약세가 겹치면 일부 축소'
+            : side === 'hold'
+              ? '상대강도 유지 시 보유, 지수보다 약해지면 신규 매수 금지'
+              : '조건 충족 전까지 주문 없음',
+      reason: plan.reason,
+      relatedSignals: [forecast.openingBias, dataReliability.label, ...portfolioPlaybook.riskSignals.slice(0, 2).map((signal) => signal.title)],
+    }
+  })
+  const plannedBuyKrw = items.filter((item) => item.side === 'buy').reduce((sum, item) => sum + item.budgetKrw, 0)
+  const plannedTrimKrw = items.filter((item) => item.side === 'sell').reduce((sum, item) => sum + item.budgetKrw, 0)
+  const netExposureKrw = plannedBuyKrw - plannedTrimKrw
+  const guardrails = [
+    portfolioPlaybook.stance === 'defensive' ? '방어 우선: 신규 진입은 원칙적으로 보류하고 축소 감시 종목부터 확인' : null,
+    dataReliability.score < 55 ? '데이터 신뢰도 낮음: 계획 금액의 절반 이하만 사용하거나 확인 전 대기' : null,
+    forecast.confidence === 'low' ? '예측 신뢰도 낮음: 가격대보다 트리거 충족 여부를 우선' : null,
+    urgentRisk ? '고위험 신호 있음: 첫 30분은 고비중/약세 종목 방어선 확인' : null,
+    actionQueue.some((item) => item.priority === 'critical') ? '긴급 액션 큐가 있으면 실행 계획보다 먼저 처리' : null,
+    '시장가 주문보다 지정가/분할 기준을 우선하고, 체결 전 환율·VIX·SOX 변화를 다시 확인',
+  ].filter((item): item is string => Boolean(item))
+  const summary =
+    netExposureKrw > 0
+      ? `신규 노출은 최대 ${formatKrwAmount(plannedBuyKrw)}원, 축소 후보는 ${formatKrwAmount(plannedTrimKrw)}원입니다.`
+      : plannedTrimKrw > 0
+        ? `오늘은 신규 노출보다 ${formatKrwAmount(plannedTrimKrw)}원 규모의 축소 감시가 먼저입니다.`
+        : '오늘은 주문보다 조건 확인과 보유 유지가 중심입니다.'
+  const copyText = [
+    `[Tracking Money 내일 실행 계획 · ${briefDateLabel(generatedAt)}]`,
+    `${portfolioPlaybook.stanceLabel}: ${summary}`,
+    `신규 한도: ${formatKrwAmount(maxNewCapitalKrw)}원 / 리스크 예산: ${formatKrwAmount(riskBudgetKrw)}원`,
+    '',
+    '[종목별 계획]',
+    ...items.map(
+      (item) =>
+        `- ${item.symbol} ${executionSideLabel(item.side)}: ${item.quantityGuide}, ${formatKrwAmount(item.budgetKrw)}원 / ${item.priceBand} / ${item.trigger}`,
+    ),
+    '',
+    '[가드레일]',
+    ...guardrails.map((item) => `- ${item}`),
+  ].join('\n')
+
+  return {
+    generatedAt,
+    stance: portfolioPlaybook.stance,
+    stanceLabel: portfolioPlaybook.stanceLabel,
+    summary,
+    maxNewCapitalKrw,
+    plannedBuyKrw,
+    plannedTrimKrw,
+    netExposureKrw,
+    riskBudgetKrw,
+    guardrails,
+    items,
+    copyText,
+  }
+}
+
 function buildDashboardSnapshot({
   baseHoldings,
   baseWatchlist,
@@ -2753,6 +2937,15 @@ function buildDashboardSnapshot({
     disclosureMessage,
     disclosureCount: disclosures.length,
   })
+  const executionPlan = buildExecutionPlan({
+    portfolioPlaybook,
+    holdingsData: liveHoldings,
+    watchlistData: liveWatchlist,
+    forecast,
+    dataReliability,
+    actionQueue,
+    usdKrw: getQuote(quoteMap, 'USD/KRW')?.price ?? Number(marketStatus.usdKrw.replace(/,/g, '')),
+  })
   const morningBrief = buildMorningBrief({
     forecast,
     portfolioPlaybook,
@@ -2763,6 +2956,7 @@ function buildDashboardSnapshot({
     disclosures,
     marketStatusData: marketStatusView,
     dataReliability,
+    executionPlan,
   })
   const forecastReview = buildForecastReview({
     forecast,
@@ -2773,7 +2967,6 @@ function buildDashboardSnapshot({
     actionQueue,
     journal,
   })
-
   return {
     holdings: liveHoldings,
     watchlist: liveWatchlist,
@@ -2812,6 +3005,7 @@ function buildDashboardSnapshot({
     morningBrief,
     dataReliability,
     forecastReview,
+    executionPlan,
     actionQueue,
     journal,
   }
@@ -3174,6 +3368,121 @@ function ForecastReviewPanel({
                 </div>
               ))}
             </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ExecutionPlanPanel({ plan, compact = false }: { plan: ExecutionPlan; compact?: boolean }) {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
+  const visibleItems = compact ? plan.items.slice(0, 4) : plan.items
+  const stanceTone: 'positive' | 'negative' | 'warning' | 'neutral' =
+    plan.stance === 'risk-on' ? 'positive' : plan.stance === 'defensive' ? 'warning' : 'neutral'
+
+  function copyExecutionFallback(text: string) {
+    const textArea = document.createElement('textarea')
+    textArea.value = text
+    textArea.setAttribute('readonly', '')
+    textArea.style.position = 'fixed'
+    textArea.style.left = '-9999px'
+    textArea.style.top = '0'
+    document.body.appendChild(textArea)
+    textArea.focus()
+    textArea.select()
+    textArea.setSelectionRange(0, textArea.value.length)
+    const copied = document.execCommand('copy')
+    textArea.remove()
+    if (!copied) throw new Error('fallback copy failed')
+  }
+
+  async function copyExecutionPlan() {
+    try {
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable')
+        await navigator.clipboard.writeText(plan.copyText)
+      } catch {
+        copyExecutionFallback(plan.copyText)
+      }
+      setCopyState('copied')
+      window.setTimeout(() => setCopyState('idle'), 1800)
+    } catch {
+      setCopyState('error')
+      window.setTimeout(() => setCopyState('idle'), 2400)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>내일 실행 계획</CardTitle>
+            <CardDescription>{plan.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={stanceTone}>{plan.stanceLabel}</Badge>
+            <Badge variant={plan.netExposureKrw > 0 ? 'positive' : plan.netExposureKrw < 0 ? 'warning' : 'neutral'}>
+              순노출 {formatKrwAmount(plan.netExposureKrw)}원
+            </Badge>
+            <Button type="button" variant="outline" size="sm" onClick={() => void copyExecutionPlan()}>
+              {copyState === 'copied' ? <Check className="size-4" /> : <Copy className="size-4" />}
+              {copyState === 'copied' ? '복사됨' : copyState === 'error' ? '복사 실패' : '계획 복사'}
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">신규 한도</div>
+            <div className="mt-2 text-lg font-semibold">{formatKrwAmount(plan.maxNewCapitalKrw)}원</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">계획 매수</div>
+            <div className="mt-2 text-lg font-semibold text-positive">{formatKrwAmount(plan.plannedBuyKrw)}원</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">축소 감시</div>
+            <div className="mt-2 text-lg font-semibold text-warning">{formatKrwAmount(plan.plannedTrimKrw)}원</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">리스크 예산</div>
+            <div className="mt-2 text-lg font-semibold">{formatKrwAmount(plan.riskBudgetKrw)}원</div>
+          </div>
+        </div>
+
+        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="grid gap-3 lg:grid-cols-2">
+            {visibleItems.map((item) => (
+              <div key={item.id} className="rounded-md border border-border bg-muted/15 p-4">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <Badge variant={executionSideVariant(item.side)}>{executionSideLabel(item.side)}</Badge>
+                  <Badge variant={playbookPriorityVariant(item.priority)}>{actionPriorityLabel[item.priority]}</Badge>
+                  <Badge variant="secondary">{item.symbol}</Badge>
+                  <Badge variant="secondary">신뢰도 {confidenceLabel[item.confidence]}</Badge>
+                </div>
+                <div className="text-sm font-semibold">{item.name}</div>
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <div className="rounded-md bg-background/70 p-2 text-xs text-muted-foreground">금액 {formatKrwAmount(item.budgetKrw)}원</div>
+                  <div className="rounded-md bg-background/70 p-2 text-xs text-muted-foreground">{item.quantityGuide}</div>
+                </div>
+                <div className="mt-3 text-xs leading-5 text-muted-foreground">가격대 {item.priceBand}</div>
+                <div className="mt-2 text-xs leading-5 text-foreground/85">{item.trigger}</div>
+                {!compact ? <div className="mt-2 text-xs leading-5 text-muted-foreground">{item.riskRule}</div> : null}
+              </div>
+            ))}
+          </div>
+
+          <div className="space-y-3">
+            <div className="text-sm font-semibold">실행 가드레일</div>
+            {plan.guardrails.slice(0, compact ? 4 : 6).map((guardrail, index) => (
+              <div key={guardrail} className="flex gap-3 rounded-md border border-border bg-background/70 p-3">
+                <Badge variant={index === 0 ? 'warning' : 'secondary'}>{index + 1}</Badge>
+                <div className="text-sm leading-6 text-muted-foreground">{guardrail}</div>
+              </div>
+            ))}
           </div>
         </div>
       </CardContent>
@@ -3897,11 +4206,13 @@ function ForecastPage({
   actionQueue,
   portfolioPlaybook,
   dataReliability,
+  executionPlan,
 }: {
   forecast: MarketForecast
   actionQueue: ActionQueueItem[]
   portfolioPlaybook: PortfolioPlaybook
   dataReliability: DataReliability
+  executionPlan: ExecutionPlan
 }) {
   const topImpact = forecast.impacts[0]
   const topRisk = forecast.impacts.find((item) => item.impact < 0)
@@ -3966,6 +4277,8 @@ function ForecastPage({
       </section>
 
       <PortfolioPlaybookPanel playbook={portfolioPlaybook} />
+
+      <ExecutionPlanPanel plan={executionPlan} />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
         <Card>
@@ -4809,6 +5122,7 @@ function NotesPage({
   marketStatusData,
   morningBrief,
   forecastReview,
+  executionPlan,
   onUpdateJournal,
   onToggleJournalAction,
   onResetJournal,
@@ -4819,6 +5133,7 @@ function NotesPage({
   marketStatusData: MarketStatusView
   morningBrief: MorningBrief
   forecastReview: ForecastReview
+  executionPlan: ExecutionPlan
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
   onResetJournal: () => void
@@ -4848,6 +5163,8 @@ function NotesPage({
         review={forecastReview}
         onApplyReview={() => onUpdateJournal({ afterMarketReview: forecastReview.reviewDraft })}
       />
+
+      <ExecutionPlanPanel plan={executionPlan} />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
         <Card>
@@ -5740,6 +6057,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         actionQueue={snapshot.actionQueue}
         portfolioPlaybook={snapshot.portfolioPlaybook}
         dataReliability={snapshot.dataReliability}
+        executionPlan={snapshot.executionPlan}
       />
     )
   }
@@ -5804,6 +6122,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         marketStatusData={snapshot.marketStatus}
         morningBrief={snapshot.morningBrief}
         forecastReview={snapshot.forecastReview}
+        executionPlan={snapshot.executionPlan}
         onUpdateJournal={actions.onUpdateJournal}
         onToggleJournalAction={actions.onToggleJournalAction}
         onResetJournal={actions.onResetJournal}
@@ -6555,6 +6874,8 @@ export function Dashboard() {
             <MorningBriefPanel brief={snapshot.morningBrief} compact />
 
             <PortfolioPlaybookPanel playbook={snapshot.portfolioPlaybook} compact />
+
+            <ExecutionPlanPanel plan={snapshot.executionPlan} compact />
 
             <ActionQueuePanel
               items={snapshot.actionQueue}
