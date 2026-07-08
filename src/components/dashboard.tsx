@@ -195,6 +195,43 @@ type ForecastImpact = {
   relatedSymbols: string[]
 }
 
+type ScenarioShockSymbol = 'SOX' | 'NQ=F' | 'USD/KRW' | 'VIX' | 'US10Y'
+
+type ScenarioShockState = Record<ScenarioShockSymbol, number>
+
+type ScenarioSimulationFactor = {
+  symbol: ScenarioShockSymbol
+  label: string
+  shock: number
+  scoreImpact: number
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  note: string
+}
+
+type ScenarioSimulationPosition = {
+  symbol: string
+  name: string
+  impactPercent: number
+  impactKrw: number
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  sensitivity: string[]
+}
+
+type ScenarioSimulationResult = {
+  score: number
+  scoreDelta: number
+  scoreTone: 'positive' | 'negative' | 'warning' | 'neutral'
+  label: string
+  kospiRange: string
+  kosdaqRange: string
+  portfolioImpactKrw: number
+  portfolioImpactPercent: number
+  summary: string
+  action: string
+  factors: ScenarioSimulationFactor[]
+  positions: ScenarioSimulationPosition[]
+}
+
 type MarketForecast = {
   baseScore: number
   openingBias: string
@@ -240,6 +277,7 @@ type DashboardSnapshot = {
   quoteStatus: QuoteStatus
   quoteMessage: string
   liveQuoteCount: number
+  usdKrw: number
   fetchedAt: string | null
   calendarEvents: CalendarEvent[]
   calendarStatus: CalendarStatus
@@ -2143,6 +2181,145 @@ function indicatorPressure(indicators: MarketIndicator[], symbol: string) {
 
   const signedChange = inverseIndicators.has(symbol) ? -indicator.change : indicator.change
   return signedChange
+}
+
+const scenarioShockControls: Array<{
+  symbol: ScenarioShockSymbol
+  label: string
+  min: number
+  max: number
+  step: number
+  weight: number
+  limit: number
+  note: string
+}> = [
+  { symbol: 'SOX', label: 'SOX 추가 변화', min: -4, max: 4, step: 0.25, weight: 8, limit: 22, note: '반도체 대형주 민감도' },
+  { symbol: 'NQ=F', label: 'NQ 선물 추가 변화', min: -3, max: 3, step: 0.25, weight: 7, limit: 18, note: '성장주와 코스닥 심리' },
+  { symbol: 'USD/KRW', label: '달러/원 추가 변화', min: -1.5, max: 1.5, step: 0.1, weight: 6, limit: 14, note: '국내 외국인 수급 부담' },
+  { symbol: 'VIX', label: 'VIX 추가 변화', min: -8, max: 8, step: 0.5, weight: 3.5, limit: 12, note: '위험회피 강도' },
+  { symbol: 'US10Y', label: '미국 10년물 추가 변화', min: -3, max: 3, step: 0.25, weight: 3, limit: 10, note: '성장주 밸류 부담' },
+]
+
+const defaultScenarioShocks: ScenarioShockState = {
+  SOX: 0,
+  'NQ=F': 0,
+  'USD/KRW': 0,
+  VIX: 0,
+  US10Y: 0,
+}
+
+const scenarioPositionSensitivity: Record<string, number> = {
+  SOX: 0.55,
+  'NQ=F': 0.38,
+  'USD/KRW': 0.3,
+  VIX: 0.18,
+  US10Y: 0.2,
+  DXY: 0.18,
+  TSLA: 0.42,
+  KOSPI: 0.25,
+}
+
+function scenarioShockImpact(symbol: string, shock: number, weight: number, limit: number) {
+  const adjustedShock = inverseIndicators.has(symbol) ? -shock : shock
+  return clamp(round(adjustedShock * weight, 1), -limit, limit)
+}
+
+function scenarioFactorNote(symbol: ScenarioShockSymbol, impact: number) {
+  if (impact > 0) return `${symbol} 가정은 국내장 점수에 우호적입니다.`
+  if (impact < 0) return `${symbol} 가정은 국내장 점수에 부담입니다.`
+  return `${symbol} 추가 가정은 중립입니다.`
+}
+
+function buildScenarioSimulation({
+  forecast,
+  holdingsData,
+  newsImpactBoard,
+  shocks,
+  usdKrw,
+}: {
+  forecast: MarketForecast
+  holdingsData: Holding[]
+  newsImpactBoard: NewsImpactBoard
+  shocks: ScenarioShockState
+  usdKrw: number
+}): ScenarioSimulationResult {
+  const factors = scenarioShockControls.map((control) => {
+    const shock = shocks[control.symbol]
+    const scoreImpact = scenarioShockImpact(control.symbol, shock, control.weight, control.limit)
+    const tone = scoreImpact > 1 ? 'positive' : scoreImpact < -1 ? 'negative' : shock !== 0 ? 'warning' : 'neutral'
+
+    return {
+      symbol: control.symbol,
+      label: control.label,
+      shock,
+      scoreImpact,
+      tone,
+      note: scenarioFactorNote(control.symbol, scoreImpact),
+    } satisfies ScenarioSimulationFactor
+  })
+  const scoreDelta = round(factors.reduce((sum, factor) => sum + factor.scoreImpact, 0), 1)
+  const score = clamp(Math.round(forecast.baseScore + scoreDelta), 0, 100)
+  const totalShockIntensity = clamp(Object.values(shocks).reduce((sum, shock) => sum + Math.abs(shock), 0) / 8, 0, 1)
+  const boardBySymbol = new Map(newsImpactBoard.items.map((item) => [item.symbol, item]))
+  const positions = holdingsData
+    .map((holding) => {
+      const profile = getSymbolProfile(holding.symbol, holding.name)
+      const sensitivity = Array.from(new Set([...profile.sensitivity, ...(holding.market === 'KR' ? ['USD/KRW'] : [])]))
+      const baseValueKrw = holdingMarketValueKrw(holding, usdKrw)
+      const rawImpactPercent = sensitivity.reduce((sum, symbol) => {
+        const shock = shocks[symbol as ScenarioShockSymbol] ?? 0
+        const adjustedShock = inverseIndicators.has(symbol) ? -shock : shock
+        return sum + adjustedShock * (scenarioPositionSensitivity[symbol] ?? 0.12)
+      }, 0)
+      const currencyTranslation = holding.market === 'US' ? shocks['USD/KRW'] * 0.25 : 0
+      const newsTilt = clamp((boardBySymbol.get(holding.symbol)?.score ?? 0) / 240, -0.35, 0.35) * totalShockIntensity
+      const impactPercent = round(clamp(rawImpactPercent + currencyTranslation + newsTilt, -7, 7), 2)
+      const impactKrw = Math.round(baseValueKrw * (impactPercent / 100))
+
+      return {
+        symbol: holding.symbol,
+        name: holding.name,
+        impactPercent,
+        impactKrw,
+        tone: stressPositionTone(impactPercent),
+        sensitivity,
+      } satisfies ScenarioSimulationPosition
+    })
+    .sort((left, right) => Math.abs(right.impactKrw) - Math.abs(left.impactKrw))
+  const totalValueKrw = holdingsData.reduce((sum, holding) => sum + holdingMarketValueKrw(holding, usdKrw), 0)
+  const portfolioImpactKrw = positions.reduce((sum, position) => sum + position.impactKrw, 0)
+  const portfolioImpactPercent = totalValueKrw > 0 ? round((portfolioImpactKrw / totalValueKrw) * 100, 2) : 0
+  const topFactor = [...factors].sort((left, right) => Math.abs(right.scoreImpact) - Math.abs(left.scoreImpact))[0]
+  const topPosition = positions[0]
+  const scoreTone = stressToneFromScore(score)
+  const label = stressLabelFromScore(score)
+  const action =
+    score <= 43
+      ? '신규 매수 보류'
+      : score >= 62
+        ? '강한 종목만 분할'
+        : portfolioImpactPercent < -1
+          ? '비중 축소 감시'
+          : '첫 30분 확인'
+  const summary =
+    topFactor && Math.abs(topFactor.scoreImpact) > 0
+      ? `${topFactor.symbol} 가정이 ${topFactor.scoreImpact > 0 ? '+' : ''}${topFactor.scoreImpact}점으로 가장 큽니다. ${topPosition ? `${topPosition.symbol} 영향 ${formatChange(topPosition.impactPercent)}를 먼저 봅니다.` : '포트폴리오 영향은 제한적입니다.'}`
+      : '추가 가정이 없는 기준 상태입니다. 현재 예측과 스트레스 테스트를 함께 봅니다.'
+
+  return {
+    score,
+    scoreDelta,
+    scoreTone,
+    label,
+    kospiRange: stressRangeFromScore(score, 'KOSPI'),
+    kosdaqRange: stressRangeFromScore(score, 'KOSDAQ'),
+    portfolioImpactKrw,
+    portfolioImpactPercent,
+    summary,
+    action,
+    factors,
+    positions,
+  }
 }
 
 function stressToneFromScore(score: number): OvernightStressTest['stressTone'] {
@@ -4209,6 +4386,7 @@ function buildDashboardSnapshot({
     quoteStatus,
     quoteMessage,
     liveQuoteCount: quotes.length,
+    usdKrw,
     fetchedAt,
     calendarEvents: calendarEventsData,
     calendarStatus,
@@ -4631,6 +4809,217 @@ function OvernightStressTestPanel({ stress, compact = false }: { stress: Overnig
                   <Badge key={symbol} variant="neutral">
                     {symbol}
                   </Badge>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ScenarioSimulatorPanel({
+  forecast,
+  holdingsData,
+  indicators,
+  newsImpactBoard,
+  usdKrw,
+}: {
+  forecast: MarketForecast
+  holdingsData: Holding[]
+  indicators: MarketIndicator[]
+  newsImpactBoard: NewsImpactBoard
+  usdKrw: number
+}) {
+  const [shocks, setShocks] = useState<ScenarioShockState>(() => ({ ...defaultScenarioShocks }))
+  const indicatorMap = useMemo(() => new Map(indicators.map((indicator) => [indicator.symbol, indicator])), [indicators])
+  const result = useMemo(
+    () =>
+      buildScenarioSimulation({
+        forecast,
+        holdingsData,
+        newsImpactBoard,
+        shocks,
+        usdKrw,
+      }),
+    [forecast, holdingsData, newsImpactBoard, shocks, usdKrw],
+  )
+
+  function updateShock(symbol: ScenarioShockSymbol, value: string) {
+    const parsed = Number(value)
+    const control = scenarioShockControls.find((item) => item.symbol === symbol)
+    setShocks((current) => ({
+      ...current,
+      [symbol]: Number.isFinite(parsed) ? clamp(parsed, control?.min ?? -10, control?.max ?? 10) : 0,
+    }))
+  }
+
+  function applyPreset(nextShocks: ScenarioShockState) {
+    setShocks({ ...nextShocks })
+  }
+
+  return (
+    <Card data-testid="scenario-simulator">
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>가정 시뮬레이터</CardTitle>
+            <CardDescription>{result.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => applyPreset({ SOX: -1.5, 'NQ=F': -1, 'USD/KRW': 0.6, VIX: 4, US10Y: 0.75 })}
+            >
+              <TrendingDown className="size-4" />
+              위험회피
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => applyPreset({ SOX: 1.2, 'NQ=F': 0.8, 'USD/KRW': -0.4, VIX: -3, US10Y: -0.5 })}
+            >
+              <TrendingUp className="size-4" />
+              안정회복
+            </Button>
+            <Button type="button" variant="outline" size="sm" onClick={() => applyPreset(defaultScenarioShocks)}>
+              <RefreshCw className="size-4" />
+              초기화
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">가정 점수</div>
+            <div className="mt-2 text-2xl font-semibold">{result.score}</div>
+            <Badge className="mt-3" variant={result.scoreTone}>
+              {result.scoreDelta > 0 ? '+' : ''}
+              {result.scoreDelta}점
+            </Badge>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">예상 범위</div>
+            <div className="mt-2 text-xl font-semibold">{result.kospiRange}</div>
+            <div className="mt-2 text-xs text-muted-foreground">KOSDAQ {result.kosdaqRange}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">포트폴리오 영향</div>
+            <div className="mt-2 text-xl font-semibold">{formatSignedKrwAmount(result.portfolioImpactKrw)}</div>
+            <Badge className="mt-3" variant={result.portfolioImpactPercent < 0 ? 'negative' : result.portfolioImpactPercent > 0 ? 'positive' : 'neutral'}>
+              {formatChange(result.portfolioImpactPercent)}
+            </Badge>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">실행 모드</div>
+            <div className="mt-2 text-xl font-semibold">{result.action}</div>
+            <Badge className="mt-3" variant={result.scoreTone}>
+              {result.label}
+            </Badge>
+          </div>
+        </div>
+
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="grid gap-3">
+            {scenarioShockControls.map((control) => {
+              const current = indicatorMap.get(control.symbol)
+              const factor = result.factors.find((item) => item.symbol === control.symbol)
+              const contribution = factor ? Math.abs(factor.scoreImpact) / control.limit : 0
+
+              return (
+                <div key={control.symbol} className="rounded-md border border-border bg-muted/10 p-3">
+                  <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-sm font-semibold">{control.symbol}</span>
+                        <span className="text-sm font-medium">{control.label}</span>
+                        <Badge variant={factor?.tone ?? 'neutral'}>{formatChange(shocks[control.symbol])}</Badge>
+                      </div>
+                      <div className="mt-2 text-xs leading-5 text-muted-foreground">
+                        현재 {current ? formatChange(current.change) : '수집 대기'} · {control.note}
+                      </div>
+                    </div>
+                    <Badge variant={factor?.tone ?? 'neutral'}>
+                      {factor && factor.scoreImpact > 0 ? '+' : ''}
+                      {factor?.scoreImpact ?? 0}점
+                    </Badge>
+                  </div>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-[minmax(0,1fr)_104px]">
+                    <input
+                      type="range"
+                      min={control.min}
+                      max={control.max}
+                      step={control.step}
+                      value={shocks[control.symbol]}
+                      aria-label={control.label}
+                      onChange={(event) => updateShock(control.symbol, event.target.value)}
+                      className="h-2 w-full cursor-pointer accent-primary"
+                    />
+                    <input
+                      type="number"
+                      min={control.min}
+                      max={control.max}
+                      step={control.step}
+                      value={shocks[control.symbol]}
+                      aria-label={`${control.label} 숫자 입력`}
+                      onChange={(event) => updateShock(control.symbol, event.target.value)}
+                      className="h-9 w-full rounded-md border border-border bg-background px-2 text-right font-mono text-sm text-foreground outline-none transition focus:border-primary"
+                    />
+                  </div>
+                  <Progress className="mt-3" value={clamp(contribution * 100, 0, 100)} />
+                </div>
+              )
+            })}
+          </div>
+
+          <div className="grid content-start gap-3">
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">점수 기여도</div>
+              <div className="mt-3 grid gap-2">
+                {result.factors.map((factor) => (
+                  <div key={factor.symbol} className="flex items-center justify-between gap-3 rounded-md border border-border bg-background/70 px-3 py-2 text-sm">
+                    <div className="min-w-0">
+                      <div className="font-mono font-semibold">{factor.symbol}</div>
+                      <div className="mt-1 text-xs text-muted-foreground">{factor.note}</div>
+                    </div>
+                    <Badge variant={factor.tone}>
+                      {factor.scoreImpact > 0 ? '+' : ''}
+                      {factor.scoreImpact}
+                    </Badge>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">민감 포지션</div>
+              <div className="mt-3 grid gap-2">
+                {result.positions.slice(0, 5).map((position) => (
+                  <div key={position.symbol} className="rounded-md border border-border bg-background/70 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-mono text-sm font-semibold">{position.symbol}</span>
+                          <span className="text-sm font-medium">{position.name}</span>
+                        </div>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {position.sensitivity.slice(0, 4).map((symbol) => (
+                            <Badge key={symbol} variant="secondary">
+                              {symbol}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="shrink-0 text-right">
+                        <Badge variant={position.tone}>{formatChange(position.impactPercent)}</Badge>
+                        <div className="mt-2 text-xs text-muted-foreground">{formatSignedKrwAmount(position.impactKrw)}</div>
+                      </div>
+                    </div>
+                  </div>
                 ))}
               </div>
             </div>
@@ -6107,6 +6496,9 @@ const forecastSourceLabel = {
 
 function ForecastPage({
   forecast,
+  holdingsData,
+  leadingIndicatorsData,
+  newsImpactBoard,
   actionQueue,
   portfolioPlaybook,
   dataReliability,
@@ -6115,8 +6507,12 @@ function ForecastPage({
   overnightStressTest,
   preMarketCommand,
   executionPlan,
+  usdKrw,
 }: {
   forecast: MarketForecast
+  holdingsData: Holding[]
+  leadingIndicatorsData: MarketIndicator[]
+  newsImpactBoard: NewsImpactBoard
   actionQueue: ActionQueueItem[]
   portfolioPlaybook: PortfolioPlaybook
   dataReliability: DataReliability
@@ -6125,6 +6521,7 @@ function ForecastPage({
   overnightStressTest: OvernightStressTest
   preMarketCommand: PreMarketCommandCenter
   executionPlan: ExecutionPlan
+  usdKrw: number
 }) {
   const topImpact = forecast.impacts[0]
   const topRisk = forecast.impacts.find((item) => item.impact < 0)
@@ -6146,6 +6543,8 @@ function ForecastPage({
       <SignalAuditPanel audit={signalAudit} />
 
       <ForecastSensitivityPanel sensitivity={forecastSensitivity} />
+
+      <ScenarioSimulatorPanel forecast={forecast} holdingsData={holdingsData} indicators={leadingIndicatorsData} newsImpactBoard={newsImpactBoard} usdKrw={usdKrw} />
 
       <OvernightStressTestPanel stress={overnightStressTest} />
 
@@ -8299,6 +8698,9 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
     return (
       <ForecastPage
         forecast={snapshot.forecast}
+        holdingsData={snapshot.holdings}
+        leadingIndicatorsData={snapshot.leadingIndicators}
+        newsImpactBoard={snapshot.newsImpactBoard}
         actionQueue={snapshot.actionQueue}
         portfolioPlaybook={snapshot.portfolioPlaybook}
         dataReliability={snapshot.dataReliability}
@@ -8307,6 +8709,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         overnightStressTest={snapshot.overnightStressTest}
         preMarketCommand={snapshot.preMarketCommand}
         executionPlan={snapshot.executionPlan}
+        usdKrw={snapshot.usdKrw}
       />
     )
   }
