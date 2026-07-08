@@ -64,6 +64,7 @@ import type {
   AlertSettings,
   BiasScore,
   CalendarEvent,
+  DataReliability,
   Direction,
   DisclosureItem,
   Holding,
@@ -239,6 +240,7 @@ type DashboardSnapshot = {
   forecast: MarketForecast
   portfolioPlaybook: PortfolioPlaybook
   morningBrief: MorningBrief
+  dataReliability: DataReliability
   actionQueue: ActionQueueItem[]
   journal: InvestmentJournal
 }
@@ -2015,6 +2017,7 @@ function buildMorningBrief({
   eventsData,
   disclosures,
   marketStatusData,
+  dataReliability,
 }: {
   forecast: MarketForecast
   portfolioPlaybook: PortfolioPlaybook
@@ -2024,6 +2027,7 @@ function buildMorningBrief({
   eventsData: CalendarEvent[]
   disclosures: DisclosureItem[]
   marketStatusData: MarketStatusView
+  dataReliability: DataReliability
 }): MorningBrief {
   const generatedAt = new Date().toISOString()
   const topAction = actionQueue[0]
@@ -2056,6 +2060,7 @@ function buildMorningBrief({
         [
           `방향점수 ${forecast.baseScore}/100, 예상 출발 ${forecast.expectedOpenRange}`,
           `가장 가능성 높은 시나리오: ${topScenario.label} ${topScenario.probability}%`,
+          `데이터 신뢰도 ${dataReliability.score}/100 (${dataReliability.label})`,
           `USD/KRW ${marketStatusData.usdKrw}, VIX ${marketStatusData.vix}`,
           forecast.summary,
         ],
@@ -2320,6 +2325,149 @@ function buildMarketStatusView({
   }
 }
 
+function reliabilityTone(score: number): DataReliability['tone'] {
+  if (score >= 82) return 'positive'
+  if (score >= 45) return 'warning'
+  return 'negative'
+}
+
+function reliabilityLabel(score: number) {
+  if (score >= 82) return '실데이터 우세'
+  if (score >= 64) return '부분 실데이터'
+  if (score >= 45) return '대체 데이터 혼합'
+  return '연결 점검 필요'
+}
+
+function reliabilityConfidence(score: number): DataReliability['confidence'] {
+  if (score >= 78) return 'high'
+  if (score >= 52) return 'medium'
+  return 'low'
+}
+
+function statusReliabilityScore(status: DataHealthStatus) {
+  if (status === 'ready' || status === 'local') return 90
+  if (status === 'partial') return 68
+  if (status === 'loading') return 46
+  if (status === 'fallback' || status === 'planned') return 34
+  if (status === 'idle') return 20
+  return 10
+}
+
+function buildDataReliability({
+  quoteStatus,
+  quoteMessage,
+  liveQuoteCount,
+  expectedQuoteCount,
+  newsStatus,
+  newsMessage,
+  liveNewsCount,
+  calendarStatus,
+  calendarMessage,
+  calendarEventCount,
+  disclosureStatus,
+  disclosureMessage,
+  disclosureCount,
+}: {
+  quoteStatus: QuoteStatus
+  quoteMessage: string
+  liveQuoteCount: number
+  expectedQuoteCount: number
+  newsStatus: NewsStatus
+  newsMessage: string
+  liveNewsCount: number
+  calendarStatus: CalendarStatus
+  calendarMessage: string
+  calendarEventCount: number
+  disclosureStatus: DisclosureStatus
+  disclosureMessage: string
+  disclosureCount: number
+}): DataReliability {
+  const quoteCoverage = expectedQuoteCount > 0 ? clamp(liveQuoteCount / expectedQuoteCount, 0, 1) : liveQuoteCount > 0 ? 1 : 0
+  const quoteScore =
+    quoteStatus === 'ready' || quoteStatus === 'partial'
+      ? clamp(statusReliabilityScore(quoteStatus) + Math.round(quoteCoverage * 10), 0, 100)
+      : statusReliabilityScore(quoteStatus)
+  const newsScore = newsStatus === 'ready' ? clamp(statusReliabilityScore(newsStatus) + Math.min(8, liveNewsCount), 0, 100) : statusReliabilityScore(newsStatus)
+  const calendarScore =
+    calendarStatus === 'ready' ? clamp(statusReliabilityScore(calendarStatus) + Math.min(6, Math.round(calendarEventCount / 2)), 0, 100) : statusReliabilityScore(calendarStatus)
+  const disclosureScore =
+    disclosureStatus === 'ready' || disclosureStatus === 'partial'
+      ? clamp(statusReliabilityScore(disclosureStatus) + Math.min(6, disclosureCount), 0, 100)
+      : statusReliabilityScore(disclosureStatus)
+  const sources: DataReliability['sources'] = [
+    {
+      id: 'quotes',
+      name: '시세·선행지표',
+      statusLabel: dataHealthStatusLabel[quoteStatus],
+      tone: dataHealthVariant(quoteStatus),
+      score: quoteScore,
+      weight: 40,
+      metric: `${liveQuoteCount}/${expectedQuoteCount || liveQuoteCount || 0}개`,
+      summary: quoteMessage,
+      effect: '방향점수, 보유/관심 가격, 환율·VIX·SOX 해석에 직접 반영됩니다.',
+    },
+    {
+      id: 'news',
+      name: '뉴스 이슈',
+      statusLabel: dataHealthStatusLabel[newsStatus],
+      tone: dataHealthVariant(newsStatus),
+      score: newsScore,
+      weight: 25,
+      metric: `${liveNewsCount}건`,
+      summary: newsMessage,
+      effect: '종목별 이슈, 방향점수 보정, 액션 큐와 장전 브리핑에 반영됩니다.',
+    },
+    {
+      id: 'disclosures',
+      name: 'DART 공시',
+      statusLabel: dataHealthStatusLabel[disclosureStatus],
+      tone: dataHealthVariant(disclosureStatus),
+      score: disclosureScore,
+      weight: 20,
+      metric: `${disclosureCount}건`,
+      summary: disclosureMessage,
+      effect: '국내 보유/관심종목의 실적·주요사항 원문 리스크를 보정합니다.',
+    },
+    {
+      id: 'calendar',
+      name: '일정 캘린더',
+      statusLabel: dataHealthStatusLabel[calendarStatus],
+      tone: dataHealthVariant(calendarStatus),
+      score: calendarScore,
+      weight: 15,
+      metric: `${calendarEventCount}개`,
+      summary: calendarMessage,
+      effect: 'CPI, FOMC, 실적 구간처럼 이벤트 전후 변동성 판단에 반영됩니다.',
+    },
+  ]
+  const totalWeight = sources.reduce((sum, source) => sum + source.weight, 0)
+  const score = Math.round(sources.reduce((sum, source) => sum + source.score * source.weight, 0) / totalWeight)
+  const connectedCount = sources.filter((source) => source.score >= 64).length
+  const nextActions = [
+    quoteStatus === 'ready' || quoteStatus === 'partial' ? null : '시세 새로고침 후 NQ=F, SOX, USD/KRW가 들어오는지 확인',
+    newsStatus === 'ready' ? null : '네이버 뉴스 환경변수와 키워드 목록 확인',
+    disclosureStatus === 'ready' || disclosureStatus === 'partial' ? null : 'OpenDART 키 또는 최근 국내 공시 유무 확인',
+    calendarStatus === 'ready' ? null : '캘린더 새로고침 후 오늘/이번 주 이벤트 확인',
+  ].filter((item): item is string => item !== null)
+
+  return {
+    score,
+    label: reliabilityLabel(score),
+    tone: reliabilityTone(score),
+    confidence: reliabilityConfidence(score),
+    summary:
+      score >= 82
+        ? `핵심 데이터 ${connectedCount}/${sources.length}개가 충분히 연결되어 예측과 브리핑을 적극 참고할 수 있습니다.`
+        : score >= 64
+          ? `핵심 데이터 ${connectedCount}/${sources.length}개가 연결되어 있지만 일부 소스는 대체 데이터가 섞여 있습니다.`
+          : score >= 45
+            ? `실데이터와 대체 데이터가 섞여 있으니 방향성은 참고하되 개장 전 원자료를 한 번 더 확인해야 합니다.`
+            : `실데이터 연결이 약해 현재 예측은 체크리스트 수준으로만 보는 편이 좋습니다.`,
+    sources,
+    nextActions: nextActions.length > 0 ? nextActions.slice(0, 4) : ['현재 연결 상태는 양호합니다. 개장 직전 시세 새로고침만 한 번 더 확인하면 됩니다.'],
+  }
+}
+
 function buildDashboardSnapshot({
   baseHoldings,
   baseWatchlist,
@@ -2410,6 +2558,22 @@ function buildDashboardSnapshot({
     biasScoreData: liveBiasScore,
   })
   const marketStatusView = buildMarketStatusView({ quoteMap, fetchedAt, quoteStatus })
+  const expectedQuoteCount = new Set([...baseHoldings.map((holding) => holding.symbol), ...baseWatchlist.map((item) => item.symbol), ...indicatorSymbols]).size
+  const dataReliability = buildDataReliability({
+    quoteStatus,
+    quoteMessage,
+    liveQuoteCount: quotes.length,
+    expectedQuoteCount,
+    newsStatus,
+    newsMessage,
+    liveNewsCount: liveNews.length,
+    calendarStatus,
+    calendarMessage,
+    calendarEventCount: calendarEventsData.length,
+    disclosureStatus,
+    disclosureMessage,
+    disclosureCount: disclosures.length,
+  })
   const morningBrief = buildMorningBrief({
     forecast,
     portfolioPlaybook,
@@ -2419,6 +2583,7 @@ function buildDashboardSnapshot({
     eventsData: calendarEventsData,
     disclosures,
     marketStatusData: marketStatusView,
+    dataReliability,
   })
 
   return {
@@ -2457,6 +2622,7 @@ function buildDashboardSnapshot({
     forecast,
     portfolioPlaybook,
     morningBrief,
+    dataReliability,
     actionQueue,
     journal,
   }
@@ -2483,6 +2649,98 @@ function MetricCard({
             {detail}
           </Badge>
         ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+function DataReliabilityPanel({
+  reliability,
+  onRefreshAll,
+  refreshing = false,
+  compact = false,
+}: {
+  reliability: DataReliability
+  onRefreshAll?: () => void
+  refreshing?: boolean
+  compact?: boolean
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <CardTitle>실데이터 신뢰도</CardTitle>
+            <CardDescription>{reliability.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={reliability.tone}>{reliability.label}</Badge>
+            <Badge variant="secondary">신뢰도 {confidenceLabel[reliability.confidence]}</Badge>
+            {onRefreshAll ? (
+              <Button type="button" variant="outline" size="sm" onClick={onRefreshAll} disabled={refreshing}>
+                <RefreshCw className={cn('size-4', refreshing && 'animate-spin')} />
+                전체 새로고침
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-4 xl:grid-cols-[240px_minmax(0,1fr)]">
+          <div className="rounded-md border border-border bg-muted/15 p-4">
+            <div className="mb-2 text-xs text-muted-foreground">현재 계산 신뢰도</div>
+            <div className="flex items-end gap-2">
+              <div className="text-4xl font-semibold leading-none">{reliability.score}</div>
+              <div className="pb-1 text-sm text-muted-foreground">/ 100</div>
+            </div>
+            <Progress className="mt-4" value={reliability.score} />
+            <div className="mt-3 text-xs leading-5 text-muted-foreground">
+              시세, 뉴스, 공시, 캘린더의 연결 상태를 가중 평균했습니다.
+            </div>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            {reliability.sources.map((source) => (
+              <div key={source.id} className="rounded-md border border-border bg-muted/15 p-3">
+                <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <div className="text-sm font-semibold">{source.name}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">가중치 {source.weight}%</div>
+                  </div>
+                  <Badge variant={source.tone}>{source.statusLabel}</Badge>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <Badge variant="secondary">{source.metric}</Badge>
+                  <span className="text-sm font-semibold">{source.score}점</span>
+                </div>
+                <div className="mt-3 text-xs leading-5 text-muted-foreground">{compact ? source.effect : source.summary}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+          <div className="rounded-md border border-border bg-background/70 p-4">
+            <div className="mb-2 text-sm font-semibold">예측에 반영되는 방식</div>
+            <div className="space-y-2">
+              {reliability.sources.slice(0, compact ? 2 : 4).map((source) => (
+                <div key={source.id} className="text-sm leading-6 text-muted-foreground">
+                  {source.effect}
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-md border border-border bg-background/70 p-4">
+            <div className="mb-2 text-sm font-semibold">다음 확인 액션</div>
+            <div className="space-y-2">
+              {reliability.nextActions.map((action) => (
+                <div key={action} className="text-sm leading-6 text-muted-foreground">
+                  {action}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </CardContent>
     </Card>
   )
@@ -3350,10 +3608,12 @@ function ForecastPage({
   forecast,
   actionQueue,
   portfolioPlaybook,
+  dataReliability,
 }: {
   forecast: MarketForecast
   actionQueue: ActionQueueItem[]
   portfolioPlaybook: PortfolioPlaybook
+  dataReliability: DataReliability
 }) {
   const topImpact = forecast.impacts[0]
   const topRisk = forecast.impacts.find((item) => item.impact < 0)
@@ -3367,6 +3627,8 @@ function ForecastPage({
         <MetricCard label="예측 신뢰도" value={confidenceLabel[forecast.confidence]} detail="데이터 연결 기준" tone={forecast.confidence === 'high' ? 'positive' : forecast.confidence === 'medium' ? 'warning' : 'neutral'} />
         <MetricCard label="핵심 변수" value={topImpact?.label ?? '확인 대기'} detail={topImpact ? `${topImpact.impact > 0 ? '+' : ''}${topImpact.impact}점` : '데이터 대기'} tone={topImpact ? directionVariant(topImpact.direction) : 'neutral'} />
       </section>
+
+      <DataReliabilityPanel reliability={dataReliability} compact />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
         <Card>
@@ -5176,7 +5438,16 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
     )
   }
   if (page === 'radar') return <MarketRadarPage leadingIndicatorsData={snapshot.leadingIndicators} biasScoreData={snapshot.biasScore} />
-  if (page === 'forecast') return <ForecastPage forecast={snapshot.forecast} actionQueue={snapshot.actionQueue} portfolioPlaybook={snapshot.portfolioPlaybook} />
+  if (page === 'forecast') {
+    return (
+      <ForecastPage
+        forecast={snapshot.forecast}
+        actionQueue={snapshot.actionQueue}
+        portfolioPlaybook={snapshot.portfolioPlaybook}
+        dataReliability={snapshot.dataReliability}
+      />
+    )
+  }
   if (page === 'news') {
     return (
       <NewsPage
@@ -5603,6 +5874,14 @@ export function Dashboard() {
         : snapshot.quoteStatus === 'error'
           ? 'negative'
           : 'neutral'
+  const dataRefreshBusy =
+    quoteStatus === 'loading' || newsStatus === 'loading' || calendarStatus === 'loading' || disclosureStatus === 'loading'
+  const refreshAllData = () => {
+    void loadQuotes()
+    void loadLiveNews()
+    void loadCalendar()
+    void loadDisclosures()
+  }
 
   useEffect(() => {
     setNotificationPermission(getNotificationPermissionState())
@@ -5938,6 +6217,8 @@ export function Dashboard() {
                 </CardContent>
               </Card>
             </section>
+
+            <DataReliabilityPanel reliability={snapshot.dataReliability} onRefreshAll={refreshAllData} refreshing={dataRefreshBusy} compact />
 
             <Card>
               <CardHeader>

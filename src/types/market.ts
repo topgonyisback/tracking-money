@@ -240,6 +240,28 @@ export type MorningBrief = {
   copyText: string
 }
 
+export type DataReliabilitySource = {
+  id: 'quotes' | 'news' | 'calendar' | 'disclosures'
+  name: string
+  statusLabel: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  score: number
+  weight: number
+  metric: string
+  summary: string
+  effect: string
+}
+
+export type DataReliability = {
+  score: number
+  label: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  confidence: Confidence
+  summary: string
+  sources: DataReliabilitySource[]
+  nextActions: string[]
+}
+
 export type InvestmentJournal = {
   date: string
   preMarketPlan: string
