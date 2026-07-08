@@ -37,9 +37,33 @@ function normalizeSymbol(value) {
 function findQuoteConfig(symbol) {
   const normalized = normalizeSymbol(symbol)
 
-  return DEFAULT_QUOTES.find(
+  const knownQuote = DEFAULT_QUOTES.find(
     (quote) => normalizeSymbol(quote.symbol) === normalized || normalizeSymbol(quote.sourceSymbol) === normalized,
   )
+
+  if (knownQuote) return knownQuote
+
+  if (/^\d{6}$/.test(normalized)) {
+    return {
+      symbol: normalized,
+      sourceSymbol: `${normalized}.KS`,
+      name: normalized,
+      market: 'KR',
+      type: 'stock',
+    }
+  }
+
+  if (/^[A-Z][A-Z0-9.-]{0,9}$/.test(normalized)) {
+    return {
+      symbol: normalized,
+      sourceSymbol: normalized,
+      name: normalized,
+      market: 'US',
+      type: 'stock',
+    }
+  }
+
+  return undefined
 }
 
 function getQuoteConfigs(rawSymbols) {

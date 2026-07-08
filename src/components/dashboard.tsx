@@ -11,13 +11,17 @@ import {
   LineChart,
   Newspaper,
   NotebookPen,
+  Pencil,
   Radar,
   RefreshCw,
+  Save,
   Settings,
   Star,
+  Trash2,
   TrendingDown,
   TrendingUp,
   WalletCards,
+  X,
 } from 'lucide-react'
 import {
   Area,
@@ -76,6 +80,10 @@ type QuotesApiResponse = {
 }
 
 type MarketStatusView = typeof marketStatus
+type StoredDashboardData = {
+  holdings: Holding[]
+  watchlist: WatchItem[]
+}
 
 type DashboardSnapshot = {
   holdings: Holding[]
@@ -89,14 +97,9 @@ type DashboardSnapshot = {
   fetchedAt: string | null
 }
 
-const quoteSymbols = [
-  '005930',
-  '000660',
-  '035420',
-  '373220',
-  'AAPL',
-  'TSLA',
-  'NVDA',
+const storageKey = 'tracking-money-dashboard-v1'
+
+const indicatorSymbols = [
   'NQ=F',
   'ES=F',
   'SOX',
@@ -150,6 +153,44 @@ function clamp(value: number, min: number, max: number) {
 function round(value: number, digits = 2) {
   const factor = 10 ** digits
   return Math.round(value * factor) / factor
+}
+
+function parseNumericInput(value: string, fallback = 0) {
+  const parsed = Number(String(value).replace(/,/g, '').trim())
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function normalizeUserSymbol(value: string) {
+  return value.trim().toUpperCase()
+}
+
+function defaultMarketForSymbol(symbol: string): 'KR' | 'US' {
+  return /^\d{6}$/.test(symbol) ? 'KR' : 'US'
+}
+
+function loadStoredDashboardData(): StoredDashboardData | null {
+  try {
+    const raw = window.localStorage.getItem(storageKey)
+    if (!raw) return null
+
+    const parsed = JSON.parse(raw) as Partial<StoredDashboardData>
+    if (!Array.isArray(parsed.holdings) || !Array.isArray(parsed.watchlist)) return null
+
+    return {
+      holdings: parsed.holdings,
+      watchlist: parsed.watchlist,
+    }
+  } catch {
+    return null
+  }
+}
+
+function saveStoredDashboardData(data: StoredDashboardData) {
+  window.localStorage.setItem(storageKey, JSON.stringify(data))
+}
+
+function resetStoredDashboardData() {
+  window.localStorage.removeItem(storageKey)
 }
 
 function quoteKey(symbol: string) {
@@ -280,9 +321,9 @@ function relatedIssues(symbol: string) {
   return keyIssues.filter((issue) => issue.relatedSymbols.includes(symbol))
 }
 
-function mergeHoldingsWithQuotes(quoteMap: Map<string, MarketQuote>) {
+function mergeHoldingsWithQuotes(baseHoldings: Holding[], quoteMap: Map<string, MarketQuote>) {
   const usdKrw = getQuote(quoteMap, 'USD/KRW')?.price ?? Number(marketStatus.usdKrw.replace(/,/g, ''))
-  const updated = holdings.map((holding) => {
+  const updated = baseHoldings.map((holding) => {
     const quote = getQuote(quoteMap, holding.symbol)
     if (!quote) return holding
 
@@ -314,8 +355,8 @@ function mergeHoldingsWithQuotes(quoteMap: Map<string, MarketQuote>) {
   }))
 }
 
-function mergeWatchlistWithQuotes(quoteMap: Map<string, MarketQuote>) {
-  return watchlist.map((item) => {
+function mergeWatchlistWithQuotes(baseWatchlist: WatchItem[], quoteMap: Map<string, MarketQuote>) {
+  return baseWatchlist.map((item) => {
     const quote = getQuote(quoteMap, item.symbol)
     if (!quote) return item
 
@@ -428,19 +469,23 @@ function buildMarketStatusView({
 }
 
 function buildDashboardSnapshot({
+  baseHoldings,
+  baseWatchlist,
   quotes,
   fetchedAt,
   quoteStatus,
   quoteMessage,
 }: {
+  baseHoldings: Holding[]
+  baseWatchlist: WatchItem[]
   quotes: MarketQuote[]
   fetchedAt: string | null
   quoteStatus: QuoteStatus
   quoteMessage: string
 }): DashboardSnapshot {
   const quoteMap = quoteBySymbol(quotes)
-  const liveHoldings = mergeHoldingsWithQuotes(quoteMap)
-  const liveWatchlist = mergeWatchlistWithQuotes(quoteMap)
+  const liveHoldings = mergeHoldingsWithQuotes(baseHoldings, quoteMap)
+  const liveWatchlist = mergeWatchlistWithQuotes(baseWatchlist, quoteMap)
   const liveIndicators = mergeIndicatorsWithQuotes(quoteMap)
   const liveBiasScore = buildLiveBiasScore(liveIndicators, quotes.length)
 
@@ -487,29 +532,211 @@ function PageGrid({ children }: { children: ReactNode }) {
   return <div className="mx-auto grid max-w-[1600px] gap-4 p-4 md:p-6">{children}</div>
 }
 
+type HoldingFormState = {
+  symbol: string
+  name: string
+  market: 'KR' | 'US'
+  quantity: string
+  averagePrice: string
+}
+
+type WatchFormState = {
+  symbol: string
+  name: string
+  targetBuyPrice: string
+  trigger: string
+}
+
+const emptyHoldingForm: HoldingFormState = {
+  symbol: '',
+  name: '',
+  market: 'KR',
+  quantity: '',
+  averagePrice: '',
+}
+
+const emptyWatchForm: WatchFormState = {
+  symbol: '',
+  name: '',
+  targetBuyPrice: '',
+  trigger: '',
+}
+
+const inputClassName =
+  'h-9 w-full min-w-0 rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none transition placeholder:text-muted-foreground focus:border-primary'
+
+function holdingToForm(holding: Holding): HoldingFormState {
+  return {
+    symbol: holding.symbol,
+    name: holding.name,
+    market: holding.market,
+    quantity: String(holding.quantity),
+    averagePrice: String(holding.averagePrice),
+  }
+}
+
+function watchItemToForm(item: WatchItem): WatchFormState {
+  return {
+    symbol: item.symbol,
+    name: item.name,
+    targetBuyPrice: String(item.targetBuyPrice),
+    trigger: item.trigger,
+  }
+}
+
+function formToHolding(form: HoldingFormState, existing?: Holding): Holding {
+  const symbol = normalizeUserSymbol(form.symbol)
+  const market = form.market
+  const averagePrice = parseNumericInput(form.averagePrice, existing?.averagePrice ?? 0)
+
+  return {
+    symbol,
+    name: form.name.trim() || symbol,
+    market,
+    quantity: parseNumericInput(form.quantity, existing?.quantity ?? 0),
+    averagePrice,
+    currentPrice: existing?.currentPrice ?? averagePrice,
+    dayChange: existing?.dayChange ?? 0,
+    portfolioWeight: existing?.portfolioWeight ?? 0,
+    impact: existing?.impact ?? 'neutral',
+    impactNote: existing?.impactNote ?? '사용자가 추가한 보유종목입니다.',
+  }
+}
+
+function formToWatchItem(form: WatchFormState, existing?: WatchItem): WatchItem {
+  const symbol = normalizeUserSymbol(form.symbol)
+  const targetBuyPrice = parseNumericInput(form.targetBuyPrice, existing?.targetBuyPrice ?? 0)
+
+  return {
+    symbol,
+    name: form.name.trim() || symbol,
+    targetBuyPrice,
+    currentPrice: existing?.currentPrice ?? targetBuyPrice,
+    distanceToBuy: existing?.distanceToBuy ?? 0,
+    trigger: form.trigger.trim() || '가격과 뉴스 트리거 확인',
+    status: existing?.status ?? 'waiting',
+  }
+}
+
 function HoldingsPage({
   holdingsData,
   biasScoreData,
+  onSaveHolding,
+  onDeleteHolding,
+  onResetHoldings,
 }: {
   holdingsData: Holding[]
   biasScoreData: BiasScore
+  onSaveHolding: (holding: Holding, previousSymbol?: string) => void
+  onDeleteHolding: (symbol: string) => void
+  onResetHoldings: () => void
 }) {
+  const [form, setForm] = useState<HoldingFormState>(emptyHoldingForm)
+  const [editingSymbol, setEditingSymbol] = useState<string | null>(null)
   const totalPositions = holdingsData.length
   const positiveCount = holdingsData.filter((holding) => holding.impact === 'positive').length
   const riskCount = holdingsData.filter((holding) => holding.impact === 'negative').length
-  const topWeight = holdingsData.reduce(
+  const topWeight = holdingsData.length > 0 ? holdingsData.reduce(
     (top, holding) => (holding.portfolioWeight > top.portfolioWeight ? holding : top),
     holdingsData[0],
-  )
+  ) : null
+  const isFormValid = normalizeUserSymbol(form.symbol).length > 0 && parseNumericInput(form.quantity) > 0
+
+  function clearForm() {
+    setForm(emptyHoldingForm)
+    setEditingSymbol(null)
+  }
+
+  function editHolding(holding: Holding) {
+    setForm(holdingToForm(holding))
+    setEditingSymbol(holding.symbol)
+  }
+
+  function submitHolding() {
+    if (!isFormValid) return
+
+    const symbol = normalizeUserSymbol(form.symbol)
+    const existing = holdingsData.find((holding) => holding.symbol === editingSymbol || holding.symbol === symbol)
+    onSaveHolding(formToHolding(form, existing), editingSymbol ?? undefined)
+    clearForm()
+  }
 
   return (
     <PageGrid>
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <MetricCard label="보유 종목" value={`${totalPositions}개`} detail={`${positiveCount}개 우호`} tone="positive" />
-        <MetricCard label="최대 비중" value={`${topWeight.name}`} detail={`${topWeight.portfolioWeight}%`} tone="warning" />
+        <MetricCard label="최대 비중" value={topWeight?.name ?? '-'} detail={topWeight ? `${topWeight.portfolioWeight}%` : '대기'} tone="warning" />
         <MetricCard label="이슈 부담" value={`${riskCount}개`} detail="환율/금리 확인" tone={riskCount ? 'negative' : 'neutral'} />
         <MetricCard label="국내장 방향점수" value={`+${biasScoreData.score}`} detail={`신뢰도 ${confidenceLabel[biasScoreData.confidence]}`} tone={biasScoreData.stance === 'pressure' ? 'negative' : biasScoreData.stance === 'neutral' ? 'neutral' : 'positive'} />
       </section>
+
+      <Card>
+        <CardHeader>
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div>
+              <CardTitle>보유종목 편집</CardTitle>
+              <CardDescription>수량과 평단은 브라우저에 저장되고, 현재가는 실시간 시세로 덮어씁니다.</CardDescription>
+            </div>
+            <Button type="button" variant="outline" size="sm" onClick={onResetHoldings}>
+              <RefreshCw className="size-4" />
+              기본값
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-3 lg:grid-cols-[120px_minmax(150px,1fr)_110px_120px_160px_auto]">
+            <input
+              className={inputClassName}
+              placeholder="티커"
+              value={form.symbol}
+              onChange={(event) => {
+                const symbol = normalizeUserSymbol(event.target.value)
+                setForm((current) => ({ ...current, symbol, market: symbol ? defaultMarketForSymbol(symbol) : current.market }))
+              }}
+            />
+            <input
+              className={inputClassName}
+              placeholder="종목명"
+              value={form.name}
+              onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
+            />
+            <select
+              className={inputClassName}
+              value={form.market}
+              onChange={(event) => setForm((current) => ({ ...current, market: event.target.value as 'KR' | 'US' }))}
+            >
+              <option value="KR">국내</option>
+              <option value="US">미국</option>
+            </select>
+            <input
+              className={inputClassName}
+              placeholder="수량"
+              inputMode="decimal"
+              value={form.quantity}
+              onChange={(event) => setForm((current) => ({ ...current, quantity: event.target.value }))}
+            />
+            <input
+              className={inputClassName}
+              placeholder="평단"
+              inputMode="decimal"
+              value={form.averagePrice}
+              onChange={(event) => setForm((current) => ({ ...current, averagePrice: event.target.value }))}
+            />
+            <div className="flex gap-2">
+              <Button type="button" size="sm" className="min-w-20" onClick={submitHolding} disabled={!isFormValid}>
+                <Save className="size-4" />
+                저장
+              </Button>
+              <Button type="button" variant="outline" size="icon" aria-label="입력 취소" onClick={clearForm}>
+                <X className="size-4" />
+              </Button>
+            </div>
+          </div>
+          <div className="mt-3 text-xs text-muted-foreground">
+            {editingSymbol ? `${editingSymbol} 수정 중` : '국내 종목은 005930처럼 6자리, 미국 종목은 AAPL처럼 입력하면 됩니다.'}
+          </div>
+        </CardContent>
+      </Card>
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
         <Card>
@@ -529,6 +756,7 @@ function HoldingsPage({
                   <TableHead>평가손익</TableHead>
                   <TableHead>비중</TableHead>
                   <TableHead>영향</TableHead>
+                  <TableHead>관리</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -551,6 +779,16 @@ function HoldingsPage({
                         <div className="flex items-center gap-2">
                           <Badge variant={directionVariant(holding.impact)}>{directionLabel[holding.impact]}</Badge>
                           <span className="text-xs text-muted-foreground">{relatedIssues(holding.symbol).length}건</span>
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex gap-2">
+                          <Button type="button" variant="outline" size="icon" aria-label={`${holding.name} 수정`} onClick={() => editHolding(holding)}>
+                            <Pencil className="size-4" />
+                          </Button>
+                          <Button type="button" variant="outline" size="icon" aria-label={`${holding.name} 삭제`} onClick={() => onDeleteHolding(holding.symbol)}>
+                            <Trash2 className="size-4" />
+                          </Button>
                         </div>
                       </TableCell>
                     </TableRow>
@@ -586,7 +824,40 @@ function HoldingsPage({
   )
 }
 
-function WatchlistPage({ watchlistData }: { watchlistData: WatchItem[] }) {
+function WatchlistPage({
+  watchlistData,
+  onSaveWatchItem,
+  onDeleteWatchItem,
+  onResetWatchlist,
+}: {
+  watchlistData: WatchItem[]
+  onSaveWatchItem: (item: WatchItem, previousSymbol?: string) => void
+  onDeleteWatchItem: (symbol: string) => void
+  onResetWatchlist: () => void
+}) {
+  const [form, setForm] = useState<WatchFormState>(emptyWatchForm)
+  const [editingSymbol, setEditingSymbol] = useState<string | null>(null)
+  const isFormValid = normalizeUserSymbol(form.symbol).length > 0 && parseNumericInput(form.targetBuyPrice) > 0
+
+  function clearForm() {
+    setForm(emptyWatchForm)
+    setEditingSymbol(null)
+  }
+
+  function editWatchItem(item: WatchItem) {
+    setForm(watchItemToForm(item))
+    setEditingSymbol(item.symbol)
+  }
+
+  function submitWatchItem() {
+    if (!isFormValid) return
+
+    const symbol = normalizeUserSymbol(form.symbol)
+    const existing = watchlistData.find((item) => item.symbol === editingSymbol || item.symbol === symbol)
+    onSaveWatchItem(formToWatchItem(form, existing), editingSymbol ?? undefined)
+    clearForm()
+  }
+
   return (
     <PageGrid>
       <section className="grid gap-4 md:grid-cols-3">
@@ -594,6 +865,62 @@ function WatchlistPage({ watchlistData }: { watchlistData: WatchItem[] }) {
         <MetricCard label="매수가 근접" value={`${watchlistData.filter((item) => item.status === 'near').length}개`} detail="우선 확인" tone="positive" />
         <MetricCard label="이슈 확인" value={`${watchlistData.filter((item) => item.status === 'alert').length}개`} detail="뉴스 연결" tone="warning" />
       </section>
+
+      <Card>
+        <CardHeader>
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div>
+              <CardTitle>관심종목 편집</CardTitle>
+              <CardDescription>관심가와 트리거를 저장하고 실시간 현재가와 거리 계산에 연결합니다.</CardDescription>
+            </div>
+            <Button type="button" variant="outline" size="sm" onClick={onResetWatchlist}>
+              <RefreshCw className="size-4" />
+              기본값
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-3 lg:grid-cols-[120px_minmax(150px,1fr)_160px_minmax(220px,2fr)_auto]">
+            <input
+              className={inputClassName}
+              placeholder="티커"
+              value={form.symbol}
+              onChange={(event) => setForm((current) => ({ ...current, symbol: normalizeUserSymbol(event.target.value) }))}
+            />
+            <input
+              className={inputClassName}
+              placeholder="종목명"
+              value={form.name}
+              onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
+            />
+            <input
+              className={inputClassName}
+              placeholder="관심가"
+              inputMode="decimal"
+              value={form.targetBuyPrice}
+              onChange={(event) => setForm((current) => ({ ...current, targetBuyPrice: event.target.value }))}
+            />
+            <input
+              className={inputClassName}
+              placeholder="트리거"
+              value={form.trigger}
+              onChange={(event) => setForm((current) => ({ ...current, trigger: event.target.value }))}
+            />
+            <div className="flex gap-2">
+              <Button type="button" size="sm" className="min-w-20" onClick={submitWatchItem} disabled={!isFormValid}>
+                <Save className="size-4" />
+                저장
+              </Button>
+              <Button type="button" variant="outline" size="icon" aria-label="입력 취소" onClick={clearForm}>
+                <X className="size-4" />
+              </Button>
+            </div>
+          </div>
+          <div className="mt-3 text-xs text-muted-foreground">
+            {editingSymbol ? `${editingSymbol} 수정 중` : '저장 후 대시보드의 관심종목 트리거 카드에도 바로 반영됩니다.'}
+          </div>
+        </CardContent>
+      </Card>
 
       <section className="grid gap-4 xl:grid-cols-3">
         {watchlistData.map((item) => (
@@ -628,6 +955,16 @@ function WatchlistPage({ watchlistData }: { watchlistData: WatchItem[] }) {
                 <Progress value={Math.max(0, 100 - item.distanceToBuy * 6)} />
               </div>
               <div className="rounded-md border border-border bg-muted/15 p-3 text-sm">{item.trigger}</div>
+              <div className="flex justify-end gap-2">
+                <Button type="button" variant="outline" size="sm" onClick={() => editWatchItem(item)}>
+                  <Pencil className="size-4" />
+                  수정
+                </Button>
+                <Button type="button" variant="outline" size="sm" onClick={() => onDeleteWatchItem(item.symbol)}>
+                  <Trash2 className="size-4" />
+                  삭제
+                </Button>
+              </div>
             </CardContent>
           </Card>
         ))}
@@ -1120,9 +1457,37 @@ function SettingsPage({
   )
 }
 
-function renderPage(page: PageId, snapshot: DashboardSnapshot) {
-  if (page === 'holdings') return <HoldingsPage holdingsData={snapshot.holdings} biasScoreData={snapshot.biasScore} />
-  if (page === 'watchlist') return <WatchlistPage watchlistData={snapshot.watchlist} />
+type DashboardActions = {
+  onSaveHolding: (holding: Holding, previousSymbol?: string) => void
+  onDeleteHolding: (symbol: string) => void
+  onResetHoldings: () => void
+  onSaveWatchItem: (item: WatchItem, previousSymbol?: string) => void
+  onDeleteWatchItem: (symbol: string) => void
+  onResetWatchlist: () => void
+}
+
+function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: DashboardActions) {
+  if (page === 'holdings') {
+    return (
+      <HoldingsPage
+        holdingsData={snapshot.holdings}
+        biasScoreData={snapshot.biasScore}
+        onSaveHolding={actions.onSaveHolding}
+        onDeleteHolding={actions.onDeleteHolding}
+        onResetHoldings={actions.onResetHoldings}
+      />
+    )
+  }
+  if (page === 'watchlist') {
+    return (
+      <WatchlistPage
+        watchlistData={snapshot.watchlist}
+        onSaveWatchItem={actions.onSaveWatchItem}
+        onDeleteWatchItem={actions.onDeleteWatchItem}
+        onResetWatchlist={actions.onResetWatchlist}
+      />
+    )
+  }
   if (page === 'radar') return <MarketRadarPage leadingIndicatorsData={snapshot.leadingIndicators} biasScoreData={snapshot.biasScore} />
   if (page === 'news') return <NewsPage holdingsData={snapshot.holdings} />
   if (page === 'calendar') return <CalendarPage />
@@ -1141,16 +1506,30 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot) {
 
 export function Dashboard() {
   const [activePage, setActivePage] = useState<PageId>('dashboard')
+  const [userHoldings, setUserHoldings] = useState<Holding[]>(holdings)
+  const [userWatchlist, setUserWatchlist] = useState<WatchItem[]>(watchlist)
+  const [storageLoaded, setStorageLoaded] = useState(false)
   const [quoteResponse, setQuoteResponse] = useState<QuotesApiResponse | null>(null)
   const [quoteStatus, setQuoteStatus] = useState<QuoteStatus>('idle')
   const [quoteMessage, setQuoteMessage] = useState('시세 연결 대기')
   const currentPage = navItems.find((item) => item.id === activePage) ?? navItems[0]
+  const trackedQuoteSymbols = useMemo(
+    () =>
+      Array.from(
+        new Set([
+          ...userHoldings.map((holding) => holding.symbol),
+          ...userWatchlist.map((item) => item.symbol),
+          ...indicatorSymbols,
+        ]),
+      ),
+    [userHoldings, userWatchlist],
+  )
   const loadQuotes = useCallback(async (signal?: AbortSignal) => {
     setQuoteStatus((status) => (status === 'idle' ? 'loading' : status))
 
     try {
       const params = new URLSearchParams({
-        symbols: quoteSymbols.join(','),
+        symbols: trackedQuoteSymbols.join(','),
       })
       const response = await fetch(`/api/quotes?${params.toString()}`, { signal })
       const contentType = response.headers.get('content-type') ?? ''
@@ -1179,7 +1558,24 @@ export function Dashboard() {
       setQuoteStatus('error')
       setQuoteMessage(error instanceof Error ? error.message : '시세를 불러오지 못했습니다.')
     }
+  }, [trackedQuoteSymbols])
+
+  useEffect(() => {
+    const stored = loadStoredDashboardData()
+    if (stored) {
+      setUserHoldings(stored.holdings)
+      setUserWatchlist(stored.watchlist)
+    }
+    setStorageLoaded(true)
   }, [])
+
+  useEffect(() => {
+    if (!storageLoaded) return
+    saveStoredDashboardData({
+      holdings: userHoldings,
+      watchlist: userWatchlist,
+    })
+  }, [storageLoaded, userHoldings, userWatchlist])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -1198,11 +1594,13 @@ export function Dashboard() {
     () =>
       buildDashboardSnapshot({
         quotes: quoteResponse?.quotes ?? [],
+        baseHoldings: userHoldings,
+        baseWatchlist: userWatchlist,
         fetchedAt: quoteResponse?.fetchedAt ?? null,
         quoteStatus,
         quoteMessage,
       }),
-    [quoteMessage, quoteResponse, quoteStatus],
+    [quoteMessage, quoteResponse, quoteStatus, userHoldings, userWatchlist],
   )
   const indicatorChartData = buildIndicatorChartData(snapshot.leadingIndicators)
   const biasTimeline = buildBiasTimeline(snapshot.biasScore.score)
@@ -1214,6 +1612,39 @@ export function Dashboard() {
         : snapshot.quoteStatus === 'error'
           ? 'negative'
           : 'neutral'
+  const actions = useMemo<DashboardActions>(
+    () => ({
+      onSaveHolding: (holding, previousSymbol) => {
+        setUserHoldings((current) => {
+          const previous = previousSymbol ? normalizeUserSymbol(previousSymbol) : holding.symbol
+          const remaining = current.filter((item) => item.symbol !== previous && item.symbol !== holding.symbol)
+          return [...remaining, holding]
+        })
+      },
+      onDeleteHolding: (symbol) => {
+        setUserHoldings((current) => current.filter((holding) => holding.symbol !== symbol))
+      },
+      onResetHoldings: () => {
+        setUserHoldings(holdings)
+        resetStoredDashboardData()
+      },
+      onSaveWatchItem: (item, previousSymbol) => {
+        setUserWatchlist((current) => {
+          const previous = previousSymbol ? normalizeUserSymbol(previousSymbol) : item.symbol
+          const remaining = current.filter((watchItem) => watchItem.symbol !== previous && watchItem.symbol !== item.symbol)
+          return [...remaining, item]
+        })
+      },
+      onDeleteWatchItem: (symbol) => {
+        setUserWatchlist((current) => current.filter((item) => item.symbol !== symbol))
+      },
+      onResetWatchlist: () => {
+        setUserWatchlist(watchlist)
+        resetStoredDashboardData()
+      },
+    }),
+    [],
+  )
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -1611,7 +2042,7 @@ export function Dashboard() {
             </Card>
           </div>
           ) : (
-            renderPage(activePage, snapshot)
+            renderPage(activePage, snapshot, actions)
           )}
         </main>
       </div>
