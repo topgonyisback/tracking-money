@@ -417,12 +417,16 @@ export type DataReliabilitySource = {
   id: 'quotes' | 'news' | 'calendar' | 'disclosures'
   name: string
   statusLabel: string
+  modeLabel: string
   tone: 'positive' | 'negative' | 'warning' | 'neutral'
   score: number
   weight: number
   metric: string
+  endpoint: string
+  requiredConfig: string
   summary: string
   effect: string
+  nextAction: string
 }
 
 export type DataReliability = {

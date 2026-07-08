@@ -117,6 +117,7 @@ type DataHealthService = {
   status: DataHealthStatus
   configured: boolean
   source: string
+  requiredEnv?: string[]
   cadence: string
   coverage: string[]
   summary: string
@@ -596,6 +597,18 @@ function dataHealthVariant(status: DataHealthStatus): 'positive' | 'negative' | 
   if (status === 'partial' || status === 'fallback' || status === 'planned' || status === 'loading') return 'warning'
   if (status === 'error' || status === 'missing') return 'negative'
   return 'neutral'
+}
+
+function dataModeLabel(status: DataHealthStatus) {
+  if (status === 'ready') return '실데이터'
+  if (status === 'partial') return '부분 실데이터'
+  if (status === 'fallback') return '대체 데이터'
+  if (status === 'missing') return '설정 필요'
+  if (status === 'error') return '연결 오류'
+  if (status === 'loading') return '확인 중'
+  if (status === 'local') return '로컬 저장'
+  if (status === 'planned') return '연결 예정'
+  return '대기'
 }
 
 function profileSyncVariant(status: ProfileSyncStatus): 'positive' | 'negative' | 'warning' | 'neutral' {
@@ -3860,45 +3873,73 @@ function buildDataReliability({
       id: 'quotes',
       name: '시세·선행지표',
       statusLabel: dataHealthStatusLabel[quoteStatus],
+      modeLabel: dataModeLabel(quoteStatus),
       tone: dataHealthVariant(quoteStatus),
       score: quoteScore,
       weight: 40,
       metric: `${liveQuoteCount}/${expectedQuoteCount || liveQuoteCount || 0}개`,
+      endpoint: '/api/quotes -> Yahoo Finance chart',
+      requiredConfig: '별도 API 키 없음',
       summary: quoteMessage,
       effect: '방향점수, 보유/관심 가격, 환율·VIX·SOX 해석에 직접 반영됩니다.',
+      nextAction:
+        quoteStatus === 'ready' || quoteStatus === 'partial'
+          ? '장 시작 직전 전체 새로고침으로 NQ=F, SOX, USD/KRW 최신값만 다시 확인'
+          : '시세 새로고침 후 NQ=F, SOX, USD/KRW가 들어오는지 확인',
     },
     {
       id: 'news',
       name: '뉴스 이슈',
       statusLabel: dataHealthStatusLabel[newsStatus],
+      modeLabel: dataModeLabel(newsStatus),
       tone: dataHealthVariant(newsStatus),
       score: newsScore,
       weight: 25,
       metric: `${liveNewsCount}건`,
+      endpoint: '/api/news -> Naver News Open API',
+      requiredConfig: 'NAVER_CLIENT_ID, NAVER_CLIENT_SECRET',
       summary: newsMessage,
       effect: '종목별 이슈, 방향점수 보정, 액션 큐와 장전 브리핑에 반영됩니다.',
+      nextAction:
+        newsStatus === 'ready'
+          ? '키워드가 내 보유/관심종목을 충분히 덮는지 확인하고 필요하면 설정에서 추가'
+          : 'Vercel 환경변수 NAVER_CLIENT_ID, NAVER_CLIENT_SECRET과 키워드 목록 확인',
     },
     {
       id: 'disclosures',
       name: 'DART 공시',
       statusLabel: dataHealthStatusLabel[disclosureStatus],
+      modeLabel: dataModeLabel(disclosureStatus),
       tone: dataHealthVariant(disclosureStatus),
       score: disclosureScore,
       weight: 20,
       metric: `${disclosureCount}건`,
+      endpoint: '/api/disclosures -> OpenDART',
+      requiredConfig: 'OPENDART_API_KEY',
       summary: disclosureMessage,
       effect: '국내 보유/관심종목의 실적·주요사항 원문 리스크를 보정합니다.',
+      nextAction:
+        disclosureStatus === 'ready' || disclosureStatus === 'partial'
+          ? '공시 제목만 보지 말고 큰 점수 항목은 원문 링크에서 제출 사유 확인'
+          : 'Vercel 환경변수 OPENDART_API_KEY 또는 최근 국내 공시 유무 확인',
     },
     {
       id: 'calendar',
       name: '일정 캘린더',
       statusLabel: dataHealthStatusLabel[calendarStatus],
+      modeLabel: dataModeLabel(calendarStatus),
       tone: dataHealthVariant(calendarStatus),
       score: calendarScore,
       weight: 15,
       metric: `${calendarEventCount}개`,
+      endpoint: '/api/calendar -> Tracking Money event rules',
+      requiredConfig: '별도 API 키 없음',
       summary: calendarMessage,
       effect: 'CPI, FOMC, 실적 구간처럼 이벤트 전후 변동성 판단에 반영됩니다.',
+      nextAction:
+        calendarStatus === 'ready'
+          ? 'estimated 일정은 실제 발표 시간 전 공식 캘린더나 IR에서 재확인'
+          : '캘린더 새로고침 후 오늘/이번 주 이벤트 확인',
     },
   ]
   const totalWeight = sources.reduce((sum, source) => sum + source.weight, 0)
@@ -5633,13 +5674,29 @@ function DataReliabilityPanel({
                     <div className="text-sm font-semibold">{source.name}</div>
                     <div className="mt-1 text-xs text-muted-foreground">가중치 {source.weight}%</div>
                   </div>
-                  <Badge variant={source.tone}>{source.statusLabel}</Badge>
+                  <div className="flex flex-wrap justify-end gap-1.5">
+                    <Badge variant={source.tone}>{source.modeLabel}</Badge>
+                    <Badge variant="secondary">{source.statusLabel}</Badge>
+                  </div>
                 </div>
                 <div className="flex items-center justify-between gap-3">
                   <Badge variant="secondary">{source.metric}</Badge>
                   <span className="text-sm font-semibold">{source.score}점</span>
                 </div>
                 <div className="mt-3 text-xs leading-5 text-muted-foreground">{compact ? source.effect : source.summary}</div>
+                {!compact ? (
+                  <div className="mt-3 grid gap-2 border-t border-border pt-3 text-xs leading-5 text-muted-foreground">
+                    <div>
+                      <span className="text-foreground/80">경로</span> · {source.endpoint}
+                    </div>
+                    <div>
+                      <span className="text-foreground/80">설정</span> · {source.requiredConfig}
+                    </div>
+                    <div>
+                      <span className="text-foreground/80">다음 조치</span> · {source.nextAction}
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>
@@ -8298,6 +8355,7 @@ function SettingsPage({
   disclosureStatus,
   disclosureMessage,
   disclosureCount,
+  dataReliability,
   backupData,
   onImportDashboardData,
   onResetDashboardData,
@@ -8320,6 +8378,7 @@ function SettingsPage({
   disclosureStatus: DisclosureStatus
   disclosureMessage: string
   disclosureCount: number
+  dataReliability: DataReliability
   backupData: StoredDashboardData
   onImportDashboardData: (data: StoredDashboardData) => void
   onResetDashboardData: () => void
@@ -8359,9 +8418,11 @@ function SettingsPage({
   const backupMessageVariant = backupTone === 'positive' ? 'positive' : backupTone === 'negative' ? 'negative' : 'neutral'
   const keywordMessageVariant = keywordTone === 'positive' ? 'positive' : keywordTone === 'negative' ? 'negative' : 'neutral'
   const profileSyncBusy = profileSyncStatus === 'checking' || profileSyncStatus === 'saving' || profileSyncStatus === 'loading'
+  const reliabilitySourceById = new Map(dataReliability.sources.map((source) => [source.id, source]))
   const runtimeSources = [
     {
       id: 'runtime-quotes',
+      reliabilityId: 'quotes',
       name: '현재 시세/지수',
       status: quoteStatus as DataHealthStatus,
       source: '대시보드 수신 상태',
@@ -8372,6 +8433,7 @@ function SettingsPage({
     },
     {
       id: 'runtime-news',
+      reliabilityId: 'news',
       name: '현재 뉴스 피드',
       status: newsStatus as DataHealthStatus,
       source: '네이버 뉴스 수신 상태',
@@ -8382,6 +8444,7 @@ function SettingsPage({
     },
     {
       id: 'runtime-calendar',
+      reliabilityId: 'calendar',
       name: '현재 캘린더',
       status: calendarStatus as DataHealthStatus,
       source: '이벤트 캘린더 수신 상태',
@@ -8392,6 +8455,7 @@ function SettingsPage({
     },
     {
       id: 'runtime-disclosures',
+      reliabilityId: 'disclosures',
       name: '현재 공시 원문',
       status: disclosureStatus as DataHealthStatus,
       source: 'OpenDART 수신 상태',
@@ -8660,29 +8724,47 @@ function SettingsPage({
             <CardDescription>지금 화면이 실제로 받은 시세, 뉴스, 캘린더 상태</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            {runtimeSources.map((source) => (
-              <div key={source.id} className="rounded-md border border-border bg-muted/15 p-4">
-                <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                  <div>
-                    <div className="text-sm font-semibold">{source.name}</div>
-                    <div className="mt-1 text-xs text-muted-foreground">{source.source}</div>
+            {runtimeSources.map((source) => {
+              const diagnostic = reliabilitySourceById.get(source.reliabilityId as DataReliability['sources'][number]['id'])
+
+              return (
+                <div key={source.id} className="rounded-md border border-border bg-muted/15 p-4">
+                  <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <div className="text-sm font-semibold">{source.name}</div>
+                      <div className="mt-1 text-xs text-muted-foreground">{source.source}</div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge variant={diagnostic?.tone ?? dataHealthVariant(source.status)}>{diagnostic?.modeLabel ?? dataModeLabel(source.status)}</Badge>
+                      <Badge variant={dataHealthVariant(source.status)}>{dataHealthStatusLabel[source.status]}</Badge>
+                      <Badge variant="secondary">{source.metric}</Badge>
+                    </div>
                   </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Badge variant={dataHealthVariant(source.status)}>{dataHealthStatusLabel[source.status]}</Badge>
-                    <Badge variant="secondary">{source.metric}</Badge>
+                  <div className="text-sm leading-6 text-foreground/85">{source.summary}</div>
+                  <div className="mt-1 text-xs leading-5 text-muted-foreground">{source.detail}</div>
+                  {diagnostic ? (
+                    <div className="mt-3 grid gap-2 rounded-md border border-border bg-background/60 p-3 text-xs leading-5 text-muted-foreground">
+                      <div>
+                        <span className="text-foreground/80">호출 경로</span> · {diagnostic.endpoint}
+                      </div>
+                      <div>
+                        <span className="text-foreground/80">필요 설정</span> · {diagnostic.requiredConfig}
+                      </div>
+                      <div>
+                        <span className="text-foreground/80">다음 조치</span> · {diagnostic.nextAction}
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {source.coverage.map((item) => (
+                      <Badge key={item} variant="secondary">
+                        {item}
+                      </Badge>
+                    ))}
                   </div>
                 </div>
-                <div className="text-sm leading-6 text-foreground/85">{source.summary}</div>
-                <div className="mt-1 text-xs leading-5 text-muted-foreground">{source.detail}</div>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {source.coverage.map((item) => (
-                    <Badge key={item} variant="secondary">
-                      {item}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-            ))}
+              )
+            })}
           </CardContent>
         </Card>
 
@@ -8712,12 +8794,16 @@ function SettingsPage({
                     <div className="text-sm font-medium">{service.name}</div>
                     <div className="mt-1 text-xs text-muted-foreground">{service.source}</div>
                   </div>
-                  <Badge variant={dataHealthVariant(service.status)}>{dataHealthStatusLabel[service.status]}</Badge>
+                  <div className="flex flex-wrap justify-end gap-1.5">
+                    <Badge variant={service.configured ? 'positive' : 'negative'}>{service.configured ? '환경변수 OK' : '환경변수 필요'}</Badge>
+                    <Badge variant={dataHealthVariant(service.status)}>{dataHealthStatusLabel[service.status]}</Badge>
+                  </div>
                 </div>
                 <div className="mt-3 text-xs leading-5 text-foreground/80">{service.summary}</div>
                 <div className="mt-1 text-xs leading-5 text-muted-foreground">{service.nextAction}</div>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <Badge variant="secondary">{service.cadence}</Badge>
+                  {service.requiredEnv && service.requiredEnv.length > 0 ? <Badge variant="neutral">{service.requiredEnv.join(', ')}</Badge> : <Badge variant="neutral">추가 키 없음</Badge>}
                   {service.coverage.slice(0, 3).map((item) => (
                     <Badge key={item} variant="secondary">
                       {item}
@@ -9163,6 +9249,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         disclosureStatus={snapshot.disclosureStatus}
         disclosureMessage={snapshot.disclosureMessage}
         disclosureCount={snapshot.disclosures.length}
+        dataReliability={snapshot.dataReliability}
         backupData={snapshot.storedData}
         onImportDashboardData={actions.onImportDashboardData}
         onResetDashboardData={actions.onResetDashboardData}
