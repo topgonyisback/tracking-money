@@ -354,6 +354,17 @@ export type InvestmentJournal = {
   lastSavedAt: string | null
 }
 
+export type JournalHistoryItem = InvestmentJournal & {
+  id: string
+  archivedAt: string
+  forecastScore: number
+  forecastLabel: string
+  forecastSummary: string
+  completedActionCount: number
+  totalActionCount: number
+  topActionTitle: string | null
+}
+
 export type ActionMemo = {
   bullishScenario: string
   bearishScenario: string

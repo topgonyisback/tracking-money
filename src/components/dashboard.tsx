@@ -72,6 +72,7 @@ import type {
   ForecastReview,
   Holding,
   InvestmentJournal,
+  JournalHistoryItem,
   LiveNewsItem,
   MarketIndicator,
   MarketQuote,
@@ -210,6 +211,7 @@ type StoredDashboardData = {
   alertSettings: AlertSettings
   alertHistory: AlertHistoryItem[]
   journal: InvestmentJournal
+  journalHistory: JournalHistoryItem[]
 }
 
 type DashboardBackup = {
@@ -501,18 +503,37 @@ function createDefaultJournal(date = getKstDateKey()): InvestmentJournal {
   }
 }
 
-function normalizeJournal(rawJournal: unknown): InvestmentJournal {
+function normalizeJournalRecord(rawJournal: unknown): InvestmentJournal | null {
+  if (!isRecord(rawJournal)) return null
+
   const today = getKstDateKey()
-  if (!isRecord(rawJournal) || rawJournal.date !== today) return createDefaultJournal(today)
+  const date = textValue(rawJournal.date, today)
+  const normalizedDate = parseDateKey(date) ? date : today
 
   return {
-    date: textValue(rawJournal.date, today),
+    date: normalizedDate,
     preMarketPlan: textValue(rawJournal.preMarketPlan),
     riskPlan: textValue(rawJournal.riskPlan),
     afterMarketReview: textValue(rawJournal.afterMarketReview),
     completedActionIds: stringArrayValue(rawJournal.completedActionIds),
     lastSavedAt: typeof rawJournal.lastSavedAt === 'string' ? rawJournal.lastSavedAt : null,
   }
+}
+
+function hasJournalContent(journal: InvestmentJournal) {
+  return (
+    journal.preMarketPlan.trim().length > 0 ||
+    journal.riskPlan.trim().length > 0 ||
+    journal.afterMarketReview.trim().length > 0 ||
+    journal.completedActionIds.length > 0
+  )
+}
+
+function normalizeJournal(rawJournal: unknown): InvestmentJournal {
+  const today = getKstDateKey()
+  const journal = normalizeJournalRecord(rawJournal)
+  if (!journal || journal.date !== today) return createDefaultJournal(today)
+  return journal
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -626,6 +647,66 @@ function simpleHash(value: string) {
 
 function dedupeAlertHistory(items: AlertHistoryItem[]) {
   return Array.from(new Map(items.map((item) => [item.dedupeKey, item])).values())
+}
+
+function createJournalHistoryItem({
+  journal,
+  forecastReview,
+  actionQueue,
+}: {
+  journal: InvestmentJournal
+  forecastReview?: ForecastReview
+  actionQueue?: ActionQueueItem[]
+}): JournalHistoryItem {
+  const completedActionCount = actionQueue
+    ? journal.completedActionIds.filter((id) => actionQueue.some((item) => item.id === id)).length
+    : journal.completedActionIds.length
+  const topActionTitle = actionQueue?.[0]?.title ?? null
+  const archivedAt = new Date().toISOString()
+  const idSeed = `${journal.date}|${journal.preMarketPlan}|${journal.riskPlan}|${journal.afterMarketReview}|${journal.completedActionIds.join(',')}`
+
+  return {
+    ...journal,
+    id: `journal-${journal.date}-${simpleHash(idSeed)}`,
+    archivedAt,
+    forecastScore: forecastReview?.score ?? 0,
+    forecastLabel: forecastReview?.label ?? '수동 보관',
+    forecastSummary: forecastReview?.summary ?? '보관 시점의 예측 검증 요약이 없습니다.',
+    completedActionCount,
+    totalActionCount: actionQueue?.length ?? journal.completedActionIds.length,
+    topActionTitle,
+  }
+}
+
+function normalizeImportedJournalHistoryItem(value: unknown): JournalHistoryItem | null {
+  const journal = normalizeJournalRecord(value)
+  if (!journal) return null
+
+  const raw = isRecord(value) ? value : {}
+  const archivedAt = typeof raw.archivedAt === 'string' ? raw.archivedAt : journal.lastSavedAt ?? new Date().toISOString()
+  const idSeed = `${journal.date}|${journal.preMarketPlan}|${journal.riskPlan}|${journal.afterMarketReview}|${journal.completedActionIds.join(',')}`
+
+  return {
+    ...journal,
+    id: textValue(raw.id, `journal-${journal.date}-${simpleHash(idSeed)}`),
+    archivedAt,
+    forecastScore: clamp(numberValue(raw.forecastScore), 0, 100),
+    forecastLabel: textValue(raw.forecastLabel, '수동 보관'),
+    forecastSummary: textValue(raw.forecastSummary, '보관된 저널입니다.'),
+    completedActionCount: Math.max(0, Math.round(numberValue(raw.completedActionCount, journal.completedActionIds.length))),
+    totalActionCount: Math.max(0, Math.round(numberValue(raw.totalActionCount, journal.completedActionIds.length))),
+    topActionTitle: textValue(raw.topActionTitle) || null,
+  }
+}
+
+function dedupeJournalHistory(items: JournalHistoryItem[]) {
+  return Array.from(new Map(items.map((item) => [item.id, item])).values())
+    .sort((a, b) => {
+      const archivedDiff = new Date(b.archivedAt).getTime() - new Date(a.archivedAt).getTime()
+      if (Number.isFinite(archivedDiff) && archivedDiff !== 0) return archivedDiff
+      return b.date.localeCompare(a.date)
+    })
+    .slice(0, 60)
 }
 
 function normalizeImportedHolding(value: unknown): Holding | null {
@@ -759,6 +840,15 @@ function normalizeStoredDashboardData(value: unknown): StoredDashboardData | nul
   const candidate = isRecord(value) && isRecord(value.data) ? value.data : value
   if (!isRecord(candidate) || !Array.isArray(candidate.holdings) || !Array.isArray(candidate.watchlist)) return null
 
+  const rawJournal = normalizeJournalRecord(candidate.journal)
+  const staleJournalHistory =
+    rawJournal && rawJournal.date !== getKstDateKey() && hasJournalContent(rawJournal)
+      ? [createJournalHistoryItem({ journal: rawJournal })]
+      : []
+  const importedJournalHistory = Array.isArray(candidate.journalHistory)
+    ? candidate.journalHistory.map(normalizeImportedJournalHistoryItem).filter((item): item is JournalHistoryItem => item !== null)
+    : []
+
   return {
     holdings: dedupeBySymbol(candidate.holdings.map(normalizeImportedHolding).filter((item): item is Holding => item !== null)),
     watchlist: dedupeBySymbol(candidate.watchlist.map(normalizeImportedWatchItem).filter((item): item is WatchItem => item !== null)),
@@ -774,6 +864,7 @@ function normalizeStoredDashboardData(value: unknown): StoredDashboardData | nul
       ? dedupeAlertHistory(candidate.alertHistory.map(normalizeImportedAlertHistoryItem).filter((item): item is AlertHistoryItem => item !== null)).slice(0, 100)
       : [],
     journal: normalizeJournal(candidate.journal),
+    journalHistory: dedupeJournalHistory([...staleJournalHistory, ...importedJournalHistory]),
   }
 }
 
@@ -803,7 +894,7 @@ function parseDashboardBackup(rawJson: string): { ok: true; data: StoredDashboar
     return {
       ok: true,
       data,
-      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 개인 일정 ${data.calendarEvents.length}개, 뉴스 키워드 ${data.newsKeywords.length}개, 알림 ${data.alertRules.length}개, 기록 ${data.alertHistory.length}개, 투자노트를 가져왔습니다.`,
+      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 개인 일정 ${data.calendarEvents.length}개, 뉴스 키워드 ${data.newsKeywords.length}개, 알림 ${data.alertRules.length}개, 기록 ${data.alertHistory.length}개, 투자노트 ${data.journalHistory.length}개를 가져왔습니다.`,
     }
   } catch {
     return {
@@ -3078,6 +3169,7 @@ function buildDashboardSnapshot({
   alertRulesData,
   alertSettingsData,
   alertHistoryData,
+  journalHistoryData,
   quotes,
   fetchedAt,
   quoteStatus,
@@ -3100,6 +3192,7 @@ function buildDashboardSnapshot({
   alertRulesData: AlertRule[]
   alertSettingsData: AlertSettings
   alertHistoryData: AlertHistoryItem[]
+  journalHistoryData: JournalHistoryItem[]
   quotes: MarketQuote[]
   fetchedAt: string | null
   quoteStatus: QuoteStatus
@@ -3229,6 +3322,7 @@ function buildDashboardSnapshot({
       alertSettings: alertSettingsData,
       alertHistory: alertHistoryData,
       journal,
+      journalHistory: journalHistoryData,
     },
     leadingIndicators: liveIndicators,
     biasScore: liveBiasScore,
@@ -5674,9 +5768,88 @@ function JournalActionChecklist({
   )
 }
 
+function JournalHistoryPanel({
+  history,
+  canArchive,
+  onArchiveJournal,
+  onDeleteJournalHistory,
+  onClearJournalHistory,
+}: {
+  history: JournalHistoryItem[]
+  canArchive: boolean
+  onArchiveJournal: () => void
+  onDeleteJournalHistory: (id: string) => void
+  onClearJournalHistory: () => void
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle>복기 히스토리</CardTitle>
+            <CardDescription>날짜별 장전 계획, 실행률, 예측 검증 결과 보관</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button type="button" size="sm" onClick={onArchiveJournal} disabled={!canArchive}>
+              <Save className="size-4" />
+              오늘 기록 보관
+            </Button>
+            <Button type="button" variant="ghost" size="sm" className="text-negative hover:text-negative" onClick={onClearJournalHistory} disabled={history.length === 0}>
+              기록 비우기
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {history.length > 0 ? (
+          <div className="grid gap-3 lg:grid-cols-2">
+            {history.slice(0, 8).map((item) => (
+              <div key={item.id} className="rounded-md border border-border bg-muted/15 p-4">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="secondary">{item.date.slice(5).replace('-', '.')}</Badge>
+                    <Badge variant={forecastReviewTone(item.forecastScore)}>{item.forecastLabel}</Badge>
+                    <Badge variant="neutral">
+                      {item.completedActionCount}/{item.totalActionCount} 실행
+                    </Badge>
+                  </div>
+                  <Button type="button" variant="ghost" size="sm" className="text-negative hover:text-negative" onClick={() => onDeleteJournalHistory(item.id)}>
+                    <Trash2 className="size-4" />
+                    삭제
+                  </Button>
+                </div>
+                <div className="text-sm font-semibold leading-6">{item.forecastSummary}</div>
+                {item.topActionTitle ? <div className="mt-2 text-xs leading-5 text-muted-foreground">주요 액션: {item.topActionTitle}</div> : null}
+                {item.preMarketPlan ? (
+                  <div className="mt-3 rounded-md border border-border bg-background/70 p-3">
+                    <div className="mb-1 text-xs text-muted-foreground">장전 계획</div>
+                    <div className="text-sm leading-6">{item.preMarketPlan}</div>
+                  </div>
+                ) : null}
+                {item.afterMarketReview ? (
+                  <div className="mt-3 rounded-md border border-border bg-background/70 p-3">
+                    <div className="mb-1 text-xs text-muted-foreground">장후 리뷰</div>
+                    <div className="text-sm leading-6">{item.afterMarketReview}</div>
+                  </div>
+                ) : null}
+                <div className="mt-3 text-xs text-muted-foreground">보관 {formatMarketTime(item.archivedAt)}</div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-md border border-border bg-muted/15 p-4 text-sm leading-6 text-muted-foreground">
+            아직 보관된 복기 기록이 없습니다. 장후 리뷰를 작성한 뒤 오늘 기록을 보관하면 날짜별로 누적됩니다.
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 function NotesPage({
   actionQueue,
   journal,
+  journalHistory,
   biasScoreData,
   marketStatusData,
   morningBrief,
@@ -5685,9 +5858,13 @@ function NotesPage({
   onUpdateJournal,
   onToggleJournalAction,
   onResetJournal,
+  onArchiveJournal,
+  onDeleteJournalHistory,
+  onClearJournalHistory,
 }: {
   actionQueue: ActionQueueItem[]
   journal: InvestmentJournal
+  journalHistory: JournalHistoryItem[]
   biasScoreData: BiasScore
   marketStatusData: MarketStatusView
   morningBrief: MorningBrief
@@ -5696,8 +5873,12 @@ function NotesPage({
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
   onResetJournal: () => void
+  onArchiveJournal: () => void
+  onDeleteJournalHistory: (id: string) => void
+  onClearJournalHistory: () => void
 }) {
   const completedCount = journal.completedActionIds.filter((id) => actionQueue.some((item) => item.id === id)).length
+  const canArchiveJournal = hasJournalContent(journal)
 
   return (
     <PageGrid>
@@ -5705,7 +5886,7 @@ function NotesPage({
         <MetricCard label="저널 날짜" value={journal.date.slice(5).replace('-', '.')} detail="오늘 기록" />
         <MetricCard label="액션 완료" value={`${completedCount}/${actionQueue.length}`} detail="체크리스트" tone={completedCount > 0 ? 'positive' : 'neutral'} />
         <MetricCard label="방향점수" value={`+${biasScoreData.score}`} detail={`신뢰도 ${confidenceLabel[biasScoreData.confidence]}`} tone={biasScoreData.stance === 'pressure' ? 'negative' : biasScoreData.stance === 'neutral' ? 'neutral' : 'positive'} />
-        <MetricCard label="마지막 저장" value={formatSavedTime(journal.lastSavedAt)} detail="브라우저 저장" />
+        <MetricCard label="복기 기록" value={`${journalHistory.length}개`} detail={formatSavedTime(journal.lastSavedAt)} tone={journalHistory.length > 0 ? 'positive' : 'neutral'} />
       </section>
 
       <ActionQueuePanel
@@ -5808,6 +5989,14 @@ function NotesPage({
         actionQueue={actionQueue}
         journal={journal}
         onToggleAction={onToggleJournalAction}
+      />
+
+      <JournalHistoryPanel
+        history={journalHistory}
+        canArchive={canArchiveJournal}
+        onArchiveJournal={onArchiveJournal}
+        onDeleteJournalHistory={onDeleteJournalHistory}
+        onClearJournalHistory={onClearJournalHistory}
       />
 
       <section className="grid gap-4 xl:grid-cols-3">
@@ -5929,6 +6118,7 @@ function SettingsPage({
     { label: '알림 규칙', value: `${backupData.alertRules.length}개` },
     { label: '알림 기록', value: `${backupData.alertHistory.length}개` },
     { label: '투자노트', value: backupData.journal.date },
+    { label: '복기 기록', value: `${backupData.journalHistory.length}개` },
   ]
   const backupMessageVariant = backupTone === 'positive' ? 'positive' : backupTone === 'negative' ? 'negative' : 'neutral'
   const keywordMessageVariant = keywordTone === 'positive' ? 'positive' : keywordTone === 'negative' ? 'negative' : 'neutral'
@@ -6075,6 +6265,7 @@ function SettingsPage({
       alertSettings: defaultAlertSettings,
       alertHistory: [],
       journal: createDefaultJournal(),
+      journalHistory: [],
     }
     onResetDashboardData()
     setBackupText(formatDashboardBackup(resetData))
@@ -6499,7 +6690,7 @@ function SettingsPage({
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
                 <CardTitle>데이터 백업</CardTitle>
-                <CardDescription>보유종목, 관심종목, 뉴스 키워드, 알림 규칙, 알림 기록, 투자노트를 JSON 파일로 보관</CardDescription>
+                <CardDescription>보유종목, 관심종목, 개인 일정, 뉴스 키워드, 알림 규칙, 알림 기록, 투자노트와 복기 기록을 JSON 파일로 보관</CardDescription>
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button type="button" variant="outline" size="sm" onClick={handleDownloadBackup}>
@@ -6587,6 +6778,9 @@ type DashboardActions = {
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
   onResetJournal: () => void
+  onArchiveJournal: () => void
+  onDeleteJournalHistory: (id: string) => void
+  onClearJournalHistory: () => void
   onImportDashboardData: (data: StoredDashboardData) => void
   onResetDashboardData: () => void
 }
@@ -6687,6 +6881,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
       <NotesPage
         actionQueue={snapshot.actionQueue}
         journal={snapshot.journal}
+        journalHistory={snapshot.storedData.journalHistory}
         biasScoreData={snapshot.biasScore}
         marketStatusData={snapshot.marketStatus}
         morningBrief={snapshot.morningBrief}
@@ -6695,6 +6890,9 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         onUpdateJournal={actions.onUpdateJournal}
         onToggleJournalAction={actions.onToggleJournalAction}
         onResetJournal={actions.onResetJournal}
+        onArchiveJournal={actions.onArchiveJournal}
+        onDeleteJournalHistory={actions.onDeleteJournalHistory}
+        onClearJournalHistory={actions.onClearJournalHistory}
       />
     )
   }
@@ -6742,6 +6940,7 @@ export function Dashboard() {
   )
   const alertHistoryRef = useRef<AlertHistoryItem[]>([])
   const [journal, setJournal] = useState<InvestmentJournal>(() => createDefaultJournal())
+  const [journalHistory, setJournalHistory] = useState<JournalHistoryItem[]>([])
   const [storageLoaded, setStorageLoaded] = useState(false)
   const [quoteResponse, setQuoteResponse] = useState<QuotesApiResponse | null>(null)
   const [quoteStatus, setQuoteStatus] = useState<QuoteStatus>('idle')
@@ -6930,6 +7129,7 @@ export function Dashboard() {
       setUserAlertSettings(stored.alertSettings)
       setAlertHistory(stored.alertHistory)
       setJournal(stored.journal)
+      setJournalHistory(stored.journalHistory)
     }
     setStorageLoaded(true)
   }, [])
@@ -6945,8 +7145,9 @@ export function Dashboard() {
       alertSettings: userAlertSettings,
       alertHistory,
       journal,
+      journalHistory,
     })
-  }, [alertHistory, journal, storageLoaded, userAlertRules, userAlertSettings, userCalendarEvents, userHoldings, userNewsKeywords, userWatchlist])
+  }, [alertHistory, journal, journalHistory, storageLoaded, userAlertRules, userAlertSettings, userCalendarEvents, userHoldings, userNewsKeywords, userWatchlist])
 
   useEffect(() => {
     alertHistoryRef.current = alertHistory
@@ -7016,6 +7217,7 @@ export function Dashboard() {
         alertRulesData: userAlertRules,
         alertSettingsData: userAlertSettings,
         alertHistoryData: alertHistory,
+        journalHistoryData: journalHistory,
         fetchedAt: quoteResponse?.fetchedAt ?? null,
         quoteStatus,
         quoteMessage,
@@ -7040,6 +7242,7 @@ export function Dashboard() {
       disclosureStatus,
       liveNews,
       journal,
+      journalHistory,
       newsMessage,
       newsStatus,
       quoteMessage,
@@ -7219,6 +7422,27 @@ export function Dashboard() {
           lastSavedAt: new Date().toISOString(),
         })
       },
+      onArchiveJournal: () => {
+        const normalized = normalizeJournal(journal)
+        if (!hasJournalContent(normalized)) return
+
+        setJournalHistory((current) =>
+          dedupeJournalHistory([
+            createJournalHistoryItem({
+              journal: normalized,
+              forecastReview: snapshot.forecastReview,
+              actionQueue: snapshot.actionQueue,
+            }),
+            ...current,
+          ]),
+        )
+      },
+      onDeleteJournalHistory: (id) => {
+        setJournalHistory((current) => current.filter((item) => item.id !== id))
+      },
+      onClearJournalHistory: () => {
+        setJournalHistory([])
+      },
       onImportDashboardData: (data) => {
         setUserHoldings(data.holdings)
         setUserWatchlist(data.watchlist)
@@ -7228,6 +7452,7 @@ export function Dashboard() {
         setUserAlertSettings(data.alertSettings)
         setAlertHistory(data.alertHistory)
         setJournal(data.journal)
+        setJournalHistory(data.journalHistory)
         saveStoredDashboardData(data)
       },
       onResetDashboardData: () => {
@@ -7240,6 +7465,7 @@ export function Dashboard() {
         setUserAlertSettings(defaultAlertSettings)
         setAlertHistory([])
         setJournal(nextJournal)
+        setJournalHistory([])
         saveStoredDashboardData({
           holdings,
           watchlist,
@@ -7249,10 +7475,11 @@ export function Dashboard() {
           alertSettings: defaultAlertSettings,
           alertHistory: [],
           journal: nextJournal,
+          journalHistory: [],
         })
       },
     }),
-    [loadCalendar, loadDisclosures, loadLiveNews, notificationPermission],
+    [journal, loadCalendar, loadDisclosures, loadLiveNews, notificationPermission, snapshot.actionQueue, snapshot.forecastReview],
   )
 
   return (
