@@ -204,6 +204,7 @@ type MarketStatusView = typeof marketStatus
 type StoredDashboardData = {
   holdings: Holding[]
   watchlist: WatchItem[]
+  calendarEvents: CalendarEvent[]
   newsKeywords: string[]
   alertRules: AlertRule[]
   alertSettings: AlertSettings
@@ -544,6 +545,20 @@ function normalizeDirection(value: unknown): Direction {
   return value === 'positive' || value === 'negative' || value === 'neutral' || value === 'mixed' ? value : 'neutral'
 }
 
+function normalizeImportance(value: unknown): CalendarEvent['importance'] {
+  return value === 'high' || value === 'medium' || value === 'low' ? value : 'medium'
+}
+
+function normalizeCalendarEventType(value: unknown): CalendarEvent['type'] {
+  if (value === 'earnings' || value === 'macro' || value === 'policy' || value === 'company' || value === 'dividend') return value
+  return 'company'
+}
+
+function normalizeCalendarEventStatus(value: unknown): NonNullable<CalendarEvent['status']> {
+  if (value === 'confirmed' || value === 'estimated' || value === 'watch') return value
+  return 'watch'
+}
+
 function normalizeAlertRuleType(value: unknown): AlertRule['type'] {
   if (
     value === 'price-above' ||
@@ -567,6 +582,10 @@ function normalizeWatchStatus(value: unknown, targetBuyPrice: number, currentPri
 
 function dedupeBySymbol<T extends { symbol: string }>(items: T[]) {
   return Array.from(new Map(items.map((item) => [item.symbol, item])).values())
+}
+
+function dedupeCalendarEvents(items: CalendarEvent[]) {
+  return Array.from(new Map(items.map((item) => [item.id, item])).values())
 }
 
 function dedupeAlertRules(items: AlertRule[]) {
@@ -656,6 +675,37 @@ function normalizeImportedWatchItem(value: unknown): WatchItem | null {
   }
 }
 
+function normalizeImportedCalendarEvent(value: unknown): CalendarEvent | null {
+  if (!isRecord(value)) return null
+
+  const title = normalizeNewsKeyword(textValue(value.title))
+  if (!title) return null
+
+  const absoluteDate = textValue(value.absoluteDate, getKstDateKey())
+  const normalizedDate = parseDateKey(absoluteDate) ? absoluteDate : getKstDateKey()
+  const rawTime = textValue(value.time, '09:00')
+  const time = /^\d{2}:\d{2}$/.test(rawTime) ? rawTime : '09:00'
+  const relatedSymbols = stringArrayValue(value.relatedSymbols)
+    .map(normalizeUserSymbol)
+    .filter(Boolean)
+    .slice(0, 8)
+
+  return {
+    id: textValue(value.id, `user-calendar-${simpleHash(`${normalizedDate}-${time}-${title}`)}`),
+    date: textValue(value.date, formatCalendarDateLabel(normalizedDate)),
+    absoluteDate: normalizedDate,
+    time,
+    title,
+    type: normalizeCalendarEventType(value.type),
+    importance: normalizeImportance(value.importance),
+    relatedSymbols,
+    status: normalizeCalendarEventStatus(value.status),
+    confidence: value.confidence === 'high' || value.confidence === 'medium' || value.confidence === 'low' ? value.confidence : 'medium',
+    source: textValue(value.source, '개인 캘린더'),
+    description: textValue(value.description),
+  }
+}
+
 function normalizeImportedAlertRule(value: unknown): AlertRule | null {
   if (!isRecord(value)) return null
 
@@ -712,6 +762,9 @@ function normalizeStoredDashboardData(value: unknown): StoredDashboardData | nul
   return {
     holdings: dedupeBySymbol(candidate.holdings.map(normalizeImportedHolding).filter((item): item is Holding => item !== null)),
     watchlist: dedupeBySymbol(candidate.watchlist.map(normalizeImportedWatchItem).filter((item): item is WatchItem => item !== null)),
+    calendarEvents: Array.isArray(candidate.calendarEvents)
+      ? dedupeCalendarEvents(candidate.calendarEvents.map(normalizeImportedCalendarEvent).filter((item): item is CalendarEvent => item !== null)).slice(0, 60)
+      : [],
     newsKeywords: normalizeNewsKeywords(candidate.newsKeywords),
     alertRules: Array.isArray(candidate.alertRules)
       ? dedupeAlertRules(candidate.alertRules.map(normalizeImportedAlertRule).filter((item): item is AlertRule => item !== null))
@@ -750,7 +803,7 @@ function parseDashboardBackup(rawJson: string): { ok: true; data: StoredDashboar
     return {
       ok: true,
       data,
-      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 뉴스 키워드 ${data.newsKeywords.length}개, 알림 ${data.alertRules.length}개, 기록 ${data.alertHistory.length}개, 투자노트를 가져왔습니다.`,
+      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 개인 일정 ${data.calendarEvents.length}개, 뉴스 키워드 ${data.newsKeywords.length}개, 알림 ${data.alertRules.length}개, 기록 ${data.alertHistory.length}개, 투자노트를 가져왔습니다.`,
     }
   } catch {
     return {
@@ -883,6 +936,55 @@ function getKstDateKey(now = new Date()) {
   const month = String(kstNow.getMonth() + 1).padStart(2, '0')
   const day = String(kstNow.getDate()).padStart(2, '0')
   return `${year}-${month}-${day}`
+}
+
+function parseDateKey(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null
+  const [year, month, day] = value.split('-').map(Number)
+  const date = new Date(year, month - 1, day)
+  if (Number.isNaN(date.getTime())) return null
+  return date
+}
+
+function addDaysToDateKey(value: string, days: number) {
+  const date = parseDateKey(value)
+  if (!date) return value
+  date.setDate(date.getDate() + days)
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function formatCalendarDateLabel(absoluteDate: string) {
+  const today = getKstDateKey()
+  if (absoluteDate === today) return '오늘'
+  if (absoluteDate === addDaysToDateKey(today, 1)) return '내일'
+  const date = parseDateKey(absoluteDate)
+  if (!date) return absoluteDate || '날짜 확인'
+
+  return date.toLocaleDateString('ko-KR', {
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'short',
+  })
+}
+
+function calendarEventSortValue(event: CalendarEvent) {
+  const dateValue = event.absoluteDate ?? (event.date === '오늘' ? getKstDateKey() : event.date === '내일' ? addDaysToDateKey(getKstDateKey(), 1) : '9999-12-31')
+  return `${dateValue}T${event.time || '23:59'}`
+}
+
+function mergeCalendarEvents(apiEvents: CalendarEvent[], userEvents: CalendarEvent[]) {
+  return dedupeCalendarEvents([...apiEvents, ...userEvents])
+    .map((event) => {
+      if (!event.absoluteDate) return event
+      return {
+        ...event,
+        date: formatCalendarDateLabel(event.absoluteDate),
+      }
+    })
+    .sort((a, b) => calendarEventSortValue(a).localeCompare(calendarEventSortValue(b)))
 }
 
 function isTodayCalendarEvent(event: CalendarEvent) {
@@ -2971,6 +3073,7 @@ function buildExecutionPlan({
 function buildDashboardSnapshot({
   baseHoldings,
   baseWatchlist,
+  userCalendarEvents,
   newsKeywordsData,
   alertRulesData,
   alertSettingsData,
@@ -2992,6 +3095,7 @@ function buildDashboardSnapshot({
 }: {
   baseHoldings: Holding[]
   baseWatchlist: WatchItem[]
+  userCalendarEvents: CalendarEvent[]
   newsKeywordsData: string[]
   alertRulesData: AlertRule[]
   alertSettingsData: AlertSettings
@@ -3119,6 +3223,7 @@ function buildDashboardSnapshot({
     storedData: {
       holdings: baseHoldings,
       watchlist: baseWatchlist,
+      calendarEvents: userCalendarEvents,
       newsKeywords: newsKeywordsData,
       alertRules: alertRulesData,
       alertSettings: alertSettingsData,
@@ -4868,17 +4973,96 @@ function DisclosuresPage({
   )
 }
 
+type CalendarEventFormState = {
+  id: string | null
+  absoluteDate: string
+  time: string
+  title: string
+  type: CalendarEvent['type']
+  importance: CalendarEvent['importance']
+  status: NonNullable<CalendarEvent['status']>
+  relatedSymbols: string
+  description: string
+}
+
+function createEmptyCalendarEventForm(): CalendarEventFormState {
+  return {
+    id: null,
+    absoluteDate: getKstDateKey(),
+    time: '09:00',
+    title: '',
+    type: 'company',
+    importance: 'medium',
+    status: 'watch',
+    relatedSymbols: '',
+    description: '',
+  }
+}
+
+function calendarEventToForm(event: CalendarEvent): CalendarEventFormState {
+  return {
+    id: event.id,
+    absoluteDate: event.absoluteDate ?? getKstDateKey(),
+    time: event.time,
+    title: event.title,
+    type: event.type,
+    importance: event.importance,
+    status: normalizeCalendarEventStatus(event.status),
+    relatedSymbols: event.relatedSymbols.join(', '),
+    description: event.description ?? '',
+  }
+}
+
+function formToCalendarEvent(form: CalendarEventFormState, existing?: CalendarEvent): CalendarEvent {
+  const absoluteDate = parseDateKey(form.absoluteDate) ? form.absoluteDate : getKstDateKey()
+  const title = normalizeNewsKeyword(form.title) || '개인 이벤트'
+  const time = /^\d{2}:\d{2}$/.test(form.time) ? form.time : '09:00'
+  const relatedSymbols = form.relatedSymbols
+    .split(',')
+    .map(normalizeUserSymbol)
+    .filter(Boolean)
+    .slice(0, 8)
+
+  return {
+    id: existing?.id ?? form.id ?? `user-calendar-${Date.now()}`,
+    date: formatCalendarDateLabel(absoluteDate),
+    absoluteDate,
+    time,
+    title,
+    type: form.type,
+    importance: form.importance,
+    relatedSymbols,
+    status: form.status,
+    confidence: 'medium',
+    source: '개인 캘린더',
+    description: normalizeNewsKeyword(form.description),
+  }
+}
+
+function isPersonalCalendarEvent(event: CalendarEvent) {
+  return event.source === '개인 캘린더' || event.id.startsWith('user-calendar-')
+}
+
 function CalendarPage({
   eventsData,
+  personalEvents,
   calendarStatus,
   calendarMessage,
   onRefreshCalendar,
+  onSaveCalendarEvent,
+  onDeleteCalendarEvent,
+  onResetCalendarEvents,
 }: {
   eventsData: CalendarEvent[]
+  personalEvents: CalendarEvent[]
   calendarStatus: CalendarStatus
   calendarMessage: string
   onRefreshCalendar: () => void
+  onSaveCalendarEvent: (event: CalendarEvent, previousId?: string) => void
+  onDeleteCalendarEvent: (id: string) => void
+  onResetCalendarEvents: () => void
 }) {
+  const [form, setForm] = useState<CalendarEventFormState>(() => createEmptyCalendarEventForm())
   const todayEvents = eventsData.filter(isTodayCalendarEvent)
   const earningsEvents = eventsData.filter((event) => event.type === 'earnings')
   const macroEvents = eventsData.filter((event) => event.type !== 'earnings')
@@ -4899,25 +5083,27 @@ function CalendarPage({
         <MetricCard label="매크로/정책" value={`${macroEvents.length}건`} detail={statusLabel} tone={calendarStatus === 'error' ? 'negative' : calendarStatus === 'ready' ? 'positive' : 'neutral'} />
       </section>
 
-      <Card>
-        <CardHeader>
-          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-            <div>
-              <CardTitle>이벤트 타임라인</CardTitle>
-              <CardDescription>종목과 지표에 연결된 일정</CardDescription>
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+        <Card>
+          <CardHeader>
+            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+              <div>
+                <CardTitle>이벤트 타임라인</CardTitle>
+                <CardDescription>자동 수집 일정과 개인 일정을 함께 표시</CardDescription>
+              </div>
+              <Button type="button" variant="outline" size="sm" onClick={onRefreshCalendar} disabled={calendarStatus === 'loading'}>
+                <RefreshCw className={cn('size-4', calendarStatus === 'loading' && 'animate-spin')} />
+                새로고침
+              </Button>
             </div>
-            <Button type="button" variant="outline" size="sm" onClick={onRefreshCalendar} disabled={calendarStatus === 'loading'}>
-              <RefreshCw className={cn('size-4', calendarStatus === 'loading' && 'animate-spin')} />
-              새로고침
-            </Button>
-          </div>
-        </CardHeader>
-        <CardContent>
+          </CardHeader>
+          <CardContent>
           <div className="mb-4 flex flex-wrap items-center gap-2">
             <Badge variant={calendarStatus === 'ready' ? 'positive' : calendarStatus === 'error' ? 'negative' : 'neutral'}>{statusLabel}</Badge>
+            <Badge variant="secondary">개인 일정 {personalEvents.length}개</Badge>
             <span className="text-xs text-muted-foreground">{calendarMessage}</span>
           </div>
-          <div className="grid gap-3 lg:grid-cols-3">
+          <div className="grid gap-3 lg:grid-cols-2">
             {eventsData.map((event) => (
               <div key={event.id} className="rounded-md border border-border bg-muted/15 p-4">
                 <div className="mb-3 flex flex-wrap items-center gap-2">
@@ -4940,11 +5126,144 @@ function CalendarPage({
                     </Badge>
                   ))}
                 </div>
+                {isPersonalCalendarEvent(event) ? (
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <Button type="button" size="sm" variant="outline" onClick={() => setForm(calendarEventToForm(event))}>
+                      <Pencil className="size-4" />
+                      수정
+                    </Button>
+                    <Button type="button" size="sm" variant="ghost" className="text-negative hover:text-negative" onClick={() => onDeleteCalendarEvent(event.id)}>
+                      <Trash2 className="size-4" />
+                      삭제
+                    </Button>
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>
-        </CardContent>
-      </Card>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>{form.id ? '개인 일정 수정' : '개인 일정 추가'}</CardTitle>
+            <CardDescription>실적, FOMC, 환율 이벤트, 종목 메모를 직접 등록</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form
+              className="space-y-3"
+              onSubmit={(event) => {
+                event.preventDefault()
+                const existing = form.id ? personalEvents.find((item) => item.id === form.id) : undefined
+                onSaveCalendarEvent(formToCalendarEvent(form, existing), form.id ?? undefined)
+                setForm(createEmptyCalendarEventForm())
+              }}
+            >
+              <label className="block text-sm">
+                <span className="mb-1 block text-xs text-muted-foreground">제목</span>
+                <input
+                  className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                  value={form.title}
+                  onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))}
+                  placeholder="예: 엔비디아 실적 발표"
+                />
+              </label>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="block text-sm">
+                  <span className="mb-1 block text-xs text-muted-foreground">날짜</span>
+                  <input
+                    type="date"
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                    value={form.absoluteDate}
+                    onChange={(event) => setForm((current) => ({ ...current, absoluteDate: event.target.value }))}
+                  />
+                </label>
+                <label className="block text-sm">
+                  <span className="mb-1 block text-xs text-muted-foreground">시간</span>
+                  <input
+                    type="time"
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                    value={form.time}
+                    onChange={(event) => setForm((current) => ({ ...current, time: event.target.value }))}
+                  />
+                </label>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <label className="block text-sm">
+                  <span className="mb-1 block text-xs text-muted-foreground">유형</span>
+                  <select
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                    value={form.type}
+                    onChange={(event) => setForm((current) => ({ ...current, type: normalizeCalendarEventType(event.target.value) }))}
+                  >
+                    {Object.entries(calendarTypeLabel).map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block text-sm">
+                  <span className="mb-1 block text-xs text-muted-foreground">중요도</span>
+                  <select
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                    value={form.importance}
+                    onChange={(event) => setForm((current) => ({ ...current, importance: normalizeImportance(event.target.value) }))}
+                  >
+                    <option value="high">높음</option>
+                    <option value="medium">보통</option>
+                    <option value="low">낮음</option>
+                  </select>
+                </label>
+                <label className="block text-sm">
+                  <span className="mb-1 block text-xs text-muted-foreground">상태</span>
+                  <select
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                    value={form.status}
+                    onChange={(event) => setForm((current) => ({ ...current, status: normalizeCalendarEventStatus(event.target.value) }))}
+                  >
+                    {Object.entries(calendarStatusLabel).map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <label className="block text-sm">
+                <span className="mb-1 block text-xs text-muted-foreground">관련 심볼</span>
+                <input
+                  className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-primary"
+                  value={form.relatedSymbols}
+                  onChange={(event) => setForm((current) => ({ ...current, relatedSymbols: event.target.value }))}
+                  placeholder="예: NVDA, SOX, NQ=F"
+                />
+              </label>
+              <label className="block text-sm">
+                <span className="mb-1 block text-xs text-muted-foreground">메모</span>
+                <textarea
+                  className="min-h-24 w-full rounded-md border border-border bg-background px-3 py-2 text-sm leading-6 outline-none transition focus:border-primary"
+                  value={form.description}
+                  onChange={(event) => setForm((current) => ({ ...current, description: event.target.value }))}
+                  placeholder="발표 전후 확인할 조건이나 포지션 메모"
+                />
+              </label>
+              <div className="flex flex-wrap gap-2">
+                <Button type="submit">
+                  <Save className="size-4" />
+                  저장
+                </Button>
+                <Button type="button" variant="outline" onClick={() => setForm(createEmptyCalendarEventForm())}>
+                  새 입력
+                </Button>
+                <Button type="button" variant="ghost" className="text-negative hover:text-negative" onClick={onResetCalendarEvents} disabled={personalEvents.length === 0}>
+                  개인 일정 초기화
+                </Button>
+              </div>
+            </form>
+          </CardContent>
+        </Card>
+      </section>
     </PageGrid>
   )
 }
@@ -5605,6 +5924,7 @@ function SettingsPage({
   const backupStats = [
     { label: '보유종목', value: `${backupData.holdings.length}개` },
     { label: '관심종목', value: `${backupData.watchlist.length}개` },
+    { label: '개인 일정', value: `${backupData.calendarEvents.length}개` },
     { label: '뉴스 키워드', value: `${backupData.newsKeywords.length}개` },
     { label: '알림 규칙', value: `${backupData.alertRules.length}개` },
     { label: '알림 기록', value: `${backupData.alertHistory.length}개` },
@@ -5641,8 +5961,8 @@ function SettingsPage({
       source: '이벤트 캘린더 수신 상태',
       metric: `${calendarEventCount}개`,
       summary: calendarMessage,
-      detail: '장전 점검과 이벤트가 액션 큐에 반영됩니다.',
-      coverage: ['매크로', '정책', '실적 구간'],
+      detail: backupData.calendarEvents.length > 0 ? `개인 일정 ${backupData.calendarEvents.length}개까지 액션 큐에 반영됩니다.` : '장전 점검과 이벤트가 액션 큐에 반영됩니다.',
+      coverage: ['매크로', '정책', '실적', '개인 일정'],
     },
     {
       id: 'runtime-disclosures',
@@ -5749,6 +6069,7 @@ function SettingsPage({
     const resetData = {
       holdings,
       watchlist,
+      calendarEvents: [],
       newsKeywords: defaultNewsKeywords,
       alertRules: defaultAlertRules,
       alertSettings: defaultAlertSettings,
@@ -6118,7 +6439,7 @@ function SettingsPage({
           <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
             <div>
               <CardTitle>서버 동기화</CardTitle>
-              <CardDescription>다른 기기에서도 같은 보유종목, 관심종목, 뉴스 키워드, 알림 규칙, 알림 기록, 투자노트 사용</CardDescription>
+              <CardDescription>다른 기기에서도 같은 보유종목, 관심종목, 개인 일정, 뉴스 키워드, 알림 규칙, 알림 기록, 투자노트 사용</CardDescription>
             </div>
             <Button type="button" variant="outline" size="sm" onClick={() => void loadProfileSyncStatus()} disabled={profileSyncBusy}>
               <RefreshCw className={cn('size-4', profileSyncStatus === 'checking' && 'animate-spin')} />
@@ -6154,7 +6475,7 @@ function SettingsPage({
           <div className="grid gap-3 md:grid-cols-4">
             <div className="rounded-md border border-border bg-muted/15 p-3">
               <div className="text-xs text-muted-foreground">저장 대상</div>
-              <div className="mt-2 text-sm font-semibold">보유/관심/키워드/알림/기록/노트</div>
+              <div className="mt-2 text-sm font-semibold">보유/관심/일정/키워드/알림/노트</div>
             </div>
             <div className="rounded-md border border-border bg-muted/15 p-3">
               <div className="text-xs text-muted-foreground">서버 저장소</div>
@@ -6248,6 +6569,9 @@ type DashboardActions = {
   onSaveWatchItem: (item: WatchItem, previousSymbol?: string) => void
   onDeleteWatchItem: (symbol: string) => void
   onResetWatchlist: () => void
+  onSaveCalendarEvent: (event: CalendarEvent, previousId?: string) => void
+  onDeleteCalendarEvent: (id: string) => void
+  onResetCalendarEvents: () => void
   onRefreshNews: () => void
   onRefreshDisclosures: () => void
   onRefreshCalendar: () => void
@@ -6328,9 +6652,13 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
     return (
       <CalendarPage
         eventsData={snapshot.calendarEvents}
+        personalEvents={snapshot.storedData.calendarEvents}
         calendarStatus={snapshot.calendarStatus}
         calendarMessage={snapshot.calendarMessage}
         onRefreshCalendar={actions.onRefreshCalendar}
+        onSaveCalendarEvent={actions.onSaveCalendarEvent}
+        onDeleteCalendarEvent={actions.onDeleteCalendarEvent}
+        onResetCalendarEvents={actions.onResetCalendarEvents}
       />
     )
   }
@@ -6404,6 +6732,7 @@ export function Dashboard() {
   const [activePage, setActivePage] = useState<PageId>('dashboard')
   const [userHoldings, setUserHoldings] = useState<Holding[]>(holdings)
   const [userWatchlist, setUserWatchlist] = useState<WatchItem[]>(watchlist)
+  const [userCalendarEvents, setUserCalendarEvents] = useState<CalendarEvent[]>([])
   const [userNewsKeywords, setUserNewsKeywords] = useState<string[]>(defaultNewsKeywords)
   const [userAlertRules, setUserAlertRules] = useState<AlertRule[]>(defaultAlertRules)
   const [userAlertSettings, setUserAlertSettings] = useState<AlertSettings>(defaultAlertSettings)
@@ -6595,6 +6924,7 @@ export function Dashboard() {
     if (stored) {
       setUserHoldings(stored.holdings)
       setUserWatchlist(stored.watchlist)
+      setUserCalendarEvents(stored.calendarEvents)
       setUserNewsKeywords(stored.newsKeywords)
       setUserAlertRules(stored.alertRules)
       setUserAlertSettings(stored.alertSettings)
@@ -6609,13 +6939,14 @@ export function Dashboard() {
     saveStoredDashboardData({
       holdings: userHoldings,
       watchlist: userWatchlist,
+      calendarEvents: userCalendarEvents,
       newsKeywords: userNewsKeywords,
       alertRules: userAlertRules,
       alertSettings: userAlertSettings,
       alertHistory,
       journal,
     })
-  }, [alertHistory, journal, storageLoaded, userAlertRules, userAlertSettings, userHoldings, userNewsKeywords, userWatchlist])
+  }, [alertHistory, journal, storageLoaded, userAlertRules, userAlertSettings, userCalendarEvents, userHoldings, userNewsKeywords, userWatchlist])
 
   useEffect(() => {
     alertHistoryRef.current = alertHistory
@@ -6674,11 +7005,13 @@ export function Dashboard() {
   }, [loadDisclosures])
 
   const snapshot = useMemo(
-    () =>
-      buildDashboardSnapshot({
+    () => {
+      const automaticCalendarEvents = calendarResponse?.events.length ? calendarResponse.events : fallbackCalendarEvents
+      return buildDashboardSnapshot({
         quotes: quoteResponse?.quotes ?? [],
         baseHoldings: userHoldings,
         baseWatchlist: userWatchlist,
+        userCalendarEvents,
         newsKeywordsData: userNewsKeywords,
         alertRulesData: userAlertRules,
         alertSettingsData: userAlertSettings,
@@ -6686,7 +7019,7 @@ export function Dashboard() {
         fetchedAt: quoteResponse?.fetchedAt ?? null,
         quoteStatus,
         quoteMessage,
-        calendarEventsData: calendarResponse?.events.length ? calendarResponse.events : fallbackCalendarEvents,
+        calendarEventsData: mergeCalendarEvents(automaticCalendarEvents, userCalendarEvents),
         calendarStatus,
         calendarMessage,
         liveNews,
@@ -6696,7 +7029,8 @@ export function Dashboard() {
         disclosureStatus,
         disclosureMessage,
         journal,
-      }),
+      })
+    },
     [
       calendarMessage,
       calendarResponse,
@@ -6714,6 +7048,7 @@ export function Dashboard() {
       alertHistory,
       userAlertRules,
       userAlertSettings,
+      userCalendarEvents,
       userHoldings,
       userNewsKeywords,
       userWatchlist,
@@ -6784,6 +7119,19 @@ export function Dashboard() {
       },
       onResetWatchlist: () => {
         setUserWatchlist(watchlist)
+      },
+      onSaveCalendarEvent: (event, previousId) => {
+        setUserCalendarEvents((current) => {
+          const removeId = previousId ?? event.id
+          const remaining = current.filter((item) => item.id !== removeId && item.id !== event.id)
+          return mergeCalendarEvents([], [...remaining, event]).slice(0, 60)
+        })
+      },
+      onDeleteCalendarEvent: (id) => {
+        setUserCalendarEvents((current) => current.filter((event) => event.id !== id))
+      },
+      onResetCalendarEvents: () => {
+        setUserCalendarEvents([])
       },
       onRefreshNews: () => {
         void loadLiveNews()
@@ -6874,6 +7222,7 @@ export function Dashboard() {
       onImportDashboardData: (data) => {
         setUserHoldings(data.holdings)
         setUserWatchlist(data.watchlist)
+        setUserCalendarEvents(data.calendarEvents)
         setUserNewsKeywords(data.newsKeywords)
         setUserAlertRules(data.alertRules)
         setUserAlertSettings(data.alertSettings)
@@ -6885,6 +7234,7 @@ export function Dashboard() {
         const nextJournal = createDefaultJournal()
         setUserHoldings(holdings)
         setUserWatchlist(watchlist)
+        setUserCalendarEvents([])
         setUserNewsKeywords(defaultNewsKeywords)
         setUserAlertRules(defaultAlertRules)
         setUserAlertSettings(defaultAlertSettings)
@@ -6893,6 +7243,7 @@ export function Dashboard() {
         saveStoredDashboardData({
           holdings,
           watchlist,
+          calendarEvents: [],
           newsKeywords: defaultNewsKeywords,
           alertRules: defaultAlertRules,
           alertSettings: defaultAlertSettings,
