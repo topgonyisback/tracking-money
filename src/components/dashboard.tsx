@@ -74,6 +74,7 @@ const navItems = [
   { id: 'holdings', label: '보유종목', subtitle: '보유 비중, 손익, 이슈 영향', icon: WalletCards },
   { id: 'watchlist', label: '관심종목', subtitle: '매수가 조건과 이슈 트리거', icon: Star },
   { id: 'radar', label: '시장 레이더', subtitle: '선행 지표와 국내장 연결', icon: Radar },
+  { id: 'forecast', label: '예측', subtitle: '내일장 시나리오와 조건', icon: LineChart },
   { id: 'news', label: '뉴스', subtitle: '종목별 이슈와 영향도', icon: Newspaper },
   { id: 'disclosures', label: '공시', subtitle: 'DART 공시와 실적 원문', icon: FileText },
   { id: 'calendar', label: '캘린더', subtitle: '실적, 매크로, 정책 일정', icon: CalendarDays },
@@ -141,6 +142,38 @@ type DisclosureApiResponse = {
   message?: string
 }
 
+type ForecastScenario = {
+  id: 'base' | 'upside' | 'downside'
+  label: string
+  score: number
+  probability: number
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  summary: string
+  triggers: string[]
+  action: string
+}
+
+type ForecastImpact = {
+  id: string
+  label: string
+  source: 'indicator' | 'news' | 'disclosure' | 'calendar' | 'portfolio'
+  impact: number
+  direction: Direction
+  reason: string
+  relatedSymbols: string[]
+}
+
+type MarketForecast = {
+  baseScore: number
+  openingBias: string
+  expectedOpenRange: string
+  confidence: 'low' | 'medium' | 'high'
+  summary: string
+  scenarios: ForecastScenario[]
+  impacts: ForecastImpact[]
+  checklist: string[]
+}
+
 type MarketStatusView = typeof marketStatus
 type StoredDashboardData = {
   holdings: Holding[]
@@ -174,6 +207,7 @@ type DashboardSnapshot = {
   disclosures: DisclosureItem[]
   disclosureStatus: DisclosureStatus
   disclosureMessage: string
+  forecast: MarketForecast
   actionQueue: ActionQueueItem[]
   journal: InvestmentJournal
 }
@@ -794,6 +828,276 @@ function applyNewsBiasFactor(score: BiasScore, factor: BiasScore['positives'][nu
   }
 }
 
+function signedDirection(value: number): Direction {
+  if (value > 0) return 'positive'
+  if (value < 0) return 'negative'
+  return 'neutral'
+}
+
+function disclosureImpact(item: DisclosureItem) {
+  const importanceWeight = item.importance === 'high' ? 9 : item.importance === 'medium' ? 5 : 3
+  if (item.direction === 'positive') return importanceWeight
+  if (item.direction === 'negative') return -importanceWeight
+  if (item.direction === 'mixed') return -Math.round(importanceWeight * 0.55)
+  return item.importance === 'high' ? 3 : 1
+}
+
+function calendarImpact(event: CalendarEvent) {
+  const highWeight = event.importance === 'high' ? 9 : event.importance === 'medium' ? 5 : 2
+  const todayWeight = isTodayCalendarEvent(event) ? 1.25 : 1
+  return -Math.round(highWeight * todayWeight)
+}
+
+function holdingImpactForForecast(holding: Holding) {
+  const directionWeight = holding.impact === 'positive' ? 1 : holding.impact === 'negative' ? -1 : holding.impact === 'mixed' ? -0.35 : 0
+  return Math.round(directionWeight * Math.min(10, Math.max(2, holding.portfolioWeight / 4)))
+}
+
+function buildForecastImpacts({
+  biasScoreData,
+  holdingsData,
+  newsItems,
+  eventsData,
+  disclosures,
+}: {
+  biasScoreData: BiasScore
+  holdingsData: Holding[]
+  newsItems: LiveNewsItem[]
+  eventsData: CalendarEvent[]
+  disclosures: DisclosureItem[]
+}): ForecastImpact[] {
+  const indicatorImpacts = [...biasScoreData.positives, ...biasScoreData.risks]
+    .filter((factor) => factor.impact !== 0)
+    .map((factor) => ({
+      id: `indicator-${factor.label}`,
+      label: factor.label,
+      source: 'indicator' as const,
+      impact: factor.impact,
+      direction: signedDirection(factor.impact),
+      reason: `방향점수에 ${factor.impact > 0 ? '+' : ''}${factor.impact}점 반영된 선행지표입니다.`,
+      relatedSymbols: [factor.label],
+    }))
+
+  const newsImpacts = newsItems
+    .slice(0, 8)
+    .map((item) => {
+      const impact = clamp(Math.round(newsItemImpact(item) * 5), -12, 12)
+      return {
+        id: `news-${item.id}`,
+        label: item.keyword,
+        source: 'news' as const,
+        impact,
+        direction: item.direction,
+        reason: item.title,
+        relatedSymbols: item.relatedSymbols.length > 0 ? item.relatedSymbols : [item.keyword],
+      }
+    })
+    .filter((item) => item.impact !== 0 || item.direction !== 'neutral')
+
+  const disclosureImpacts = disclosures.slice(0, 8).map((item) => {
+    const impact = disclosureImpact(item)
+    return {
+      id: `disclosure-${item.id}`,
+      label: `${item.corpName} 공시`,
+      source: 'disclosure' as const,
+      impact,
+      direction: signedDirection(impact),
+      reason: item.reportName,
+      relatedSymbols: [item.symbol, item.sector],
+    }
+  })
+
+  const calendarImpacts = eventsData
+    .filter((event) => isTodayCalendarEvent(event) || event.importance === 'high')
+    .slice(0, 6)
+    .map((event) => {
+      const impact = calendarImpact(event)
+      return {
+        id: `calendar-${event.id}`,
+        label: event.title,
+        source: 'calendar' as const,
+        impact,
+        direction: signedDirection(impact),
+        reason: event.description ?? '발표 전후 변동성 확대 가능성이 있는 일정입니다.',
+        relatedSymbols: event.relatedSymbols,
+      }
+    })
+
+  const portfolioImpacts = holdingsData
+    .filter((holding) => holding.impact !== 'neutral' || holding.portfolioWeight >= 25)
+    .map((holding) => {
+      const impact = holdingImpactForForecast(holding)
+      return {
+        id: `portfolio-${holding.symbol}`,
+        label: `${holding.name} 비중`,
+        source: 'portfolio' as const,
+        impact,
+        direction: signedDirection(impact),
+        reason: `${holding.portfolioWeight}% 비중, 당일 ${formatChange(holding.dayChange)} 흐름입니다.`,
+        relatedSymbols: [holding.symbol],
+      }
+    })
+
+  return [...indicatorImpacts, ...newsImpacts, ...disclosureImpacts, ...calendarImpacts, ...portfolioImpacts]
+    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
+    .slice(0, 12)
+}
+
+function normalizeScenarioProbabilities(rawBase: number, rawUpside: number, rawDownside: number) {
+  const total = rawBase + rawUpside + rawDownside
+  const base = Math.round((rawBase / total) * 100)
+  const upside = Math.round((rawUpside / total) * 100)
+  return {
+    base,
+    upside,
+    downside: Math.max(0, 100 - base - upside),
+  }
+}
+
+function forecastConfidence({
+  biasScoreData,
+  quoteStatus,
+  newsStatus,
+  disclosureStatus,
+  calendarStatus,
+}: {
+  biasScoreData: BiasScore
+  quoteStatus: QuoteStatus
+  newsStatus: NewsStatus
+  disclosureStatus: DisclosureStatus
+  calendarStatus: CalendarStatus
+}): MarketForecast['confidence'] {
+  const statusScore =
+    (quoteStatus === 'ready' ? 2 : quoteStatus === 'partial' ? 1 : 0) +
+    (newsStatus === 'ready' ? 1 : 0) +
+    (disclosureStatus === 'ready' || disclosureStatus === 'partial' ? 1 : 0) +
+    (calendarStatus === 'ready' ? 1 : 0)
+  const biasScoreValue = biasScoreData.confidence === 'high' ? 2 : biasScoreData.confidence === 'medium' ? 1 : 0
+  const total = statusScore + biasScoreValue
+
+  if (total >= 5) return 'high'
+  if (total >= 3) return 'medium'
+  return 'low'
+}
+
+function buildMarketForecast({
+  biasScoreData,
+  holdingsData,
+  newsItems,
+  eventsData,
+  disclosures,
+  quoteStatus,
+  newsStatus,
+  disclosureStatus,
+  calendarStatus,
+}: {
+  biasScoreData: BiasScore
+  holdingsData: Holding[]
+  newsItems: LiveNewsItem[]
+  eventsData: CalendarEvent[]
+  disclosures: DisclosureItem[]
+  quoteStatus: QuoteStatus
+  newsStatus: NewsStatus
+  disclosureStatus: DisclosureStatus
+  calendarStatus: CalendarStatus
+}): MarketForecast {
+  const impacts = buildForecastImpacts({ biasScoreData, holdingsData, newsItems, eventsData, disclosures })
+  const positiveSum = impacts.filter((item) => item.impact > 0).reduce((sum, item) => sum + item.impact, 0)
+  const negativeSum = Math.abs(impacts.filter((item) => item.impact < 0).reduce((sum, item) => sum + item.impact, 0))
+  const baseScore = biasScoreData.score
+  const upsideScore = clamp(Math.round(baseScore + Math.min(22, 7 + positiveSum * 0.35)), 0, 100)
+  const downsideScore = clamp(Math.round(baseScore - Math.min(24, 7 + negativeSum * 0.35)), 0, 100)
+  const rawUpside = Math.max(12, 36 + (baseScore - 50) * 0.45 + positiveSum * 0.18 - negativeSum * 0.12)
+  const rawDownside = Math.max(12, 34 + (50 - baseScore) * 0.45 + negativeSum * 0.2 - positiveSum * 0.1)
+  const rawBase = Math.max(18, 44 - Math.abs(baseScore - 50) * 0.18)
+  const probabilities = normalizeScenarioProbabilities(rawBase, rawUpside, rawDownside)
+  const topPositive = impacts.find((item) => item.impact > 0)
+  const topRisk = impacts.find((item) => item.impact < 0)
+  const openingBias =
+    baseScore >= 68
+      ? '상승 우위'
+      : baseScore >= 58
+        ? '강보합 우위'
+        : baseScore >= 45
+          ? '보합권 탐색'
+          : baseScore >= 35
+            ? '약세 압력'
+            : '방어 우선'
+  const expectedOpenRange =
+    baseScore >= 68
+      ? '+0.4% ~ +1.0%'
+      : baseScore >= 58
+        ? '+0.1% ~ +0.6%'
+        : baseScore >= 45
+          ? '-0.3% ~ +0.3%'
+          : baseScore >= 35
+            ? '-0.7% ~ -0.1%'
+            : '-1.2% ~ -0.5%'
+  const confidence = forecastConfidence({ biasScoreData, quoteStatus, newsStatus, disclosureStatus, calendarStatus })
+  const checklist = [
+    topPositive ? `${topPositive.label} 유지 여부` : 'NQ=F와 SOX 방향 확인',
+    topRisk ? `${topRisk.label} 완화 여부` : 'USD/KRW와 VIX 급변 여부',
+    '개장 30분 외국인 선물 수급',
+    '삼성전자와 SK하이닉스가 지수보다 강한지 비교',
+    eventsData.some((event) => isTodayCalendarEvent(event)) ? '오늘 이벤트 발표 전후 변동성 기록' : '장중 새 일정/공시 알림 확인',
+  ]
+
+  return {
+    baseScore,
+    openingBias,
+    expectedOpenRange,
+    confidence,
+    summary:
+      topRisk && Math.abs(topRisk.impact) >= (topPositive?.impact ?? 0)
+        ? `${openingBias} 시나리오지만 ${topRisk.label}이 핵심 변수입니다.`
+        : topPositive
+          ? `${openingBias} 시나리오에서 ${topPositive.label}이 가장 큰 우호 근거입니다.`
+          : `${openingBias} 시나리오입니다. 선행 지표 확인 후 포지션 크기를 조절합니다.`,
+    scenarios: [
+      {
+        id: 'base',
+        label: '기준 시나리오',
+        score: baseScore,
+        probability: probabilities.base,
+        tone: baseScore >= 58 ? 'positive' : baseScore <= 43 ? 'negative' : 'neutral',
+        summary: `${openingBias} 출발을 기본값으로 보고 첫 30분 수급을 확인합니다.`,
+        triggers: checklist.slice(0, 3),
+        action: '시초가 추격보다 선행지표와 대장주 상대강도를 먼저 확인합니다.',
+      },
+      {
+        id: 'upside',
+        label: '상방 시나리오',
+        score: upsideScore,
+        probability: probabilities.upside,
+        tone: 'positive',
+        summary: 'NQ/SOX가 유지되고 환율 부담이 줄면 반도체와 성장주 중심으로 위험선호가 이어질 수 있습니다.',
+        triggers: [
+          'NQ=F와 SOX 플러스권 유지',
+          'USD/KRW 상승 둔화',
+          topPositive ? `${topPositive.label} 후속 반응` : '보유/관심종목 거래량 동반 상승',
+        ],
+        action: '강한 종목만 선별하고 지수보다 약한 종목의 추격 매수는 피합니다.',
+      },
+      {
+        id: 'downside',
+        label: '하방 시나리오',
+        score: downsideScore,
+        probability: probabilities.downside,
+        tone: 'negative',
+        summary: '환율, 금리, 변동성이 같이 올라가면 기술주 갭상승 실패나 하락 출발 가능성이 커집니다.',
+        triggers: [
+          'USD/KRW 또는 US10Y 재상승',
+          'VIX 급등이나 NQ=F 음전',
+          topRisk ? `${topRisk.label} 확대` : '고중요 뉴스/공시의 부정적 가격 반응',
+        ],
+        action: '첫 반등 실패 전까지 현금 비중과 손절 기준을 우선 확인합니다.',
+      },
+    ],
+    impacts,
+    checklist,
+  }
+}
+
 function actionPriorityVariant(priority: ActionQueueItem['priority']): 'positive' | 'negative' | 'warning' | 'neutral' | 'secondary' {
   if (priority === 'critical') return 'negative'
   if (priority === 'high') return 'warning'
@@ -1097,6 +1401,17 @@ function buildDashboardSnapshot({
     buildLiveBiasScore(liveIndicators, quotes.length),
     buildNewsBiasFactor(liveNews, liveHoldings, liveWatchlist),
   )
+  const forecast = buildMarketForecast({
+    biasScoreData: liveBiasScore,
+    holdingsData: liveHoldings,
+    newsItems: liveNews,
+    eventsData: calendarEventsData,
+    disclosures,
+    quoteStatus,
+    newsStatus,
+    disclosureStatus,
+    calendarStatus,
+  })
   const actionQueue = buildActionQueue({
     biasScoreData: liveBiasScore,
     holdingsData: liveHoldings,
@@ -1131,6 +1446,7 @@ function buildDashboardSnapshot({
     disclosures,
     disclosureStatus,
     disclosureMessage,
+    forecast,
     actionQueue,
     journal,
   }
@@ -1796,6 +2112,150 @@ function formatSavedTime(value: string | null) {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+const forecastSourceLabel = {
+  indicator: '지표',
+  news: '뉴스',
+  disclosure: '공시',
+  calendar: '일정',
+  portfolio: '보유',
+}
+
+function ForecastPage({ forecast, actionQueue }: { forecast: MarketForecast; actionQueue: ActionQueueItem[] }) {
+  const topImpact = forecast.impacts[0]
+  const topRisk = forecast.impacts.find((item) => item.impact < 0)
+  const topPositive = forecast.impacts.find((item) => item.impact > 0)
+
+  return (
+    <PageGrid>
+      <section className="grid gap-4 md:grid-cols-4">
+        <MetricCard label="기준 흐름" value={forecast.openingBias} detail={`점수 ${forecast.baseScore}/100`} tone={forecast.baseScore >= 58 ? 'positive' : forecast.baseScore <= 43 ? 'negative' : 'neutral'} />
+        <MetricCard label="예상 출발 범위" value={forecast.expectedOpenRange} detail="KOSPI 기준 추정" tone={forecast.baseScore >= 58 ? 'positive' : forecast.baseScore <= 43 ? 'negative' : 'neutral'} />
+        <MetricCard label="예측 신뢰도" value={confidenceLabel[forecast.confidence]} detail="데이터 연결 기준" tone={forecast.confidence === 'high' ? 'positive' : forecast.confidence === 'medium' ? 'warning' : 'neutral'} />
+        <MetricCard label="핵심 변수" value={topImpact?.label ?? '확인 대기'} detail={topImpact ? `${topImpact.impact > 0 ? '+' : ''}${topImpact.impact}점` : '데이터 대기'} tone={topImpact ? directionVariant(topImpact.direction) : 'neutral'} />
+      </section>
+
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+        <Card>
+          <CardHeader>
+            <CardTitle>내일장 시나리오</CardTitle>
+            <CardDescription>{forecast.summary}</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-3 lg:grid-cols-3">
+            {forecast.scenarios.map((scenario) => (
+              <div key={scenario.id} className="rounded-md border border-border bg-muted/15 p-4">
+                <div className="mb-3 flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold">{scenario.label}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">방향점수 {scenario.score}/100</div>
+                  </div>
+                  <Badge variant={scenario.tone}>{scenario.probability}%</Badge>
+                </div>
+                <Progress value={scenario.probability} />
+                <div className="mt-3 text-sm leading-6 text-foreground/85">{scenario.summary}</div>
+                <div className="mt-3 space-y-2">
+                  {scenario.triggers.map((trigger) => (
+                    <div key={trigger} className="rounded-md border border-border bg-background/70 px-3 py-2 text-xs leading-5 text-muted-foreground">
+                      {trigger}
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-3 text-xs leading-5 text-muted-foreground">{scenario.action}</div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>장전 체크리스트</CardTitle>
+            <CardDescription>개장 전에 순서대로 볼 항목</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {forecast.checklist.map((item, index) => (
+              <div key={item} className="flex gap-3 rounded-md border border-border bg-muted/15 p-3">
+                <Badge variant="secondary">{index + 1}</Badge>
+                <div className="text-sm leading-6">{item}</div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      </section>
+
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+        <Card>
+          <CardHeader>
+            <CardTitle>영향 요인 랭킹</CardTitle>
+            <CardDescription>지표, 뉴스, 공시, 일정, 포트폴리오를 같은 점수로 비교</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {forecast.impacts.length > 0 ? (
+              forecast.impacts.map((impact) => (
+                <div key={impact.id} className="rounded-md border border-border bg-muted/15 p-4">
+                  <div className="mb-2 flex flex-wrap items-center gap-2">
+                    <Badge variant={directionVariant(impact.direction)}>{impact.impact > 0 ? '+' : ''}{impact.impact}</Badge>
+                    <Badge variant="secondary">{forecastSourceLabel[impact.source]}</Badge>
+                    {impact.relatedSymbols.slice(0, 3).map((symbol) => (
+                      <Badge key={symbol} variant="secondary">
+                        {symbol}
+                      </Badge>
+                    ))}
+                  </div>
+                  <div className="text-sm font-semibold">{impact.label}</div>
+                  <div className="mt-2 text-sm leading-6 text-muted-foreground">{impact.reason}</div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-md border border-border bg-muted/15 p-4 text-sm text-muted-foreground">
+                아직 예측에 반영할 실시간 영향 요인이 충분하지 않습니다.
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>대응 포인트</CardTitle>
+            <CardDescription>상방/하방 핵심 조건과 바로 할 일</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="rounded-md border border-positive/25 bg-positive/10 p-4">
+              <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-positive">
+                <TrendingUp className="size-4" />
+                상방 확인
+              </div>
+              <div className="text-sm leading-6 text-foreground/85">
+                {topPositive ? `${topPositive.label}이 유지되면 강한 종목만 선별합니다.` : 'NQ=F, SOX, 환율 안정 여부를 먼저 봅니다.'}
+              </div>
+            </div>
+            <div className="rounded-md border border-negative/25 bg-negative/10 p-4">
+              <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-negative">
+                <TrendingDown className="size-4" />
+                하방 방어
+              </div>
+              <div className="text-sm leading-6 text-foreground/85">
+                {topRisk ? `${topRisk.label}이 확대되면 첫 반등 실패 전까지 방어적으로 봅니다.` : '환율, 금리, 변동성 급등 여부를 확인합니다.'}
+              </div>
+            </div>
+            <div className="space-y-2">
+              <div className="text-sm font-semibold">예측 기반 액션</div>
+              {actionQueue.slice(0, 3).map((item) => (
+                <div key={item.id} className="rounded-md border border-border bg-muted/15 p-3">
+                  <div className="mb-2 flex flex-wrap gap-2">
+                    <Badge variant={actionPriorityVariant(item.priority)}>{actionPriorityLabel[item.priority]}</Badge>
+                    <Badge variant="secondary">{actionCategoryLabel[item.category]}</Badge>
+                  </div>
+                  <div className="text-sm font-medium leading-6">{item.title}</div>
+                  <div className="mt-1 text-xs leading-5 text-muted-foreground">{item.suggestedAction}</div>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      </section>
+    </PageGrid>
+  )
 }
 
 function NewsPage({
@@ -2843,6 +3303,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
     )
   }
   if (page === 'radar') return <MarketRadarPage leadingIndicatorsData={snapshot.leadingIndicators} biasScoreData={snapshot.biasScore} />
+  if (page === 'forecast') return <ForecastPage forecast={snapshot.forecast} actionQueue={snapshot.actionQueue} />
   if (page === 'news') {
     return (
       <NewsPage
@@ -3477,6 +3938,42 @@ export function Dashboard() {
                 </CardContent>
               </Card>
             </section>
+
+            <Card>
+              <CardHeader>
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <CardTitle>내일장 예측 요약</CardTitle>
+                    <CardDescription>{snapshot.forecast.summary}</CardDescription>
+                  </div>
+                  <Button type="button" variant="outline" size="sm" onClick={() => setActivePage('forecast')}>
+                    <LineChart className="size-4" />
+                    예측 보기
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent className="grid gap-3 md:grid-cols-4">
+                <div className="rounded-md border border-border bg-muted/15 p-3">
+                  <div className="text-xs text-muted-foreground">기준 흐름</div>
+                  <div className="mt-2 text-lg font-semibold">{snapshot.forecast.openingBias}</div>
+                </div>
+                <div className="rounded-md border border-border bg-muted/15 p-3">
+                  <div className="text-xs text-muted-foreground">예상 출발</div>
+                  <div className="mt-2 text-lg font-semibold">{snapshot.forecast.expectedOpenRange}</div>
+                </div>
+                <div className="rounded-md border border-border bg-muted/15 p-3">
+                  <div className="text-xs text-muted-foreground">신뢰도</div>
+                  <div className="mt-2 text-lg font-semibold">{confidenceLabel[snapshot.forecast.confidence]}</div>
+                </div>
+                <div className="rounded-md border border-border bg-muted/15 p-3">
+                  <div className="text-xs text-muted-foreground">상방 / 하방</div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Badge variant="positive">{snapshot.forecast.scenarios.find((item) => item.id === 'upside')?.probability ?? 0}%</Badge>
+                    <Badge variant="negative">{snapshot.forecast.scenarios.find((item) => item.id === 'downside')?.probability ?? 0}%</Badge>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
 
             <ActionQueuePanel
               items={snapshot.actionQueue}
