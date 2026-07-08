@@ -61,6 +61,7 @@ function validateProfileData(data) {
   if (!Array.isArray(data.holdings)) return false
   if (!Array.isArray(data.watchlist)) return false
   if (!Array.isArray(data.newsKeywords)) return false
+  if (!Array.isArray(data.alertRules)) return false
   if (!isObject(data.journal)) return false
   return true
 }

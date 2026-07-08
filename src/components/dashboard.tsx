@@ -57,6 +57,7 @@ import {
 import { cn } from '@/lib/utils'
 import type {
   ActionQueueItem,
+  AlertRule,
   BiasScore,
   CalendarEvent,
   Direction,
@@ -66,6 +67,7 @@ import type {
   LiveNewsItem,
   MarketIndicator,
   MarketQuote,
+  TriggeredAlert,
   WatchItem,
 } from '@/types/market'
 
@@ -191,6 +193,7 @@ type StoredDashboardData = {
   holdings: Holding[]
   watchlist: WatchItem[]
   newsKeywords: string[]
+  alertRules: AlertRule[]
   journal: InvestmentJournal
 }
 
@@ -204,6 +207,8 @@ type DashboardSnapshot = {
   holdings: Holding[]
   watchlist: WatchItem[]
   newsKeywords: string[]
+  alertRules: AlertRule[]
+  triggeredAlerts: TriggeredAlert[]
   storedData: StoredDashboardData
   leadingIndicators: MarketIndicator[]
   biasScore: BiasScore
@@ -299,11 +304,67 @@ const actionCategoryLabel = {
   disclosure: '공시',
 }
 
+const alertRuleTypeLabel: Record<AlertRule['type'], string> = {
+  'price-above': '가격 이상',
+  'price-below': '가격 이하',
+  'change-above': '등락률 이상',
+  'change-below': '등락률 이하',
+  'news-keyword': '뉴스 키워드',
+  'bias-above': '방향점수 이상',
+  'bias-below': '방향점수 이하',
+}
+
+const alertSeverityLabel: Record<TriggeredAlert['severity'], string> = {
+  critical: '긴급',
+  high: '높음',
+  medium: '보통',
+  low: '낮음',
+}
+
 const watchStatusLabel = {
   near: '근접',
   waiting: '대기',
   alert: '확인',
 }
+
+const defaultAlertRules: AlertRule[] = [
+  {
+    id: 'default-bias-pressure',
+    name: '방향점수 45 이하',
+    type: 'bias-below',
+    target: 'KOSPI',
+    threshold: 45,
+    enabled: true,
+    createdAt: '2026-07-08T00:00:00.000Z',
+  },
+  {
+    id: 'default-vix-spike',
+    name: 'VIX 급등',
+    type: 'change-above',
+    target: 'VIX',
+    threshold: 5,
+    enabled: true,
+    createdAt: '2026-07-08T00:00:00.000Z',
+  },
+  {
+    id: 'default-usdkrw-risk',
+    name: '환율 상승 부담',
+    type: 'change-above',
+    target: 'USD/KRW',
+    threshold: 0.5,
+    enabled: true,
+    createdAt: '2026-07-08T00:00:00.000Z',
+  },
+  {
+    id: 'default-ai-news',
+    name: 'AI 고중요 뉴스',
+    type: 'news-keyword',
+    target: 'AI',
+    threshold: 0,
+    enabled: true,
+    createdAt: '2026-07-08T00:00:00.000Z',
+  },
+]
 
 const dataHealthStatusLabel: Record<DataHealthStatus, string> = {
   idle: '대기',
@@ -427,6 +488,21 @@ function normalizeDirection(value: unknown): Direction {
   return value === 'positive' || value === 'negative' || value === 'neutral' || value === 'mixed' ? value : 'neutral'
 }
 
+function normalizeAlertRuleType(value: unknown): AlertRule['type'] {
+  if (
+    value === 'price-above' ||
+    value === 'price-below' ||
+    value === 'change-above' ||
+    value === 'change-below' ||
+    value === 'news-keyword' ||
+    value === 'bias-above' ||
+    value === 'bias-below'
+  ) {
+    return value
+  }
+  return 'price-below'
+}
+
 function normalizeWatchStatus(value: unknown, targetBuyPrice: number, currentPrice: number): WatchItem['status'] {
   if (value === 'near' || value === 'waiting' || value === 'alert') return value
   if (targetBuyPrice > 0 && currentPrice <= targetBuyPrice * 1.03) return 'near'
@@ -435,6 +511,10 @@ function normalizeWatchStatus(value: unknown, targetBuyPrice: number, currentPri
 
 function dedupeBySymbol<T extends { symbol: string }>(items: T[]) {
   return Array.from(new Map(items.map((item) => [item.symbol, item])).values())
+}
+
+function dedupeAlertRules(items: AlertRule[]) {
+  return Array.from(new Map(items.map((item) => [item.id, item])).values())
 }
 
 function normalizeImportedHolding(value: unknown): Holding | null {
@@ -484,6 +564,27 @@ function normalizeImportedWatchItem(value: unknown): WatchItem | null {
   }
 }
 
+function normalizeImportedAlertRule(value: unknown): AlertRule | null {
+  if (!isRecord(value)) return null
+
+  const type = normalizeAlertRuleType(value.type)
+  const target = type === 'bias-above' || type === 'bias-below' ? textValue(value.target, 'KOSPI') : normalizeNewsKeyword(textValue(value.target))
+  if (!target) return null
+
+  const id = textValue(value.id, `alert-${type}-${target}-${Math.round(numberValue(value.threshold))}`)
+  const name = textValue(value.name, `${target} ${alertRuleTypeLabel[type]}`)
+
+  return {
+    id,
+    name,
+    type,
+    target,
+    threshold: numberValue(value.threshold),
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : true,
+    createdAt: typeof value.createdAt === 'string' ? value.createdAt : new Date().toISOString(),
+  }
+}
+
 function normalizeStoredDashboardData(value: unknown): StoredDashboardData | null {
   const candidate = isRecord(value) && isRecord(value.data) ? value.data : value
   if (!isRecord(candidate) || !Array.isArray(candidate.holdings) || !Array.isArray(candidate.watchlist)) return null
@@ -492,6 +593,9 @@ function normalizeStoredDashboardData(value: unknown): StoredDashboardData | nul
     holdings: dedupeBySymbol(candidate.holdings.map(normalizeImportedHolding).filter((item): item is Holding => item !== null)),
     watchlist: dedupeBySymbol(candidate.watchlist.map(normalizeImportedWatchItem).filter((item): item is WatchItem => item !== null)),
     newsKeywords: normalizeNewsKeywords(candidate.newsKeywords),
+    alertRules: Array.isArray(candidate.alertRules)
+      ? dedupeAlertRules(candidate.alertRules.map(normalizeImportedAlertRule).filter((item): item is AlertRule => item !== null))
+      : defaultAlertRules,
     journal: normalizeJournal(candidate.journal),
   }
 }
@@ -522,7 +626,7 @@ function parseDashboardBackup(rawJson: string): { ok: true; data: StoredDashboar
     return {
       ok: true,
       data,
-      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 뉴스 키워드 ${data.newsKeywords.length}개, 투자노트를 가져왔습니다.`,
+      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 뉴스 키워드 ${data.newsKeywords.length}개, 알림 ${data.alertRules.length}개, 투자노트를 가져왔습니다.`,
     }
   } catch {
     return {
@@ -1371,6 +1475,174 @@ function buildActionQueue({
     .slice(0, 10)
 }
 
+function alertSeverityFromDistance(distance: number): TriggeredAlert['severity'] {
+  if (distance >= 8) return 'critical'
+  if (distance >= 4) return 'high'
+  if (distance >= 1.5) return 'medium'
+  return 'low'
+}
+
+function findPriceAlertTarget(rule: AlertRule, holdingsData: Holding[], watchlistData: WatchItem[]) {
+  const normalizedTarget = rule.target.toUpperCase()
+  const holding = holdingsData.find(
+    (item) => item.symbol.toUpperCase() === normalizedTarget || item.name.toLocaleLowerCase('ko-KR') === rule.target.toLocaleLowerCase('ko-KR'),
+  )
+  if (holding) {
+    return {
+      symbol: holding.symbol,
+      name: holding.name,
+      market: holding.market,
+      price: holding.currentPrice,
+      change: holding.dayChange,
+    }
+  }
+
+  const watchItem = watchlistData.find(
+    (item) => item.symbol.toUpperCase() === normalizedTarget || item.name.toLocaleLowerCase('ko-KR') === rule.target.toLocaleLowerCase('ko-KR'),
+  )
+  if (!watchItem) return null
+
+  return {
+    symbol: watchItem.symbol,
+    name: watchItem.name,
+    market: defaultMarketForSymbol(watchItem.symbol),
+    price: watchItem.currentPrice,
+    change: null,
+  }
+}
+
+function findChangeAlertTarget(rule: AlertRule, holdingsData: Holding[], indicators: MarketIndicator[]) {
+  const normalizedTarget = rule.target.toUpperCase()
+  const indicator = indicators.find(
+    (item) => item.symbol.toUpperCase() === normalizedTarget || item.name.toLocaleLowerCase('ko-KR') === rule.target.toLocaleLowerCase('ko-KR'),
+  )
+  if (indicator) {
+    return {
+      symbol: indicator.symbol,
+      name: indicator.name,
+      change: indicator.change,
+      evidence: `${indicator.symbol} ${formatChange(indicator.change)}`,
+    }
+  }
+
+  const holding = holdingsData.find(
+    (item) => item.symbol.toUpperCase() === normalizedTarget || item.name.toLocaleLowerCase('ko-KR') === rule.target.toLocaleLowerCase('ko-KR'),
+  )
+  if (!holding) return null
+
+  return {
+    symbol: holding.symbol,
+    name: holding.name,
+    change: holding.dayChange,
+    evidence: `${holding.name} ${formatChange(holding.dayChange)}`,
+  }
+}
+
+function buildTriggeredAlerts({
+  alertRulesData,
+  holdingsData,
+  watchlistData,
+  indicators,
+  newsItems,
+  biasScoreData,
+}: {
+  alertRulesData: AlertRule[]
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+  indicators: MarketIndicator[]
+  newsItems: LiveNewsItem[]
+  biasScoreData: BiasScore
+}): TriggeredAlert[] {
+  return alertRulesData
+    .filter((rule) => rule.enabled)
+    .flatMap((rule): TriggeredAlert[] => {
+      if (rule.type === 'price-above' || rule.type === 'price-below') {
+        const target = findPriceAlertTarget(rule, holdingsData, watchlistData)
+        if (!target) return []
+
+        const triggered = rule.type === 'price-above' ? target.price >= rule.threshold : target.price <= rule.threshold
+        if (!triggered) return []
+
+        const distance = rule.threshold > 0 ? Math.abs(((target.price - rule.threshold) / rule.threshold) * 100) : 0
+        return [
+          {
+            id: `alert-${rule.id}`,
+            ruleId: rule.id,
+            title: rule.name,
+            summary: `${target.name}이 ${alertRuleTypeLabel[rule.type]} 조건에 도달했습니다.`,
+            severity: alertSeverityFromDistance(distance),
+            evidence: `현재 ${formatCurrency(target.price, target.market)} / 기준 ${formatCurrency(rule.threshold, target.market)}`,
+            relatedSymbols: [target.symbol],
+          },
+        ]
+      }
+
+      if (rule.type === 'change-above' || rule.type === 'change-below') {
+        const target = findChangeAlertTarget(rule, holdingsData, indicators)
+        if (!target) return []
+
+        const triggered = rule.type === 'change-above' ? target.change >= rule.threshold : target.change <= rule.threshold
+        if (!triggered) return []
+
+        const distance = Math.abs(target.change - rule.threshold)
+        return [
+          {
+            id: `alert-${rule.id}`,
+            ruleId: rule.id,
+            title: rule.name,
+            summary: `${target.name} 등락률 조건이 발동했습니다.`,
+            severity: alertSeverityFromDistance(distance),
+            evidence: `${target.evidence} / 기준 ${formatChange(rule.threshold)}`,
+            relatedSymbols: [target.symbol],
+          },
+        ]
+      }
+
+      if (rule.type === 'news-keyword') {
+        const keyword = rule.target.toLocaleLowerCase('ko-KR')
+        const matchedNews = newsItems.find((item) =>
+          [item.keyword, item.title, item.description, ...item.relatedSymbols, ...item.sectors]
+            .join(' ')
+            .toLocaleLowerCase('ko-KR')
+            .includes(keyword),
+        )
+        if (!matchedNews) return []
+
+        return [
+          {
+            id: `alert-${rule.id}`,
+            ruleId: rule.id,
+            title: rule.name,
+            summary: `${rule.target} 관련 뉴스가 수집됐습니다.`,
+            severity: matchedNews.importance === 'high' ? 'high' : 'medium',
+            evidence: matchedNews.title,
+            relatedSymbols: matchedNews.relatedSymbols.length > 0 ? matchedNews.relatedSymbols : [rule.target],
+          },
+        ]
+      }
+
+      if (rule.type === 'bias-above' || rule.type === 'bias-below') {
+        const triggered = rule.type === 'bias-above' ? biasScoreData.score >= rule.threshold : biasScoreData.score <= rule.threshold
+        if (!triggered) return []
+
+        return [
+          {
+            id: `alert-${rule.id}`,
+            ruleId: rule.id,
+            title: rule.name,
+            summary: `내일 국내장 방향점수가 조건에 도달했습니다.`,
+            severity: rule.type === 'bias-below' ? 'high' : 'medium',
+            evidence: `현재 ${biasScoreData.score}/100 / 기준 ${rule.threshold}/100`,
+            relatedSymbols: [biasScoreData.market],
+          },
+        ]
+      }
+
+      return []
+    })
+    .sort((a, b) => priorityRank(b.severity) - priorityRank(a.severity))
+}
+
 function buildMarketStatusView({
   quoteMap,
   fetchedAt,
@@ -1404,6 +1676,7 @@ function buildDashboardSnapshot({
   baseHoldings,
   baseWatchlist,
   newsKeywordsData,
+  alertRulesData,
   quotes,
   fetchedAt,
   quoteStatus,
@@ -1422,6 +1695,7 @@ function buildDashboardSnapshot({
   baseHoldings: Holding[]
   baseWatchlist: WatchItem[]
   newsKeywordsData: string[]
+  alertRulesData: AlertRule[]
   quotes: MarketQuote[]
   fetchedAt: string | null
   quoteStatus: QuoteStatus
@@ -1465,17 +1739,28 @@ function buildDashboardSnapshot({
     eventsData: calendarEventsData,
     disclosures,
   })
+  const triggeredAlerts = buildTriggeredAlerts({
+    alertRulesData,
+    holdingsData: liveHoldings,
+    watchlistData: liveWatchlist,
+    indicators: liveIndicators,
+    newsItems: liveNews,
+    biasScoreData: liveBiasScore,
+  })
 
   return {
     holdings: liveHoldings,
     watchlist: liveWatchlist,
+    newsKeywords: newsKeywordsData,
+    alertRules: alertRulesData,
+    triggeredAlerts,
     storedData: {
       holdings: baseHoldings,
       watchlist: baseWatchlist,
       newsKeywords: newsKeywordsData,
+      alertRules: alertRulesData,
       journal,
     },
-    newsKeywords: newsKeywordsData,
     leadingIndicators: liveIndicators,
     biasScore: liveBiasScore,
     marketStatus: buildMarketStatusView({ quoteMap, fetchedAt, quoteStatus }),
@@ -2658,18 +2943,218 @@ function CalendarPage({
   )
 }
 
-function AlertsPage({ actionQueue }: { actionQueue: ActionQueueItem[] }) {
+type AlertRuleFormState = {
+  id: string | null
+  name: string
+  type: AlertRule['type']
+  target: string
+  threshold: string
+}
+
+const emptyAlertRuleForm: AlertRuleFormState = {
+  id: null,
+  name: '',
+  type: 'price-below',
+  target: '',
+  threshold: '',
+}
+
+function alertRuleToForm(rule: AlertRule): AlertRuleFormState {
+  return {
+    id: rule.id,
+    name: rule.name,
+    type: rule.type,
+    target: rule.target,
+    threshold: String(rule.threshold),
+  }
+}
+
+function formToAlertRule(form: AlertRuleFormState, existing?: AlertRule): AlertRule {
+  const type = form.type
+  const target = type === 'bias-above' || type === 'bias-below' ? 'KOSPI' : normalizeNewsKeyword(form.target)
+  const threshold = type === 'news-keyword' ? 0 : parseNumericInput(form.threshold)
+  const name = normalizeNewsKeyword(form.name) || `${target} ${alertRuleTypeLabel[type]}`
+
+  return {
+    id: existing?.id ?? `alert-${Date.now()}`,
+    name,
+    type,
+    target,
+    threshold,
+    enabled: existing?.enabled ?? true,
+    createdAt: existing?.createdAt ?? new Date().toISOString(),
+  }
+}
+
+function AlertsPage({
+  actionQueue,
+  alertRules,
+  triggeredAlerts,
+  onSaveAlertRule,
+  onDeleteAlertRule,
+  onToggleAlertRule,
+  onResetAlertRules,
+}: {
+  actionQueue: ActionQueueItem[]
+  alertRules: AlertRule[]
+  triggeredAlerts: TriggeredAlert[]
+  onSaveAlertRule: (rule: AlertRule, previousId?: string) => void
+  onDeleteAlertRule: (id: string) => void
+  onToggleAlertRule: (id: string) => void
+  onResetAlertRules: () => void
+}) {
+  const [form, setForm] = useState<AlertRuleFormState>(emptyAlertRuleForm)
   const criticalCount = actionQueue.filter((item) => item.priority === 'critical').length
   const highCount = actionQueue.filter((item) => item.priority === 'high').length
   const watchlistCount = actionQueue.filter((item) => item.category === 'watchlist').length
+  const enabledRuleCount = alertRules.filter((rule) => rule.enabled).length
+  const highTriggeredCount = triggeredAlerts.filter((item) => item.severity === 'critical' || item.severity === 'high').length
+
+  function clearForm() {
+    setForm(emptyAlertRuleForm)
+  }
+
+  function editRule(rule: AlertRule) {
+    setForm(alertRuleToForm(rule))
+  }
+
+  function submitRule() {
+    const rule = formToAlertRule(form, alertRules.find((item) => item.id === form.id))
+    if (!rule.target) return
+    onSaveAlertRule(rule, form.id ?? undefined)
+    clearForm()
+  }
 
   return (
     <PageGrid>
-      <section className="grid gap-4 md:grid-cols-3">
+      <section className="grid gap-4 md:grid-cols-4">
         <MetricCard label="긴급 알림" value={`${criticalCount}개`} detail="즉시 확인" tone={criticalCount > 0 ? 'negative' : 'neutral'} />
         <MetricCard label="높은 우선순위" value={`${highCount}개`} detail="오늘 처리" tone={highCount > 0 ? 'warning' : 'neutral'} />
         <MetricCard label="관심가/트리거" value={`${watchlistCount}개`} detail="가격 조건" tone={watchlistCount > 0 ? 'positive' : 'neutral'} />
+        <MetricCard label="사용자 조건" value={`${triggeredAlerts.length}/${enabledRuleCount}`} detail="발동/활성" tone={highTriggeredCount > 0 ? 'negative' : triggeredAlerts.length > 0 ? 'warning' : 'neutral'} />
       </section>
+
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+        <Card>
+          <CardHeader>
+            <CardTitle>조건 알림</CardTitle>
+            <CardDescription>내가 정한 가격, 등락률, 뉴스, 방향점수 조건</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {triggeredAlerts.length > 0 ? (
+              triggeredAlerts.map((alert) => (
+                <div key={alert.id} className="rounded-md border border-border bg-muted/15 p-4">
+                  <div className="mb-3 flex flex-wrap gap-2">
+                    <Badge variant={actionPriorityVariant(alert.severity)}>{alertSeverityLabel[alert.severity]}</Badge>
+                    {alert.relatedSymbols.map((symbol) => (
+                      <Badge key={symbol} variant="secondary">
+                        {symbol}
+                      </Badge>
+                    ))}
+                  </div>
+                  <div className="text-sm font-semibold">{alert.title}</div>
+                  <div className="mt-2 text-sm leading-6 text-foreground/85">{alert.summary}</div>
+                  <div className="mt-2 text-xs leading-5 text-muted-foreground">{alert.evidence}</div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-md border border-border bg-muted/15 p-4 text-sm leading-6 text-muted-foreground">
+                현재 발동된 사용자 조건은 없습니다. 장 시작 전에는 환율, VIX, NQ=F, 보유종목 가격 조건을 먼저 걸어두면 좋습니다.
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>{form.id ? '알림 조건 수정' : '알림 조건 추가'}</CardTitle>
+            <CardDescription>조건은 브라우저 저장, 백업, 서버 동기화에 포함됩니다</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <input
+              value={form.name}
+              onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
+              placeholder="조건 이름"
+              className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition placeholder:text-muted-foreground focus:border-primary"
+            />
+            <select
+              value={form.type}
+              onChange={(event) => setForm((current) => ({ ...current, type: event.target.value as AlertRule['type'] }))}
+              className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition focus:border-primary"
+            >
+              {Object.entries(alertRuleTypeLabel).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+            <input
+              value={form.type === 'bias-above' || form.type === 'bias-below' ? 'KOSPI' : form.target}
+              onChange={(event) => setForm((current) => ({ ...current, target: event.target.value }))}
+              disabled={form.type === 'bias-above' || form.type === 'bias-below'}
+              placeholder="대상: 005930, VIX, AI"
+              className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition placeholder:text-muted-foreground focus:border-primary disabled:text-muted-foreground"
+            />
+            {form.type !== 'news-keyword' ? (
+              <input
+                value={form.threshold}
+                onChange={(event) => setForm((current) => ({ ...current, threshold: event.target.value }))}
+                placeholder={form.type.startsWith('price') ? '기준 가격' : form.type.startsWith('bias') ? '기준 점수' : '기준 등락률 %'}
+                className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none transition placeholder:text-muted-foreground focus:border-primary"
+              />
+            ) : null}
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" onClick={submitRule} disabled={!form.target && form.type !== 'bias-above' && form.type !== 'bias-below'}>
+                <Save className="size-4" />
+                저장
+              </Button>
+              <Button type="button" variant="outline" onClick={clearForm}>
+                <X className="size-4" />
+                취소
+              </Button>
+              <Button type="button" variant="outline" onClick={onResetAlertRules}>
+                <RefreshCw className="size-4" />
+                기본값
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </section>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>사용자 알림 규칙</CardTitle>
+          <CardDescription>조건별 활성 상태와 현재 기준</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3 lg:grid-cols-2">
+          {alertRules.map((rule) => (
+            <div key={rule.id} className="rounded-md border border-border bg-muted/15 p-4">
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                <Badge variant={rule.enabled ? 'positive' : 'neutral'}>{rule.enabled ? '활성' : '꺼짐'}</Badge>
+                <Badge variant="secondary">{alertRuleTypeLabel[rule.type]}</Badge>
+                <Badge variant="secondary">{rule.target}</Badge>
+              </div>
+              <div className="text-sm font-semibold">{rule.name}</div>
+              <div className="mt-2 text-xs leading-5 text-muted-foreground">
+                {rule.type === 'news-keyword' ? '뉴스에 키워드가 포함되면 발동' : `기준값 ${formatNumber(rule.threshold)}`}
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button type="button" variant="outline" size="sm" aria-label={`${rule.name} 수정`} onClick={() => editRule(rule)}>
+                  <Pencil className="size-4" />
+                  수정
+                </Button>
+                <Button type="button" variant="outline" size="sm" aria-label={`${rule.name} ${rule.enabled ? '끄기' : '켜기'}`} onClick={() => onToggleAlertRule(rule.id)}>
+                  {rule.enabled ? '끄기' : '켜기'}
+                </Button>
+                <Button type="button" variant="ghost" size="sm" aria-label={`${rule.name} 삭제`} className="text-negative hover:text-negative" onClick={() => onDeleteAlertRule(rule.id)}>
+                  <Trash2 className="size-4" />
+                  삭제
+                </Button>
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
 
       <ActionQueuePanel
         items={actionQueue}
@@ -2983,6 +3468,7 @@ function SettingsPage({
     { label: '보유종목', value: `${backupData.holdings.length}개` },
     { label: '관심종목', value: `${backupData.watchlist.length}개` },
     { label: '뉴스 키워드', value: `${backupData.newsKeywords.length}개` },
+    { label: '알림 규칙', value: `${backupData.alertRules.length}개` },
     { label: '투자노트', value: backupData.journal.date },
   ]
   const backupMessageVariant = backupTone === 'positive' ? 'positive' : backupTone === 'negative' ? 'negative' : 'neutral'
@@ -3125,6 +3611,7 @@ function SettingsPage({
       holdings,
       watchlist,
       newsKeywords: defaultNewsKeywords,
+      alertRules: defaultAlertRules,
       journal: createDefaultJournal(),
     }
     onResetDashboardData()
@@ -3490,7 +3977,7 @@ function SettingsPage({
           <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
             <div>
               <CardTitle>서버 동기화</CardTitle>
-              <CardDescription>다른 기기에서도 같은 보유종목, 관심종목, 뉴스 키워드, 투자노트 사용</CardDescription>
+              <CardDescription>다른 기기에서도 같은 보유종목, 관심종목, 뉴스 키워드, 알림 규칙, 투자노트 사용</CardDescription>
             </div>
             <Button type="button" variant="outline" size="sm" onClick={() => void loadProfileSyncStatus()} disabled={profileSyncBusy}>
               <RefreshCw className={cn('size-4', profileSyncStatus === 'checking' && 'animate-spin')} />
@@ -3526,7 +4013,7 @@ function SettingsPage({
           <div className="grid gap-3 md:grid-cols-4">
             <div className="rounded-md border border-border bg-muted/15 p-3">
               <div className="text-xs text-muted-foreground">저장 대상</div>
-              <div className="mt-2 text-sm font-semibold">보유/관심/키워드/노트</div>
+              <div className="mt-2 text-sm font-semibold">보유/관심/키워드/알림/노트</div>
             </div>
             <div className="rounded-md border border-border bg-muted/15 p-3">
               <div className="text-xs text-muted-foreground">서버 저장소</div>
@@ -3550,7 +4037,7 @@ function SettingsPage({
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
                 <CardTitle>데이터 백업</CardTitle>
-                <CardDescription>보유종목, 관심종목, 투자노트를 JSON 파일로 보관</CardDescription>
+                <CardDescription>보유종목, 관심종목, 뉴스 키워드, 알림 규칙, 투자노트를 JSON 파일로 보관</CardDescription>
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button type="button" variant="outline" size="sm" onClick={handleDownloadBackup}>
@@ -3623,6 +4110,10 @@ type DashboardActions = {
   onRefreshDisclosures: () => void
   onRefreshCalendar: () => void
   onUpdateNewsKeywords: (keywords: string[]) => void
+  onSaveAlertRule: (rule: AlertRule, previousId?: string) => void
+  onDeleteAlertRule: (id: string) => void
+  onToggleAlertRule: (id: string) => void
+  onResetAlertRules: () => void
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
   onResetJournal: () => void
@@ -3686,7 +4177,19 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
       />
     )
   }
-  if (page === 'alerts') return <AlertsPage actionQueue={snapshot.actionQueue} />
+  if (page === 'alerts') {
+    return (
+      <AlertsPage
+        actionQueue={snapshot.actionQueue}
+        alertRules={snapshot.alertRules}
+        triggeredAlerts={snapshot.triggeredAlerts}
+        onSaveAlertRule={actions.onSaveAlertRule}
+        onDeleteAlertRule={actions.onDeleteAlertRule}
+        onToggleAlertRule={actions.onToggleAlertRule}
+        onResetAlertRules={actions.onResetAlertRules}
+      />
+    )
+  }
   if (page === 'notes') {
     return (
       <NotesPage
@@ -3735,6 +4238,7 @@ export function Dashboard() {
   const [userHoldings, setUserHoldings] = useState<Holding[]>(holdings)
   const [userWatchlist, setUserWatchlist] = useState<WatchItem[]>(watchlist)
   const [userNewsKeywords, setUserNewsKeywords] = useState<string[]>(defaultNewsKeywords)
+  const [userAlertRules, setUserAlertRules] = useState<AlertRule[]>(defaultAlertRules)
   const [journal, setJournal] = useState<InvestmentJournal>(() => createDefaultJournal())
   const [storageLoaded, setStorageLoaded] = useState(false)
   const [quoteResponse, setQuoteResponse] = useState<QuotesApiResponse | null>(null)
@@ -3919,6 +4423,7 @@ export function Dashboard() {
       setUserHoldings(stored.holdings)
       setUserWatchlist(stored.watchlist)
       setUserNewsKeywords(stored.newsKeywords)
+      setUserAlertRules(stored.alertRules)
       setJournal(stored.journal)
     }
     setStorageLoaded(true)
@@ -3930,9 +4435,10 @@ export function Dashboard() {
       holdings: userHoldings,
       watchlist: userWatchlist,
       newsKeywords: userNewsKeywords,
+      alertRules: userAlertRules,
       journal,
     })
-  }, [journal, storageLoaded, userHoldings, userNewsKeywords, userWatchlist])
+  }, [journal, storageLoaded, userAlertRules, userHoldings, userNewsKeywords, userWatchlist])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -3993,6 +4499,7 @@ export function Dashboard() {
         baseHoldings: userHoldings,
         baseWatchlist: userWatchlist,
         newsKeywordsData: userNewsKeywords,
+        alertRulesData: userAlertRules,
         fetchedAt: quoteResponse?.fetchedAt ?? null,
         quoteStatus,
         quoteMessage,
@@ -4021,6 +4528,7 @@ export function Dashboard() {
       quoteMessage,
       quoteResponse,
       quoteStatus,
+      userAlertRules,
       userHoldings,
       userNewsKeywords,
       userWatchlist,
@@ -4077,6 +4585,22 @@ export function Dashboard() {
       onUpdateNewsKeywords: (keywords) => {
         setUserNewsKeywords(normalizeNewsKeywords(keywords))
       },
+      onSaveAlertRule: (rule, previousId) => {
+        setUserAlertRules((current) => {
+          const removeId = previousId ?? rule.id
+          const remaining = current.filter((item) => item.id !== removeId && item.id !== rule.id)
+          return [...remaining, rule]
+        })
+      },
+      onDeleteAlertRule: (id) => {
+        setUserAlertRules((current) => current.filter((rule) => rule.id !== id))
+      },
+      onToggleAlertRule: (id) => {
+        setUserAlertRules((current) => current.map((rule) => (rule.id === id ? { ...rule, enabled: !rule.enabled } : rule)))
+      },
+      onResetAlertRules: () => {
+        setUserAlertRules(defaultAlertRules)
+      },
       onUpdateJournal: (patch) => {
         setJournal((current) => ({
           ...normalizeJournal(current),
@@ -4111,6 +4635,7 @@ export function Dashboard() {
         setUserHoldings(data.holdings)
         setUserWatchlist(data.watchlist)
         setUserNewsKeywords(data.newsKeywords)
+        setUserAlertRules(data.alertRules)
         setJournal(data.journal)
         saveStoredDashboardData(data)
       },
@@ -4119,11 +4644,13 @@ export function Dashboard() {
         setUserHoldings(holdings)
         setUserWatchlist(watchlist)
         setUserNewsKeywords(defaultNewsKeywords)
+        setUserAlertRules(defaultAlertRules)
         setJournal(nextJournal)
         saveStoredDashboardData({
           holdings,
           watchlist,
           newsKeywords: defaultNewsKeywords,
+          alertRules: defaultAlertRules,
           journal: nextJournal,
         })
       },

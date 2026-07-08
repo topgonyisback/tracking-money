@@ -144,6 +144,26 @@ export type ActionQueueItem = {
   score: number
 }
 
+export type AlertRule = {
+  id: string
+  name: string
+  type: 'price-above' | 'price-below' | 'change-above' | 'change-below' | 'news-keyword' | 'bias-above' | 'bias-below'
+  target: string
+  threshold: number
+  enabled: boolean
+  createdAt: string
+}
+
+export type TriggeredAlert = {
+  id: string
+  ruleId: string
+  title: string
+  summary: string
+  severity: 'critical' | 'high' | 'medium' | 'low'
+  evidence: string
+  relatedSymbols: string[]
+}
+
 export type InvestmentJournal = {
   date: string
   preMarketPlan: string
