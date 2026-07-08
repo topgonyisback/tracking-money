@@ -51,7 +51,7 @@ import {
   keyIssues,
   leadingIndicators,
   marketStatus,
-  newsKeywords,
+  newsKeywords as defaultNewsKeywords,
   watchlist,
 } from '@/data/mock-dashboard'
 import { cn } from '@/lib/utils'
@@ -178,6 +178,7 @@ type MarketStatusView = typeof marketStatus
 type StoredDashboardData = {
   holdings: Holding[]
   watchlist: WatchItem[]
+  newsKeywords: string[]
   journal: InvestmentJournal
 }
 
@@ -190,6 +191,7 @@ type DashboardBackup = {
 type DashboardSnapshot = {
   holdings: Holding[]
   watchlist: WatchItem[]
+  newsKeywords: string[]
   storedData: StoredDashboardData
   leadingIndicators: MarketIndicator[]
   biasScore: BiasScore
@@ -327,6 +329,19 @@ function stringArrayValue(value: unknown) {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
+function normalizeNewsKeyword(value: string) {
+  return value.trim().replace(/\s+/g, ' ')
+}
+
+function normalizeNewsKeywords(value: unknown) {
+  const keywords = stringArrayValue(value)
+    .map(normalizeNewsKeyword)
+    .filter(Boolean)
+
+  const deduped = Array.from(new Map(keywords.map((keyword) => [keyword.toLocaleLowerCase('ko-KR'), keyword])).values())
+  return deduped.length > 0 ? deduped.slice(0, 20) : defaultNewsKeywords
+}
+
 function createDefaultJournal(date = getKstDateKey()): InvestmentJournal {
   return {
     date,
@@ -446,6 +461,7 @@ function normalizeStoredDashboardData(value: unknown): StoredDashboardData | nul
   return {
     holdings: dedupeBySymbol(candidate.holdings.map(normalizeImportedHolding).filter((item): item is Holding => item !== null)),
     watchlist: dedupeBySymbol(candidate.watchlist.map(normalizeImportedWatchItem).filter((item): item is WatchItem => item !== null)),
+    newsKeywords: normalizeNewsKeywords(candidate.newsKeywords),
     journal: normalizeJournal(candidate.journal),
   }
 }
@@ -476,7 +492,7 @@ function parseDashboardBackup(rawJson: string): { ok: true; data: StoredDashboar
     return {
       ok: true,
       data,
-      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 투자노트를 가져왔습니다.`,
+      message: `보유 ${data.holdings.length}개, 관심 ${data.watchlist.length}개, 뉴스 키워드 ${data.newsKeywords.length}개, 투자노트를 가져왔습니다.`,
     }
   } catch {
     return {
@@ -511,10 +527,6 @@ function loadStoredDashboardData(): StoredDashboardData | null {
 
 function saveStoredDashboardData(data: StoredDashboardData) {
   window.localStorage.setItem(storageKey, JSON.stringify(data))
-}
-
-function resetStoredDashboardData() {
-  window.localStorage.removeItem(storageKey)
 }
 
 function quoteKey(symbol: string) {
@@ -1361,6 +1373,7 @@ function buildMarketStatusView({
 function buildDashboardSnapshot({
   baseHoldings,
   baseWatchlist,
+  newsKeywordsData,
   quotes,
   fetchedAt,
   quoteStatus,
@@ -1378,6 +1391,7 @@ function buildDashboardSnapshot({
 }: {
   baseHoldings: Holding[]
   baseWatchlist: WatchItem[]
+  newsKeywordsData: string[]
   quotes: MarketQuote[]
   fetchedAt: string | null
   quoteStatus: QuoteStatus
@@ -1428,8 +1442,10 @@ function buildDashboardSnapshot({
     storedData: {
       holdings: baseHoldings,
       watchlist: baseWatchlist,
+      newsKeywords: newsKeywordsData,
       journal,
     },
+    newsKeywords: newsKeywordsData,
     leadingIndicators: liveIndicators,
     biasScore: liveBiasScore,
     marketStatus: buildMarketStatusView({ quoteMap, fetchedAt, quoteStatus }),
@@ -2260,12 +2276,14 @@ function ForecastPage({ forecast, actionQueue }: { forecast: MarketForecast; act
 
 function NewsPage({
   holdingsData,
+  newsKeywordsData,
   liveNews,
   newsStatus,
   newsMessage,
   onRefreshNews,
 }: {
   holdingsData: Holding[]
+  newsKeywordsData: string[]
   liveNews: LiveNewsItem[]
   newsStatus: NewsStatus
   newsMessage: string
@@ -2273,7 +2291,7 @@ function NewsPage({
 }) {
   const [activeKeyword, setActiveKeyword] = useState('전체')
 
-  const keywordFilters = ['전체', ...newsKeywords]
+  const keywordFilters = ['전체', ...newsKeywordsData]
   const visibleLiveNews = activeKeyword === '전체' ? liveNews : liveNews.filter((item) => item.keyword === activeKeyword)
   const hasLiveNews = liveNews.length > 0
   const highImportanceCount = hasLiveNews
@@ -2868,6 +2886,7 @@ function NotesPage({
 function SettingsPage({
   holdingsData,
   watchlistData,
+  newsKeywordsData,
   leadingIndicatorsData,
   quoteStatus,
   quoteMessage,
@@ -2885,9 +2904,11 @@ function SettingsPage({
   backupData,
   onImportDashboardData,
   onResetDashboardData,
+  onUpdateNewsKeywords,
 }: {
   holdingsData: Holding[]
   watchlistData: WatchItem[]
+  newsKeywordsData: string[]
   leadingIndicatorsData: MarketIndicator[]
   quoteStatus: QuoteStatus
   quoteMessage: string
@@ -2905,10 +2926,14 @@ function SettingsPage({
   backupData: StoredDashboardData
   onImportDashboardData: (data: StoredDashboardData) => void
   onResetDashboardData: () => void
+  onUpdateNewsKeywords: (keywords: string[]) => void
 }) {
   const [backupText, setBackupText] = useState('')
   const [backupMessage, setBackupMessage] = useState('현재 브라우저에 저장된 개인 데이터를 백업하거나 복원할 수 있습니다.')
   const [backupTone, setBackupTone] = useState<'positive' | 'negative' | 'neutral'>('neutral')
+  const [keywordInput, setKeywordInput] = useState('')
+  const [keywordMessage, setKeywordMessage] = useState('네이버 뉴스 API가 이 키워드 목록을 기준으로 최신 이슈를 수집합니다.')
+  const [keywordTone, setKeywordTone] = useState<'positive' | 'negative' | 'neutral'>('neutral')
   const [healthResponse, setHealthResponse] = useState<HealthApiResponse | null>(null)
   const [healthStatus, setHealthStatus] = useState<DataHealthStatus>('idle')
   const [healthMessage, setHealthMessage] = useState('서버 진단 대기')
@@ -2923,9 +2948,11 @@ function SettingsPage({
   const backupStats = [
     { label: '보유종목', value: `${backupData.holdings.length}개` },
     { label: '관심종목', value: `${backupData.watchlist.length}개` },
+    { label: '뉴스 키워드', value: `${backupData.newsKeywords.length}개` },
     { label: '투자노트', value: backupData.journal.date },
   ]
   const backupMessageVariant = backupTone === 'positive' ? 'positive' : backupTone === 'negative' ? 'negative' : 'neutral'
+  const keywordMessageVariant = keywordTone === 'positive' ? 'positive' : keywordTone === 'negative' ? 'negative' : 'neutral'
   const runtimeSources = [
     {
       id: 'runtime-quotes',
@@ -3039,12 +3066,56 @@ function SettingsPage({
     const resetData = {
       holdings,
       watchlist,
+      newsKeywords: defaultNewsKeywords,
       journal: createDefaultJournal(),
     }
     onResetDashboardData()
     setBackupText(formatDashboardBackup(resetData))
     setBackupTone('positive')
     setBackupMessage('기본 보유/관심종목과 오늘 투자노트로 복원했습니다.')
+  }
+
+  const handleAddKeyword = () => {
+    const keyword = normalizeNewsKeyword(keywordInput)
+    if (!keyword) {
+      setKeywordTone('negative')
+      setKeywordMessage('추가할 키워드를 입력해주세요.')
+      return
+    }
+
+    const hasKeyword = newsKeywordsData.some((item) => item.toLocaleLowerCase('ko-KR') === keyword.toLocaleLowerCase('ko-KR'))
+    if (hasKeyword) {
+      setKeywordTone('neutral')
+      setKeywordMessage(`${keyword} 키워드는 이미 추적 중입니다.`)
+      setKeywordInput('')
+      return
+    }
+
+    if (newsKeywordsData.length >= 20) {
+      setKeywordTone('negative')
+      setKeywordMessage('뉴스 키워드는 최대 20개까지 추적할 수 있습니다.')
+      return
+    }
+
+    const nextKeywords = normalizeNewsKeywords([...newsKeywordsData, keyword])
+    onUpdateNewsKeywords(nextKeywords)
+    setKeywordInput('')
+    setKeywordTone('positive')
+    setKeywordMessage(`${keyword} 키워드를 뉴스 수집 대상에 추가했습니다.`)
+  }
+
+  const handleRemoveKeyword = (keyword: string) => {
+    const nextKeywords = newsKeywordsData.filter((item) => item !== keyword)
+    onUpdateNewsKeywords(nextKeywords.length > 0 ? nextKeywords : defaultNewsKeywords)
+    setKeywordTone('positive')
+    setKeywordMessage(`${keyword} 키워드를 제거했습니다.`)
+  }
+
+  const handleResetKeywords = () => {
+    onUpdateNewsKeywords(defaultNewsKeywords)
+    setKeywordInput('')
+    setKeywordTone('positive')
+    setKeywordMessage('기본 뉴스 키워드로 복원했습니다.')
   }
 
   return (
@@ -3166,7 +3237,7 @@ function SettingsPage({
             <div>
               <div className="mb-2 text-xs text-muted-foreground">뉴스 키워드</div>
               <div className="flex flex-wrap gap-2">
-                {newsKeywords.map((keyword) => (
+                {newsKeywordsData.map((keyword) => (
                   <Badge key={keyword} variant="secondary">
                     {keyword}
                   </Badge>
@@ -3194,6 +3265,68 @@ function SettingsPage({
           </CardContent>
         </Card>
       </section>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>뉴스 키워드 관리</CardTitle>
+          <CardDescription>내 포트폴리오와 내일장 판단에 반영할 네이버 뉴스 검색어</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Badge variant={keywordMessageVariant}>{keywordMessage}</Badge>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <input
+              value={keywordInput}
+              onChange={(event) => setKeywordInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  handleAddKeyword()
+                }
+              }}
+              placeholder="예: HBM, 실적발표, 원전"
+              className="h-10 min-w-0 flex-1 rounded-md border border-border bg-background px-3 text-sm text-foreground outline-none transition placeholder:text-muted-foreground focus:border-primary"
+            />
+            <div className="flex gap-2">
+              <Button type="button" onClick={handleAddKeyword}>
+                <Save className="size-4" />
+                추가
+              </Button>
+              <Button type="button" variant="outline" onClick={handleResetKeywords}>
+                <RefreshCw className="size-4" />
+                기본값
+              </Button>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {newsKeywordsData.map((keyword) => (
+              <button
+                key={keyword}
+                type="button"
+                onClick={() => handleRemoveKeyword(keyword)}
+                className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-muted/20 px-3 text-xs text-foreground transition hover:border-negative/40 hover:bg-negative/10"
+                aria-label={`${keyword} 키워드 제거`}
+              >
+                {keyword}
+                <X className="size-3 text-muted-foreground" />
+              </button>
+            ))}
+          </div>
+          <div className="grid gap-3 md:grid-cols-3">
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">현재 키워드</div>
+              <div className="mt-2 text-lg font-semibold">{newsKeywordsData.length}개</div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">뉴스 새로고침</div>
+              <div className="mt-2 text-lg font-semibold">10분</div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">최대 키워드</div>
+              <div className="mt-2 text-lg font-semibold">20개</div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
         <Card>
@@ -3273,6 +3406,7 @@ type DashboardActions = {
   onRefreshNews: () => void
   onRefreshDisclosures: () => void
   onRefreshCalendar: () => void
+  onUpdateNewsKeywords: (keywords: string[]) => void
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
   onResetJournal: () => void
@@ -3308,6 +3442,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
     return (
       <NewsPage
         holdingsData={snapshot.holdings}
+        newsKeywordsData={snapshot.newsKeywords}
         liveNews={snapshot.liveNews}
         newsStatus={snapshot.newsStatus}
         newsMessage={snapshot.newsMessage}
@@ -3354,6 +3489,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
       <SettingsPage
         holdingsData={snapshot.holdings}
         watchlistData={snapshot.watchlist}
+        newsKeywordsData={snapshot.newsKeywords}
         leadingIndicatorsData={snapshot.leadingIndicators}
         quoteStatus={snapshot.quoteStatus}
         quoteMessage={snapshot.quoteMessage}
@@ -3371,6 +3507,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         backupData={snapshot.storedData}
         onImportDashboardData={actions.onImportDashboardData}
         onResetDashboardData={actions.onResetDashboardData}
+        onUpdateNewsKeywords={actions.onUpdateNewsKeywords}
       />
     )
   }
@@ -3381,6 +3518,7 @@ export function Dashboard() {
   const [activePage, setActivePage] = useState<PageId>('dashboard')
   const [userHoldings, setUserHoldings] = useState<Holding[]>(holdings)
   const [userWatchlist, setUserWatchlist] = useState<WatchItem[]>(watchlist)
+  const [userNewsKeywords, setUserNewsKeywords] = useState<string[]>(defaultNewsKeywords)
   const [journal, setJournal] = useState<InvestmentJournal>(() => createDefaultJournal())
   const [storageLoaded, setStorageLoaded] = useState(false)
   const [quoteResponse, setQuoteResponse] = useState<QuotesApiResponse | null>(null)
@@ -3480,7 +3618,7 @@ export function Dashboard() {
 
     try {
       const params = new URLSearchParams({
-        keywords: newsKeywords.join(','),
+        keywords: userNewsKeywords.join(','),
         display: '3',
       })
       const response = await fetch(`/api/news?${params.toString()}`, { signal })
@@ -3516,7 +3654,7 @@ export function Dashboard() {
       setNewsStatus('error')
       setNewsMessage(error instanceof Error ? error.message : '뉴스를 불러오지 못했습니다.')
     }
-  }, [])
+  }, [userNewsKeywords])
   const loadDisclosures = useCallback(async (signal?: AbortSignal) => {
     setDisclosureStatus((status) => (status === 'idle' ? 'loading' : status))
 
@@ -3564,6 +3702,7 @@ export function Dashboard() {
     if (stored) {
       setUserHoldings(stored.holdings)
       setUserWatchlist(stored.watchlist)
+      setUserNewsKeywords(stored.newsKeywords)
       setJournal(stored.journal)
     }
     setStorageLoaded(true)
@@ -3574,9 +3713,10 @@ export function Dashboard() {
     saveStoredDashboardData({
       holdings: userHoldings,
       watchlist: userWatchlist,
+      newsKeywords: userNewsKeywords,
       journal,
     })
-  }, [journal, storageLoaded, userHoldings, userWatchlist])
+  }, [journal, storageLoaded, userHoldings, userNewsKeywords, userWatchlist])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -3636,6 +3776,7 @@ export function Dashboard() {
         quotes: quoteResponse?.quotes ?? [],
         baseHoldings: userHoldings,
         baseWatchlist: userWatchlist,
+        newsKeywordsData: userNewsKeywords,
         fetchedAt: quoteResponse?.fetchedAt ?? null,
         quoteStatus,
         quoteMessage,
@@ -3665,6 +3806,7 @@ export function Dashboard() {
       quoteResponse,
       quoteStatus,
       userHoldings,
+      userNewsKeywords,
       userWatchlist,
     ],
   )
@@ -3693,7 +3835,6 @@ export function Dashboard() {
       },
       onResetHoldings: () => {
         setUserHoldings(holdings)
-        resetStoredDashboardData()
       },
       onSaveWatchItem: (item, previousSymbol) => {
         setUserWatchlist((current) => {
@@ -3707,7 +3848,6 @@ export function Dashboard() {
       },
       onResetWatchlist: () => {
         setUserWatchlist(watchlist)
-        resetStoredDashboardData()
       },
       onRefreshNews: () => {
         void loadLiveNews()
@@ -3717,6 +3857,9 @@ export function Dashboard() {
       },
       onRefreshCalendar: () => {
         void loadCalendar()
+      },
+      onUpdateNewsKeywords: (keywords) => {
+        setUserNewsKeywords(normalizeNewsKeywords(keywords))
       },
       onUpdateJournal: (patch) => {
         setJournal((current) => ({
@@ -3751,6 +3894,7 @@ export function Dashboard() {
       onImportDashboardData: (data) => {
         setUserHoldings(data.holdings)
         setUserWatchlist(data.watchlist)
+        setUserNewsKeywords(data.newsKeywords)
         setJournal(data.journal)
         saveStoredDashboardData(data)
       },
@@ -3758,10 +3902,12 @@ export function Dashboard() {
         const nextJournal = createDefaultJournal()
         setUserHoldings(holdings)
         setUserWatchlist(watchlist)
+        setUserNewsKeywords(defaultNewsKeywords)
         setJournal(nextJournal)
         saveStoredDashboardData({
           holdings,
           watchlist,
+          newsKeywords: defaultNewsKeywords,
           journal: nextJournal,
         })
       },
