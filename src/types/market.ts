@@ -44,6 +44,34 @@ export type BiasScore = {
   risks: BiasFactor[]
 }
 
+export type KoreaBridgeSignal = {
+  id: string
+  symbol: string
+  name: string
+  change: number
+  direction: Direction
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  impact: number
+  weight: number
+  koreanImpact: string
+  confirmation: string
+  relatedSymbols: string[]
+}
+
+export type KoreaMarketBridge = {
+  score: number
+  label: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  riskLevel: 'low' | 'medium' | 'high'
+  summary: string
+  openBias: string
+  kospiRange: string
+  kosdaqRange: string
+  signals: KoreaBridgeSignal[]
+  playbook: string[]
+  watchSymbols: string[]
+}
+
 export type Holding = {
   symbol: string
   name: string

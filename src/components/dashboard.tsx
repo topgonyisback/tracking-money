@@ -73,6 +73,7 @@ import type {
   Holding,
   InvestmentJournal,
   JournalHistoryItem,
+  KoreaMarketBridge,
   LiveNewsItem,
   MarketIndicator,
   MarketQuote,
@@ -250,6 +251,7 @@ type DashboardSnapshot = {
   morningBrief: MorningBrief
   dataReliability: DataReliability
   signalAudit: SignalAudit
+  koreaMarketBridge: KoreaMarketBridge
   forecastReview: ForecastReview
   executionPlan: ExecutionPlan
   actionQueue: ActionQueueItem[]
@@ -423,6 +425,69 @@ const symbolProfiles: Record<string, { sector: string; sensitivity: string[] }> 
   AAPL: { sector: '빅테크', sensitivity: ['NQ=F', 'DXY'] },
   NVDA: { sector: 'AI 반도체', sensitivity: ['SOX', 'NQ=F'] },
   TSLA: { sector: '전기차', sensitivity: ['NQ=F', 'DXY'] },
+}
+
+const koreaBridgeSymbols = ['SOX', 'NQ=F', 'USD/KRW', 'VIX', 'US10Y', 'DXY', 'ES=F'] as const
+
+const koreaBridgeMeta: Record<
+  (typeof koreaBridgeSymbols)[number],
+  {
+    weight: number
+    threshold: number
+    koreanImpact: string
+    confirmation: string
+    relatedSymbols: string[]
+  }
+> = {
+  SOX: {
+    weight: 28,
+    threshold: 1.2,
+    koreanImpact: '필라델피아 반도체는 삼성전자와 SK하이닉스의 장 초반 방향에 가장 직접적으로 이어집니다.',
+    confirmation: '삼성전자·SK하이닉스가 KOSPI보다 강한지 먼저 확인',
+    relatedSymbols: ['005930', '000660', 'NVDA', 'SOX'],
+  },
+  'NQ=F': {
+    weight: 24,
+    threshold: 1,
+    koreanImpact: '나스닥100 선물은 국내 성장주와 코스닥 투자심리의 선행 온도계입니다.',
+    confirmation: '코스닥 대형 성장주와 NAVER, 배터리주의 첫 30분 상대강도 확인',
+    relatedSymbols: ['KOSDAQ', '035420', '373220', 'AAPL', 'NVDA'],
+  },
+  'USD/KRW': {
+    weight: 18,
+    threshold: 0.8,
+    koreanImpact: '달러/원 상승은 외국인 수급과 국내 대형주 밸류에이션에 부담으로 작동합니다.',
+    confirmation: '달러/원 첫 고시와 외국인 KOSPI200 선물 순매수 전환 여부 확인',
+    relatedSymbols: ['KOSPI', '005930', '000660', '373220'],
+  },
+  VIX: {
+    weight: 14,
+    threshold: 4,
+    koreanImpact: 'VIX 상승은 위험회피 심리를 키워 갭상승 추격보다 방어 기준을 우선하게 만듭니다.',
+    confirmation: '장 시작 직후 지수 상승 종목 수와 하락 종목 수의 확산 여부 확인',
+    relatedSymbols: ['KOSPI', 'KOSDAQ', 'NQ=F'],
+  },
+  US10Y: {
+    weight: 10,
+    threshold: 1.5,
+    koreanImpact: '미국 10년물 금리 상승은 성장주 할인율 부담으로 이어질 수 있습니다.',
+    confirmation: '성장주가 지수 대비 약하면 추격 매수는 보류',
+    relatedSymbols: ['KOSDAQ', '035420', 'AAPL', 'TSLA'],
+  },
+  DXY: {
+    weight: 8,
+    threshold: 0.8,
+    koreanImpact: '달러 인덱스 강세는 환율과 외국인 수급 부담으로 국내장에 후행 압력을 줄 수 있습니다.',
+    confirmation: 'USD/KRW와 외국인 현·선물 동시 매수 여부 확인',
+    relatedSymbols: ['USD/KRW', 'KOSPI'],
+  },
+  'ES=F': {
+    weight: 8,
+    threshold: 0.8,
+    koreanImpact: 'S&P500 선물은 미국 전체 위험선호가 유지되는지 보는 보조 신호입니다.',
+    confirmation: 'NQ=F와 같은 방향인지, 아니면 기술주만 따로 움직이는지 확인',
+    relatedSymbols: ['KOSPI', 'NQ=F'],
+  },
 }
 
 const dataHealthStatusLabel: Record<DataHealthStatus, string> = {
@@ -1309,6 +1374,108 @@ function buildLiveBiasScore(indicators: MarketIndicator[], liveQuoteCount: numbe
     summary,
     positives: positives.length > 0 ? positives : [{ label: '뚜렷한 긍정 요인 없음', impact: 0, direction: 'neutral' }],
     risks: risks.length > 0 ? risks : [{ label: '뚜렷한 부담 요인 없음', impact: 0, direction: 'neutral' }],
+  }
+}
+
+function buildKoreaMarketBridge(
+  indicators: MarketIndicator[],
+  holdingsData: Holding[],
+  watchlistData: WatchItem[],
+  biasScoreData: BiasScore,
+): KoreaMarketBridge {
+  const indicatorMap = new Map(indicators.map((indicator) => [indicator.symbol, indicator]))
+  const trackedSymbols = new Set([...holdingsData.map((holding) => holding.symbol), ...watchlistData.map((item) => item.symbol)])
+  const signals = koreaBridgeSymbols
+    .reduce<KoreaMarketBridge['signals']>((acc, symbol) => {
+      const indicator = indicatorMap.get(symbol)
+      if (!indicator) return acc
+
+      const meta = koreaBridgeMeta[symbol]
+      const change = indicator.change
+      const adjustedChange = inverseIndicators.has(symbol) ? -change : change
+      const rawImpact = Math.abs(adjustedChange) < 0.05 ? 0 : Math.sign(adjustedChange) * meta.weight * clamp(Math.abs(change) / meta.threshold, 0.35, 1.5)
+      const impact = clamp(Math.round(rawImpact), Math.round(meta.weight * -1.5), Math.round(meta.weight * 1.5))
+      const direction: Direction = impact > 0 ? 'positive' : impact < 0 ? 'negative' : 'neutral'
+      const trackedRelatedSymbols = meta.relatedSymbols.filter((relatedSymbol) => trackedSymbols.has(relatedSymbol))
+
+      acc.push({
+        id: `bridge-${symbol}`,
+        symbol,
+        name: indicator.name,
+        change,
+        direction,
+        tone: directionVariant(direction),
+        impact,
+        weight: meta.weight,
+        koreanImpact: meta.koreanImpact,
+        confirmation: meta.confirmation,
+        relatedSymbols: trackedRelatedSymbols.length > 0 ? trackedRelatedSymbols : meta.relatedSymbols,
+      })
+
+      return acc
+    }, [])
+    .sort((left, right) => Math.abs(right.impact) - Math.abs(left.impact))
+
+  const indicatorImpact = signals.reduce((sum, signal) => sum + signal.impact, 0)
+  const score = clamp(Math.round(50 + indicatorImpact + (biasScoreData.score - 50) * 0.25), 0, 100)
+  const topSignal = signals[0]
+  const topRisk = signals.find((signal) => signal.impact < 0)
+  const topPositive = signals.find((signal) => signal.impact > 0)
+  const negativeCount = signals.filter((signal) => signal.impact < -4).length
+  const riskLevel: KoreaMarketBridge['riskLevel'] = score <= 38 || negativeCount >= 3 ? 'high' : score <= 52 || negativeCount >= 2 ? 'medium' : 'low'
+  const tone: KoreaMarketBridge['tone'] = score >= 62 ? 'positive' : score <= 43 ? 'negative' : riskLevel === 'medium' ? 'warning' : 'neutral'
+  const label =
+    score >= 72
+      ? '미국발 강한 우호'
+      : score >= 62
+        ? '선별 우호'
+        : score >= 45
+          ? '중립 확인'
+          : score >= 35
+            ? '위험회피 압력'
+            : '강한 방어'
+  const openBias =
+    score >= 72
+      ? '갭상승 후 강한 종목 선별'
+      : score >= 62
+        ? '반도체·성장주 우선 확인'
+        : score >= 45
+          ? '첫 30분 수급 확인'
+          : score >= 35
+            ? '추격 매수 보류'
+            : '현금·리스크 관리 우선'
+  const kospiRange =
+    score >= 72 ? '+0.4% ~ +1.0%' : score >= 62 ? '+0.1% ~ +0.6%' : score >= 45 ? '-0.3% ~ +0.3%' : score >= 35 ? '-0.8% ~ -0.1%' : '-1.3% ~ -0.5%'
+  const kosdaqRange =
+    score >= 72 ? '+0.7% ~ +1.5%' : score >= 62 ? '+0.2% ~ +0.9%' : score >= 45 ? '-0.5% ~ +0.5%' : score >= 35 ? '-1.1% ~ -0.2%' : '-1.8% ~ -0.7%'
+  const watchSymbols = Array.from(
+    new Set([
+      ...signals.flatMap((signal) => signal.relatedSymbols),
+      ...(topPositive?.symbol === 'SOX' || topRisk?.symbol === 'SOX' ? ['005930', '000660'] : []),
+    ]),
+  ).slice(0, 8)
+  const summary =
+    topSignal && topSignal.impact !== 0
+      ? `${topSignal.symbol} ${formatChange(topSignal.change)}가 가장 큰 신호입니다. ${topRisk ? `${topRisk.symbol} 부담을 같이 확인해야 합니다.` : '장 초반 주도주 확산 여부가 핵심입니다.'}`
+      : '미국 선행지표는 뚜렷한 한 방향보다 중립에 가깝습니다. 장 시작 직후 외국인 수급과 환율을 확인해야 합니다.'
+  const playbook = [
+    topPositive ? `${topPositive.symbol} 강도가 유지되면 관련 종목만 분할 접근` : '상방 신호가 약하면 첫 매수는 30분 뒤로 지연',
+    topRisk ? `${topRisk.symbol} 부담이 커지면 신규 매수보다 보유 리스크 축소 우선` : '환율과 VIX가 안정적이면 기존 관심종목 트리거 확인',
+    '09:00~09:30에는 KOSPI200 선물 외국인 수급과 삼성전자·SK하이닉스 상대강도 확인',
+  ]
+
+  return {
+    score,
+    label,
+    tone,
+    riskLevel,
+    summary,
+    openBias,
+    kospiRange,
+    kosdaqRange,
+    signals,
+    playbook,
+    watchSymbols,
   }
 }
 
@@ -3216,6 +3383,7 @@ function buildDashboardSnapshot({
     buildLiveBiasScore(liveIndicators, quotes.length),
     buildNewsBiasFactor(liveNews, liveHoldings, liveWatchlist),
   )
+  const koreaMarketBridge = buildKoreaMarketBridge(liveIndicators, liveHoldings, liveWatchlist, liveBiasScore)
   const forecast = buildMarketForecast({
     biasScoreData: liveBiasScore,
     holdingsData: liveHoldings,
@@ -3345,6 +3513,7 @@ function buildDashboardSnapshot({
     morningBrief,
     dataReliability,
     signalAudit,
+    koreaMarketBridge,
     forecastReview,
     executionPlan,
     actionQueue,
@@ -3373,6 +3542,111 @@ function MetricCard({
             {detail}
           </Badge>
         ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+const koreaBridgeRiskLabel: Record<KoreaMarketBridge['riskLevel'], string> = {
+  low: '낮음',
+  medium: '주의',
+  high: '높음',
+}
+
+const koreaBridgeRiskVariant: Record<KoreaMarketBridge['riskLevel'], 'positive' | 'negative' | 'warning'> = {
+  low: 'positive',
+  medium: 'warning',
+  high: 'negative',
+}
+
+function KoreaMarketBridgePanel({ bridge, compact = false }: { bridge: KoreaMarketBridge; compact?: boolean }) {
+  const visibleSignals = compact ? bridge.signals.slice(0, 4) : bridge.signals
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>미국 선행지표 → 국내장 브리지</CardTitle>
+            <CardDescription>{bridge.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={bridge.tone}>{bridge.label}</Badge>
+            <Badge variant={koreaBridgeRiskVariant[bridge.riskLevel]}>위험 {koreaBridgeRiskLabel[bridge.riskLevel]}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">브리지 점수</div>
+            <div className="mt-2 text-2xl font-semibold">{bridge.score}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">장 초반 전략</div>
+            <div className="mt-2 text-sm font-semibold leading-5">{bridge.openBias}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">KOSPI 예상</div>
+            <div className="mt-2 font-mono text-sm font-semibold">{bridge.kospiRange}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">KOSDAQ 예상</div>
+            <div className="mt-2 font-mono text-sm font-semibold">{bridge.kosdaqRange}</div>
+          </div>
+        </div>
+
+        <div className={cn('grid gap-4', compact ? 'xl:grid-cols-[minmax(0,1fr)_280px]' : 'xl:grid-cols-[minmax(0,1fr)_320px]')}>
+          <div className="grid gap-2">
+            {visibleSignals.map((signal) => (
+              <div key={signal.id} className="rounded-md border border-border bg-muted/10 p-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-sm font-semibold">{signal.symbol}</span>
+                      <span className="text-sm text-muted-foreground">{signal.name}</span>
+                      <Badge variant={directionVariant(signal.direction)}>{formatChange(signal.change)}</Badge>
+                    </div>
+                    <div className="mt-2 text-sm leading-5">{signal.koreanImpact}</div>
+                  </div>
+                  <Badge variant={signal.tone}>{signal.impact > 0 ? `+${signal.impact}` : signal.impact}</Badge>
+                </div>
+                {!compact ? <div className="mt-2 text-xs leading-5 text-muted-foreground">{signal.confirmation}</div> : null}
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  {signal.relatedSymbols.slice(0, compact ? 4 : 6).map((symbol) => (
+                    <Badge key={symbol} variant="secondary">
+                      {symbol}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid content-start gap-3">
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">개장 전 체크</div>
+              <div className="mt-3 grid gap-2 text-sm leading-5">
+                {bridge.playbook.map((item) => (
+                  <div key={item} className="flex gap-2">
+                    <Check className="mt-0.5 size-4 shrink-0 text-primary" />
+                    <span>{item}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">우선 확인 심볼</div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {bridge.watchSymbols.map((symbol) => (
+                  <Badge key={symbol} variant="neutral">
+                    {symbol}
+                  </Badge>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
       </CardContent>
     </Card>
   )
@@ -4505,14 +4779,18 @@ function WatchlistPage({
 function MarketRadarPage({
   leadingIndicatorsData,
   biasScoreData,
+  koreaMarketBridge,
 }: {
   leadingIndicatorsData: MarketIndicator[]
   biasScoreData: BiasScore
+  koreaMarketBridge: KoreaMarketBridge
 }) {
   const indicatorChartData = buildIndicatorChartData(leadingIndicatorsData)
 
   return (
     <PageGrid>
+      <KoreaMarketBridgePanel bridge={koreaMarketBridge} />
+
       <section className="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
         <Card>
           <CardHeader>
@@ -6807,7 +7085,9 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
       />
     )
   }
-  if (page === 'radar') return <MarketRadarPage leadingIndicatorsData={snapshot.leadingIndicators} biasScoreData={snapshot.biasScore} />
+  if (page === 'radar') {
+    return <MarketRadarPage leadingIndicatorsData={snapshot.leadingIndicators} biasScoreData={snapshot.biasScore} koreaMarketBridge={snapshot.koreaMarketBridge} />
+  }
   if (page === 'forecast') {
     return (
       <ForecastPage
@@ -7655,6 +7935,8 @@ export function Dashboard() {
             <DataReliabilityPanel reliability={snapshot.dataReliability} onRefreshAll={refreshAllData} refreshing={dataRefreshBusy} compact />
 
             <SignalAuditPanel audit={snapshot.signalAudit} compact />
+
+            <KoreaMarketBridgePanel bridge={snapshot.koreaMarketBridge} compact />
 
             <Card>
               <CardHeader>
