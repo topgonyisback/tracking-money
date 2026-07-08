@@ -142,6 +142,18 @@ type DisclosureApiResponse = {
   message?: string
 }
 
+type ProfileSyncStatus = 'idle' | 'checking' | 'ready' | 'missing' | 'saving' | 'loading' | 'empty' | 'error'
+
+type ProfileSyncApiResponse = {
+  configured: boolean
+  status?: ProfileSyncStatus | 'unauthorized' | 'invalid'
+  data?: StoredDashboardData | null
+  updatedAt?: string | null
+  source?: string
+  storage?: string
+  message?: string
+}
+
 type ForecastScenario = {
   id: 'base' | 'upside' | 'downside'
   label: string
@@ -305,10 +317,28 @@ const dataHealthStatusLabel: Record<DataHealthStatus, string> = {
   local: '로컬 저장',
 }
 
+const profileSyncStatusLabel: Record<ProfileSyncStatus, string> = {
+  idle: '대기',
+  checking: '확인 중',
+  ready: '동기화 가능',
+  missing: '설정 필요',
+  saving: '저장 중',
+  loading: '불러오는 중',
+  empty: '저장 없음',
+  error: '오류',
+}
+
 function dataHealthVariant(status: DataHealthStatus): 'positive' | 'negative' | 'warning' | 'neutral' {
   if (status === 'ready' || status === 'local') return 'positive'
   if (status === 'partial' || status === 'fallback' || status === 'planned' || status === 'loading') return 'warning'
   if (status === 'error' || status === 'missing') return 'negative'
+  return 'neutral'
+}
+
+function profileSyncVariant(status: ProfileSyncStatus): 'positive' | 'negative' | 'warning' | 'neutral' {
+  if (status === 'ready') return 'positive'
+  if (status === 'checking' || status === 'saving' || status === 'loading' || status === 'empty') return 'warning'
+  if (status === 'missing' || status === 'error') return 'negative'
   return 'neutral'
 }
 
@@ -2934,6 +2964,10 @@ function SettingsPage({
   const [keywordInput, setKeywordInput] = useState('')
   const [keywordMessage, setKeywordMessage] = useState('네이버 뉴스 API가 이 키워드 목록을 기준으로 최신 이슈를 수집합니다.')
   const [keywordTone, setKeywordTone] = useState<'positive' | 'negative' | 'neutral'>('neutral')
+  const [syncKey, setSyncKey] = useState('')
+  const [profileSyncStatus, setProfileSyncStatus] = useState<ProfileSyncStatus>('idle')
+  const [profileSyncMessage, setProfileSyncMessage] = useState('서버 동기화 상태 확인 대기')
+  const [profileSyncUpdatedAt, setProfileSyncUpdatedAt] = useState<string | null>(null)
   const [healthResponse, setHealthResponse] = useState<HealthApiResponse | null>(null)
   const [healthStatus, setHealthStatus] = useState<DataHealthStatus>('idle')
   const [healthMessage, setHealthMessage] = useState('서버 진단 대기')
@@ -2953,6 +2987,7 @@ function SettingsPage({
   ]
   const backupMessageVariant = backupTone === 'positive' ? 'positive' : backupTone === 'negative' ? 'negative' : 'neutral'
   const keywordMessageVariant = keywordTone === 'positive' ? 'positive' : keywordTone === 'negative' ? 'negative' : 'neutral'
+  const profileSyncBusy = profileSyncStatus === 'checking' || profileSyncStatus === 'saving' || profileSyncStatus === 'loading'
   const runtimeSources = [
     {
       id: 'runtime-quotes',
@@ -3027,14 +3062,37 @@ function SettingsPage({
     }
   }, [])
 
+  const loadProfileSyncStatus = useCallback(async (signal?: AbortSignal) => {
+    setProfileSyncStatus('checking')
+
+    try {
+      const response = await fetch('/api/profile?status=1', { signal })
+      const contentType = response.headers.get('content-type') ?? ''
+
+      if (!contentType.includes('application/json')) {
+        throw new Error('서버 동기화 API 응답을 확인할 수 없습니다.')
+      }
+
+      const payload = (await response.json()) as ProfileSyncApiResponse
+      setProfileSyncStatus(payload.configured ? 'ready' : 'missing')
+      setProfileSyncMessage(payload.message ?? (payload.configured ? '서버 동기화를 사용할 수 있습니다.' : '서버 동기화 설정이 필요합니다.'))
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+
+      setProfileSyncStatus('error')
+      setProfileSyncMessage(error instanceof Error ? error.message : '서버 동기화 상태를 확인하지 못했습니다.')
+    }
+  }, [])
+
   useEffect(() => {
     const controller = new AbortController()
     void loadHealth(controller.signal)
+    void loadProfileSyncStatus(controller.signal)
 
     return () => {
       controller.abort()
     }
-  }, [loadHealth])
+  }, [loadHealth, loadProfileSyncStatus])
 
   const handleBuildBackup = () => {
     setBackupText(formatDashboardBackup(backupData))
@@ -3116,6 +3174,105 @@ function SettingsPage({
     setKeywordInput('')
     setKeywordTone('positive')
     setKeywordMessage('기본 뉴스 키워드로 복원했습니다.')
+  }
+
+  const handleSaveProfileToServer = async () => {
+    if (!syncKey.trim()) {
+      setProfileSyncStatus('error')
+      setProfileSyncMessage('서버에 저장하려면 동기화 키를 입력해주세요.')
+      return
+    }
+
+    setProfileSyncStatus('saving')
+    try {
+      const response = await fetch('/api/profile', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-sync-key': syncKey.trim(),
+        },
+        body: JSON.stringify({ data: backupData }),
+      })
+      const contentType = response.headers.get('content-type') ?? ''
+      if (!contentType.includes('application/json')) {
+        throw new Error('서버 동기화 API 응답을 확인할 수 없습니다.')
+      }
+
+      const payload = (await response.json()) as ProfileSyncApiResponse
+      if (!payload.configured) {
+        setProfileSyncStatus('missing')
+        setProfileSyncMessage(payload.message ?? '서버 동기화 환경변수 설정이 필요합니다.')
+        return
+      }
+      if (!response.ok) {
+        setProfileSyncStatus('error')
+        setProfileSyncMessage(payload.message ?? '서버 저장에 실패했습니다.')
+        return
+      }
+
+      setProfileSyncStatus('ready')
+      setProfileSyncUpdatedAt(payload.updatedAt ?? new Date().toISOString())
+      setProfileSyncMessage(payload.message ?? '현재 프로필을 서버에 저장했습니다.')
+    } catch (error) {
+      setProfileSyncStatus('error')
+      setProfileSyncMessage(error instanceof Error ? error.message : '서버 저장에 실패했습니다.')
+    }
+  }
+
+  const handleLoadProfileFromServer = async () => {
+    if (!syncKey.trim()) {
+      setProfileSyncStatus('error')
+      setProfileSyncMessage('서버에서 불러오려면 동기화 키를 입력해주세요.')
+      return
+    }
+
+    setProfileSyncStatus('loading')
+    try {
+      const response = await fetch('/api/profile', {
+        headers: {
+          'x-sync-key': syncKey.trim(),
+        },
+      })
+      const contentType = response.headers.get('content-type') ?? ''
+      if (!contentType.includes('application/json')) {
+        throw new Error('서버 동기화 API 응답을 확인할 수 없습니다.')
+      }
+
+      const payload = (await response.json()) as ProfileSyncApiResponse
+      if (!payload.configured) {
+        setProfileSyncStatus('missing')
+        setProfileSyncMessage(payload.message ?? '서버 동기화 환경변수 설정이 필요합니다.')
+        return
+      }
+      if (!response.ok) {
+        setProfileSyncStatus('error')
+        setProfileSyncMessage(payload.message ?? '서버 불러오기에 실패했습니다.')
+        return
+      }
+      if (!payload.data) {
+        setProfileSyncStatus('empty')
+        setProfileSyncMessage(payload.message ?? '아직 서버에 저장된 프로필이 없습니다.')
+        return
+      }
+
+      const data = normalizeStoredDashboardData(payload.data)
+      if (!data) {
+        setProfileSyncStatus('error')
+        setProfileSyncMessage('서버 프로필 형식이 현재 앱과 맞지 않습니다.')
+        return
+      }
+
+      onImportDashboardData(data)
+      setBackupText(formatDashboardBackup(data))
+      setBackupTone('positive')
+      setBackupMessage('서버에서 불러온 프로필을 현재 브라우저에 적용했습니다.')
+      setProfileSyncStatus('ready')
+      setProfileSyncUpdatedAt(payload.updatedAt ?? null)
+      setProfileSyncMessage(payload.message ?? '서버 프로필을 불러왔습니다.')
+    } catch (error) {
+      setProfileSyncStatus('error')
+      setProfileSyncMessage(error instanceof Error ? error.message : '서버 불러오기에 실패했습니다.')
+    }
   }
 
   return (
@@ -3323,6 +3480,65 @@ function SettingsPage({
             <div className="rounded-md border border-border bg-muted/15 p-3">
               <div className="text-xs text-muted-foreground">최대 키워드</div>
               <div className="mt-2 text-lg font-semibold">20개</div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div>
+              <CardTitle>서버 동기화</CardTitle>
+              <CardDescription>다른 기기에서도 같은 보유종목, 관심종목, 뉴스 키워드, 투자노트 사용</CardDescription>
+            </div>
+            <Button type="button" variant="outline" size="sm" onClick={() => void loadProfileSyncStatus()} disabled={profileSyncBusy}>
+              <RefreshCw className={cn('size-4', profileSyncStatus === 'checking' && 'animate-spin')} />
+              상태 확인
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant={profileSyncVariant(profileSyncStatus)}>{profileSyncStatusLabel[profileSyncStatus]}</Badge>
+            {profileSyncUpdatedAt ? <Badge variant="secondary">최근 서버 저장 {formatMarketTime(profileSyncUpdatedAt)}</Badge> : null}
+          </div>
+          <div className="text-sm leading-6 text-muted-foreground">{profileSyncMessage}</div>
+          <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+            <input
+              value={syncKey}
+              onChange={(event) => setSyncKey(event.target.value)}
+              type="password"
+              placeholder="Vercel PROFILE_SYNC_KEY"
+              className="h-10 min-w-0 rounded-md border border-border bg-background px-3 text-sm text-foreground outline-none transition placeholder:text-muted-foreground focus:border-primary"
+            />
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" onClick={() => void handleSaveProfileToServer()} disabled={profileSyncBusy}>
+                <Save className={cn('size-4', profileSyncStatus === 'saving' && 'animate-pulse')} />
+                서버 저장
+              </Button>
+              <Button type="button" variant="outline" onClick={() => void handleLoadProfileFromServer()} disabled={profileSyncBusy}>
+                <Download className={cn('size-4', profileSyncStatus === 'loading' && 'animate-pulse')} />
+                서버 불러오기
+              </Button>
+            </div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-4">
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">저장 대상</div>
+              <div className="mt-2 text-sm font-semibold">보유/관심/키워드/노트</div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">서버 저장소</div>
+              <div className="mt-2 text-sm font-semibold">Upstash Redis REST</div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">필요 환경변수</div>
+              <div className="mt-2 text-sm font-semibold">3개</div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="text-xs text-muted-foreground">동기화 키</div>
+              <div className="mt-2 text-sm font-semibold">브라우저 미저장</div>
             </div>
           </div>
         </CardContent>
