@@ -80,6 +80,7 @@ import type {
   MarketQuote,
   MorningBrief,
   NewsImpactBoard,
+  OvernightStressTest,
   PortfolioPlaybook,
   PreMarketCommandCenter,
   SignalAudit,
@@ -257,6 +258,7 @@ type DashboardSnapshot = {
   signalAudit: SignalAudit
   koreaMarketBridge: KoreaMarketBridge
   forecastSensitivity: ForecastSensitivity
+  overnightStressTest: OvernightStressTest
   forecastReview: ForecastReview
   executionPlan: ExecutionPlan
   preMarketCommand: PreMarketCommandCenter
@@ -1236,6 +1238,10 @@ function formatKrwAmount(value: number) {
   return `${prefix}${Math.round(abs).toLocaleString('ko-KR')}`
 }
 
+function formatSignedKrwAmount(value: number) {
+  return value > 0 ? `+${formatKrwAmount(value)}` : formatKrwAmount(value)
+}
+
 function portfolioVariantFromSeverity(
   severity: PortfolioPlaybook['riskSignals'][number]['severity'],
 ): 'positive' | 'negative' | 'warning' | 'neutral' {
@@ -2137,6 +2143,202 @@ function indicatorPressure(indicators: MarketIndicator[], symbol: string) {
 
   const signedChange = inverseIndicators.has(symbol) ? -indicator.change : indicator.change
   return signedChange
+}
+
+function stressToneFromScore(score: number): OvernightStressTest['stressTone'] {
+  if (score >= 62) return 'positive'
+  if (score <= 40) return 'negative'
+  if (score <= 50) return 'warning'
+  return 'neutral'
+}
+
+function stressLabelFromScore(score: number) {
+  if (score >= 62) return '충격 흡수'
+  if (score >= 51) return '중립 방어'
+  if (score >= 41) return '압박 경계'
+  return '방어 우선'
+}
+
+function stressRangeFromScore(score: number, market: 'KOSPI' | 'KOSDAQ') {
+  if (market === 'KOSDAQ') {
+    if (score >= 70) return '+0.6% ~ +1.4%'
+    if (score >= 62) return '+0.2% ~ +0.9%'
+    if (score >= 51) return '-0.3% ~ +0.4%'
+    if (score >= 41) return '-1.0% ~ -0.2%'
+    return '-1.8% ~ -0.7%'
+  }
+
+  if (score >= 70) return '+0.4% ~ +1.0%'
+  if (score >= 62) return '+0.1% ~ +0.6%'
+  if (score >= 51) return '-0.2% ~ +0.3%'
+  if (score >= 41) return '-0.8% ~ -0.1%'
+  return '-1.4% ~ -0.5%'
+}
+
+function stressPositionTone(impactPercent: number): OvernightStressTest['positions'][number]['tone'] {
+  if (impactPercent <= -2.2) return 'negative'
+  if (impactPercent <= -0.8) return 'warning'
+  if (impactPercent > 0) return 'positive'
+  return 'neutral'
+}
+
+function stressPositionNote(sensitivity: string[], impactPercent: number) {
+  if (sensitivity.includes('SOX')) return `SOX/NQ 추가 약세 때 반도체 민감도 확대, 추정 ${formatChange(impactPercent)}`
+  if (sensitivity.includes('USD/KRW')) return `환율 재상승 때 외국인 수급 부담 반영, 추정 ${formatChange(impactPercent)}`
+  if (sensitivity.includes('US10Y')) return `금리 상승 때 성장주 밸류 부담 반영, 추정 ${formatChange(impactPercent)}`
+  if (sensitivity.includes('DXY')) return `강달러 구간에서 미국 성장주 변동성 반영, 추정 ${formatChange(impactPercent)}`
+  return `야간 위험회피 확대 가정, 추정 ${formatChange(impactPercent)}`
+}
+
+function buildOvernightStressTest({
+  forecast,
+  koreaMarketBridge,
+  forecastSensitivity,
+  newsImpactBoard,
+  holdingsData,
+  indicators,
+  usdKrw,
+}: {
+  forecast: MarketForecast
+  koreaMarketBridge: KoreaMarketBridge
+  forecastSensitivity: ForecastSensitivity
+  newsImpactBoard: NewsImpactBoard
+  holdingsData: Holding[]
+  indicators: MarketIndicator[]
+  usdKrw: number
+}): OvernightStressTest {
+  const downsideGapPenalty = forecastSensitivity.downsideGap <= 4 ? 5 : forecastSensitivity.downsideGap <= 10 ? 2 : 0
+  const bridgePenalty = koreaMarketBridge.riskLevel === 'high' ? 14 : koreaMarketBridge.riskLevel === 'medium' ? 10 : 7
+  const livePressurePenalty =
+    Math.max(0, -indicatorPressure(indicators, 'SOX')) * 3.6 +
+    Math.max(0, -indicatorPressure(indicators, 'NQ=F')) * 3 +
+    Math.max(0, -indicatorPressure(indicators, 'USD/KRW')) * 2.5 +
+    Math.max(0, -indicatorPressure(indicators, 'VIX')) * 1.8 +
+    Math.max(0, -indicatorPressure(indicators, 'US10Y')) * 1.6
+  const stressPenalty = clamp(Math.round(bridgePenalty + livePressurePenalty + downsideGapPenalty), 8, 30)
+  const stressScore = clamp(forecast.baseScore - stressPenalty, 0, 100)
+  const sensitivityImpact: Record<string, number> = {
+    SOX: -1.35,
+    'NQ=F': -0.85,
+    'USD/KRW': -0.55,
+    VIX: -0.45,
+    US10Y: -0.4,
+    DXY: -0.3,
+    TSLA: -0.75,
+    KOSPI: -0.45,
+  }
+  const boardBySymbol = new Map(newsImpactBoard.items.map((item) => [item.symbol, item]))
+  const positions = holdingsData
+    .map((holding) => {
+      const profile = getSymbolProfile(holding.symbol, holding.name)
+      const sensitivity = Array.from(new Set([...profile.sensitivity, ...(holding.market === 'KR' ? ['USD/KRW'] : [])]))
+      const baseValueKrw = holdingMarketValueKrw(holding, usdKrw)
+      const newsScore = boardBySymbol.get(holding.symbol)?.score ?? 0
+      const sectorPenalty = profile.sector.includes('반도체') ? -0.45 : profile.sector.includes('배터리') ? -0.35 : profile.sector.includes('인터넷') ? -0.25 : 0
+      const marketPenalty = holding.market === 'KR' ? -0.25 : -0.1
+      const momentumPenalty = holding.dayChange < -1 ? -0.35 : holding.dayChange > 1 ? 0.15 : 0
+      const rawImpactPercent =
+        -0.25 +
+        sensitivity.reduce((sum, item) => sum + (sensitivityImpact[item] ?? -0.2), 0) +
+        sectorPenalty +
+        marketPenalty +
+        momentumPenalty +
+        clamp(newsScore / 85, -1.2, 0.8)
+      const stressImpactPercent = round(clamp(rawImpactPercent, -7.5, 2.5), 2)
+      const stressImpactKrw = Math.round(baseValueKrw * (stressImpactPercent / 100))
+
+      return {
+        symbol: holding.symbol,
+        name: holding.name,
+        market: holding.market,
+        weight: holding.portfolioWeight,
+        baseValueKrw,
+        stressImpactKrw,
+        stressImpactPercent,
+        sensitivity,
+        note: stressPositionNote(sensitivity, stressImpactPercent),
+        tone: stressPositionTone(stressImpactPercent),
+      }
+    })
+    .sort((left, right) => left.stressImpactKrw - right.stressImpactKrw)
+
+  const totalValueKrw = positions.reduce((sum, position) => sum + position.baseValueKrw, 0)
+  const portfolioImpactKrw = positions.reduce((sum, position) => sum + position.stressImpactKrw, 0)
+  const portfolioImpactPercent = totalValueKrw > 0 ? round((portfolioImpactKrw / totalValueKrw) * 100, 2) : 0
+  const maxDrawdownKrw = Math.round(portfolioImpactKrw < 0 ? portfolioImpactKrw * 1.45 : portfolioImpactKrw * 0.35)
+  const maxDrawdownPercent = totalValueKrw > 0 ? round((maxDrawdownKrw / totalValueKrw) * 100, 2) : 0
+  const topAffectedSymbols = positions.slice(0, 4).map((position) => position.symbol)
+  const stabilizeScore = clamp(forecast.baseScore + Math.max(5, Math.round(stressPenalty * 0.45)), 0, 100)
+  const mixedScore = clamp(forecast.baseScore - Math.max(4, Math.round(stressPenalty * 0.45)), 0, 100)
+  const stabilizationImpactKrw = Math.round(Math.abs(portfolioImpactKrw) * 0.35)
+  const mixedImpactKrw = Math.round(portfolioImpactKrw * 0.45)
+  const stabilizationImpactPercent = totalValueKrw > 0 ? round((stabilizationImpactKrw / totalValueKrw) * 100, 2) : 0
+  const mixedImpactPercent = totalValueKrw > 0 ? round((mixedImpactKrw / totalValueKrw) * 100, 2) : 0
+  const affectedLabel = topAffectedSymbols.slice(0, 2).join(', ') || '상위 보유종목'
+
+  return {
+    generatedAt: new Date().toISOString(),
+    summary: `${koreaMarketBridge.label}에서 야간 악화 가정 시 방향점수는 ${forecast.baseScore}에서 ${stressScore}까지 밀릴 수 있습니다. ${affectedLabel}을 먼저 방어 체크합니다.`,
+    baseScore: forecast.baseScore,
+    stressScore,
+    stressLabel: stressLabelFromScore(stressScore),
+    stressTone: stressToneFromScore(stressScore),
+    expectedKospiRange: stressRangeFromScore(stressScore, 'KOSPI'),
+    expectedKosdaqRange: stressRangeFromScore(stressScore, 'KOSDAQ'),
+    portfolioImpactKrw,
+    portfolioImpactPercent,
+    maxDrawdownKrw,
+    maxDrawdownPercent,
+    scenarios: [
+      {
+        id: 'risk-off',
+        label: '야간 악화',
+        tone: stressToneFromScore(stressScore),
+        scoreDelta: stressScore - forecast.baseScore,
+        kospiRange: stressRangeFromScore(stressScore, 'KOSPI'),
+        kosdaqRange: stressRangeFromScore(stressScore, 'KOSDAQ'),
+        portfolioImpactKrw,
+        portfolioImpactPercent,
+        summary: 'SOX/NQ가 추가 하락하고 환율·VIX 부담이 커지는 경우입니다. 시초가 추격보다 방어 주문을 먼저 봅니다.',
+        triggers: ['SOX -1%대 추가 약세', 'NQ=F 음전 또는 낙폭 확대', 'USD/KRW와 VIX 동반 상승'],
+        topAffectedSymbols,
+      },
+      {
+        id: 'stabilize',
+        label: '안정 회복',
+        tone: 'positive',
+        scoreDelta: stabilizeScore - forecast.baseScore,
+        kospiRange: stressRangeFromScore(stabilizeScore, 'KOSPI'),
+        kosdaqRange: stressRangeFromScore(stabilizeScore, 'KOSDAQ'),
+        portfolioImpactKrw: stabilizationImpactKrw,
+        portfolioImpactPercent: stabilizationImpactPercent,
+        summary: 'NQ/SOX가 낙폭을 줄이고 환율이 안정되면 기존 예측보다 우호적인 출발이 가능합니다.',
+        triggers: ['SOX와 NQ=F 플러스권 회복', 'USD/KRW 상승폭 축소', 'VIX 하락 전환'],
+        topAffectedSymbols: Array.from(new Set([...koreaMarketBridge.watchSymbols, ...topAffectedSymbols])).slice(0, 4),
+      },
+      {
+        id: 'mixed',
+        label: '혼조 유지',
+        tone: 'warning',
+        scoreDelta: mixedScore - forecast.baseScore,
+        kospiRange: stressRangeFromScore(mixedScore, 'KOSPI'),
+        kosdaqRange: stressRangeFromScore(mixedScore, 'KOSDAQ'),
+        portfolioImpactKrw: mixedImpactKrw,
+        portfolioImpactPercent: mixedImpactPercent,
+        summary: '지수는 버티지만 환율이나 금리 중 하나가 부담으로 남는 경우입니다. 대장주 상대강도 확인 전까지 선별 접근합니다.',
+        triggers: ['NQ=F 보합권, SOX 약세', '환율 상승세 지속', '개장 30분 수급 불확실'],
+        topAffectedSymbols: topAffectedSymbols.slice(0, 3),
+      },
+    ],
+    positions,
+    hedgeChecklist: [
+      stressScore <= 43 ? '09:00~09:30 신규 매수 금지, 기존 보유 손절선과 현금 비중부터 확인' : '첫 30분은 대장주 상대강도 확인 후 분할 접근',
+      `${topAffectedSymbols[0] ?? '상위 보유종목'}은 시초가가 약하면 추격 대신 전일 저점·VWAP 회복 여부 확인`,
+      'USD/KRW가 추가 상승하면 국내 성장주와 반도체 신규 주문은 한 단계 낮춤',
+      'VIX 급등 또는 NQ=F 음전이면 예약 매수 주문을 취소하고 알림만 유지',
+    ],
+    focusSymbols: Array.from(new Set([...topAffectedSymbols, 'SOX', 'NQ=F', 'USD/KRW', 'VIX'])).slice(0, 8),
+  }
 }
 
 function portfolioSeverityRank(severity: PortfolioPlaybook['riskSignals'][number]['severity']) {
@@ -3877,6 +4079,7 @@ function buildDashboardSnapshot({
     disclosureStatus,
     calendarStatus,
   })
+  const usdKrw = getQuote(quoteMap, 'USD/KRW')?.price ?? Number(marketStatus.usdKrw.replace(/,/g, ''))
   const portfolioPlaybook = buildPortfolioPlaybook({
     holdingsData: liveHoldings,
     watchlistData: liveWatchlist,
@@ -3885,13 +4088,22 @@ function buildDashboardSnapshot({
     forecast,
     newsItems: liveNews,
     disclosures,
-    usdKrw: getQuote(quoteMap, 'USD/KRW')?.price ?? Number(marketStatus.usdKrw.replace(/,/g, '')),
+    usdKrw,
   })
   const forecastSensitivity = buildForecastSensitivity({
     forecast,
     koreaMarketBridge,
     newsImpactBoard,
     portfolioPlaybook,
+  })
+  const overnightStressTest = buildOvernightStressTest({
+    forecast,
+    koreaMarketBridge,
+    forecastSensitivity,
+    newsImpactBoard,
+    holdingsData: liveHoldings,
+    indicators: liveIndicators,
+    usdKrw,
   })
   const actionQueue = buildActionQueue({
     biasScoreData: liveBiasScore,
@@ -3938,7 +4150,7 @@ function buildDashboardSnapshot({
     forecast,
     dataReliability,
     actionQueue,
-    usdKrw: getQuote(quoteMap, 'USD/KRW')?.price ?? Number(marketStatus.usdKrw.replace(/,/g, '')),
+    usdKrw,
   })
   const morningBrief = buildMorningBrief({
     forecast,
@@ -4015,6 +4227,7 @@ function buildDashboardSnapshot({
     signalAudit,
     koreaMarketBridge,
     forecastSensitivity,
+    overnightStressTest,
     forecastReview,
     executionPlan,
     preMarketCommand,
@@ -4281,6 +4494,145 @@ function ForecastSensitivityPanel({ sensitivity, compact = false }: { sensitivit
                   <span>{item}</span>
                 </div>
               ))}
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function OvernightStressTestPanel({ stress, compact = false }: { stress: OvernightStressTest; compact?: boolean }) {
+  const visiblePositions = compact ? stress.positions.slice(0, 4) : stress.positions
+  const visibleScenarios = compact ? stress.scenarios.slice(0, 3) : stress.scenarios
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>야간 스트레스 테스트</CardTitle>
+            <CardDescription>{stress.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={stress.stressTone}>{stress.stressLabel}</Badge>
+            <Badge variant="secondary">{formatNewsTime(stress.generatedAt)}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">스트레스 점수</div>
+            <div className="mt-2 text-2xl font-semibold">{stress.stressScore}</div>
+            <Badge className="mt-3" variant={stress.stressTone}>
+              기준 {stress.baseScore} → {stress.stressScore}
+            </Badge>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">KOSPI 압박 범위</div>
+            <div className="mt-2 text-xl font-semibold">{stress.expectedKospiRange}</div>
+            <div className="mt-2 text-xs text-muted-foreground">KOSDAQ {stress.expectedKosdaqRange}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">포트폴리오 충격</div>
+            <div className="mt-2 text-xl font-semibold">{formatSignedKrwAmount(stress.portfolioImpactKrw)}</div>
+            <Badge className="mt-3" variant={stress.portfolioImpactPercent < 0 ? 'negative' : 'positive'}>
+              {formatChange(stress.portfolioImpactPercent)}
+            </Badge>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">최대 방어선</div>
+            <div className="mt-2 text-xl font-semibold">{formatSignedKrwAmount(stress.maxDrawdownKrw)}</div>
+            <Badge className="mt-3" variant={stress.maxDrawdownPercent < 0 ? 'negative' : 'neutral'}>
+              {formatChange(stress.maxDrawdownPercent)}
+            </Badge>
+          </div>
+        </div>
+
+        <div className={cn('grid gap-4', compact ? 'xl:grid-cols-[minmax(0,1fr)_300px]' : 'xl:grid-cols-[minmax(0,1fr)_360px]')}>
+          <div className="grid gap-3">
+            {visibleScenarios.map((scenario) => (
+              <div key={scenario.id} className="rounded-md border border-border bg-muted/10 p-3">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant={scenario.tone}>{scenario.label}</Badge>
+                      <Badge variant="secondary">
+                        {scenario.scoreDelta > 0 ? '+' : ''}
+                        {scenario.scoreDelta}점
+                      </Badge>
+                      <span className="text-sm font-semibold">{scenario.kospiRange}</span>
+                    </div>
+                    <div className="mt-2 text-sm leading-5 text-muted-foreground">{scenario.summary}</div>
+                  </div>
+                  <div className="flex shrink-0 flex-wrap gap-2">
+                    <Badge variant={scenario.portfolioImpactPercent < 0 ? 'negative' : 'positive'}>{formatChange(scenario.portfolioImpactPercent)}</Badge>
+                    <Badge variant="secondary">{formatSignedKrwAmount(scenario.portfolioImpactKrw)}</Badge>
+                  </div>
+                </div>
+                {!compact ? (
+                  <div className="mt-3 grid gap-2 md:grid-cols-3">
+                    {scenario.triggers.map((trigger) => (
+                      <div key={trigger} className="rounded-md border border-border bg-background/70 px-3 py-2 text-xs leading-5 text-muted-foreground">
+                        {trigger}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  {scenario.topAffectedSymbols.map((symbol) => (
+                    <Badge key={symbol} variant="secondary">
+                      {symbol}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid content-start gap-3">
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">민감 포지션</div>
+              <div className="mt-3 grid gap-3">
+                {visiblePositions.map((position) => (
+                  <div key={position.symbol} className="rounded-md border border-border bg-background/70 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-mono text-sm font-semibold">{position.symbol}</span>
+                          <Badge variant="secondary">{position.weight}%</Badge>
+                        </div>
+                        <div className="mt-1 text-sm font-medium">{position.name}</div>
+                      </div>
+                      <Badge variant={position.tone}>{formatChange(position.stressImpactPercent)}</Badge>
+                    </div>
+                    <Progress className="mt-3" value={clamp(Math.abs(position.stressImpactPercent) * 14, 4, 100)} />
+                    {!compact ? <div className="mt-2 text-xs leading-5 text-muted-foreground">{position.note}</div> : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-md border border-negative/25 bg-negative/10 p-3">
+              <div className="text-xs font-medium text-negative">방어 체크</div>
+              <div className="mt-3 grid gap-2 text-sm leading-5">
+                {stress.hedgeChecklist.slice(0, compact ? 3 : stress.hedgeChecklist.length).map((item) => (
+                  <div key={item} className="flex gap-2">
+                    <X className="mt-0.5 size-4 shrink-0 text-negative" />
+                    <span>{item}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">야간 집중 심볼</div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {stress.focusSymbols.map((symbol) => (
+                  <Badge key={symbol} variant="neutral">
+                    {symbol}
+                  </Badge>
+                ))}
+              </div>
             </div>
           </div>
         </div>
@@ -5760,6 +6112,7 @@ function ForecastPage({
   dataReliability,
   signalAudit,
   forecastSensitivity,
+  overnightStressTest,
   preMarketCommand,
   executionPlan,
 }: {
@@ -5769,6 +6122,7 @@ function ForecastPage({
   dataReliability: DataReliability
   signalAudit: SignalAudit
   forecastSensitivity: ForecastSensitivity
+  overnightStressTest: OvernightStressTest
   preMarketCommand: PreMarketCommandCenter
   executionPlan: ExecutionPlan
 }) {
@@ -5792,6 +6146,8 @@ function ForecastPage({
       <SignalAuditPanel audit={signalAudit} />
 
       <ForecastSensitivityPanel sensitivity={forecastSensitivity} />
+
+      <OvernightStressTestPanel stress={overnightStressTest} />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
         <Card>
@@ -7948,6 +8304,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         dataReliability={snapshot.dataReliability}
         signalAudit={snapshot.signalAudit}
         forecastSensitivity={snapshot.forecastSensitivity}
+        overnightStressTest={snapshot.overnightStressTest}
         preMarketCommand={snapshot.preMarketCommand}
         executionPlan={snapshot.executionPlan}
       />
@@ -8787,6 +9144,8 @@ export function Dashboard() {
             </section>
 
             <PreMarketCommandCenterPanel command={snapshot.preMarketCommand} compact />
+
+            <OvernightStressTestPanel stress={snapshot.overnightStressTest} compact />
 
             <NewsImpactBoardPanel board={snapshot.newsImpactBoard} compact />
 

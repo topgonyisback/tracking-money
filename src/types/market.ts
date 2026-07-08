@@ -187,6 +187,52 @@ export type ForecastSensitivity = {
   transitionChecklist: string[]
 }
 
+export type OvernightStressScenario = {
+  id: string
+  label: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  scoreDelta: number
+  kospiRange: string
+  kosdaqRange: string
+  portfolioImpactKrw: number
+  portfolioImpactPercent: number
+  summary: string
+  triggers: string[]
+  topAffectedSymbols: string[]
+}
+
+export type OvernightStressPosition = {
+  symbol: string
+  name: string
+  market: 'KR' | 'US'
+  weight: number
+  baseValueKrw: number
+  stressImpactKrw: number
+  stressImpactPercent: number
+  sensitivity: string[]
+  note: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+}
+
+export type OvernightStressTest = {
+  generatedAt: string
+  summary: string
+  baseScore: number
+  stressScore: number
+  stressLabel: string
+  stressTone: 'positive' | 'negative' | 'warning' | 'neutral'
+  expectedKospiRange: string
+  expectedKosdaqRange: string
+  portfolioImpactKrw: number
+  portfolioImpactPercent: number
+  maxDrawdownKrw: number
+  maxDrawdownPercent: number
+  scenarios: OvernightStressScenario[]
+  positions: OvernightStressPosition[]
+  hedgeChecklist: string[]
+  focusSymbols: string[]
+}
+
 export type PreMarketCommandStep = {
   id: string
   order: number
