@@ -7,6 +7,7 @@ import {
   Clock3,
   Download,
   ExternalLink,
+  FileText,
   Gauge,
   LayoutDashboard,
   LineChart,
@@ -59,6 +60,7 @@ import type {
   BiasScore,
   CalendarEvent,
   Direction,
+  DisclosureItem,
   Holding,
   InvestmentJournal,
   LiveNewsItem,
@@ -73,6 +75,7 @@ const navItems = [
   { id: 'watchlist', label: '관심종목', subtitle: '매수가 조건과 이슈 트리거', icon: Star },
   { id: 'radar', label: '시장 레이더', subtitle: '선행 지표와 국내장 연결', icon: Radar },
   { id: 'news', label: '뉴스', subtitle: '종목별 이슈와 영향도', icon: Newspaper },
+  { id: 'disclosures', label: '공시', subtitle: 'DART 공시와 실적 원문', icon: FileText },
   { id: 'calendar', label: '캘린더', subtitle: '실적, 매크로, 정책 일정', icon: CalendarDays },
   { id: 'alerts', label: '알림', subtitle: '오늘 우선순위 액션', icon: Bell },
   { id: 'notes', label: '투자노트', subtitle: '시나리오와 장 후 리뷰', icon: NotebookPen },
@@ -84,6 +87,7 @@ type PageId = (typeof navItems)[number]['id']
 type QuoteStatus = 'idle' | 'loading' | 'ready' | 'partial' | 'fallback' | 'error'
 type CalendarStatus = 'idle' | 'loading' | 'ready' | 'fallback' | 'error'
 type NewsStatus = 'idle' | 'loading' | 'ready' | 'fallback' | 'error'
+type DisclosureStatus = 'idle' | 'loading' | 'ready' | 'partial' | 'fallback' | 'error'
 type DataHealthStatus = 'idle' | 'loading' | 'ready' | 'partial' | 'fallback' | 'error' | 'missing' | 'planned' | 'local'
 
 type DataHealthService = {
@@ -127,6 +131,16 @@ type CalendarApiResponse = {
   message?: string
 }
 
+type DisclosureApiResponse = {
+  configured: boolean
+  source: string
+  fetchedAt: string
+  status: 'ready' | 'partial' | 'fallback'
+  items: DisclosureItem[]
+  errors: { symbol: string; message: string }[]
+  message?: string
+}
+
 type MarketStatusView = typeof marketStatus
 type StoredDashboardData = {
   holdings: Holding[]
@@ -157,6 +171,9 @@ type DashboardSnapshot = {
   liveNews: LiveNewsItem[]
   newsStatus: NewsStatus
   newsMessage: string
+  disclosures: DisclosureItem[]
+  disclosureStatus: DisclosureStatus
+  disclosureMessage: string
   actionQueue: ActionQueueItem[]
   journal: InvestmentJournal
 }
@@ -231,6 +248,7 @@ const actionCategoryLabel = {
   watchlist: '관심',
   news: '뉴스',
   calendar: '일정',
+  disclosure: '공시',
 }
 
 const watchStatusLabel = {
@@ -945,6 +963,33 @@ function buildCalendarActionItems(eventsData: CalendarEvent[]): ActionQueueItem[
     )
 }
 
+function buildDisclosureActionItems(disclosures: DisclosureItem[], holdingsData: Holding[], watchlistData: WatchItem[]): ActionQueueItem[] {
+  const trackedSymbols = new Set([...holdingsData.map((holding) => holding.symbol), ...watchlistData.map((item) => item.symbol)])
+
+  return disclosures
+    .filter((item) => item.importance === 'high' || trackedSymbols.has(item.symbol))
+    .slice(0, 4)
+    .map((item) =>
+      makeActionItem({
+        id: `disclosure-${item.receiptNo || item.id}`,
+        priority: item.importance === 'high' && trackedSymbols.has(item.symbol) ? 'high' : 'medium',
+        category: 'disclosure',
+        title: `${item.corpName} 공시 원문 확인`,
+        summary: item.reportName,
+        reason: item.expectedImpact,
+        suggestedAction:
+          item.direction === 'negative'
+            ? '공시 원문에서 리스크 원인과 정정 여부를 확인하고 장 초반 가격 반응을 먼저 봅니다.'
+            : item.direction === 'positive'
+              ? '수치와 계약 조건을 원문에서 확인한 뒤 뉴스 확산과 거래량을 같이 봅니다.'
+              : '제목만으로 방향을 단정하지 말고 원문 핵심 항목과 시장 반응을 기록합니다.',
+        relatedSymbols: [item.symbol, item.sector],
+        evidence: `${formatDisclosureDate(item.submittedAt)} · ${item.source}`,
+        score: 62 + (item.importance === 'high' ? 20 : 0),
+      }),
+    )
+}
+
 function buildActionQueue({
   biasScoreData,
   holdingsData,
@@ -952,6 +997,7 @@ function buildActionQueue({
   indicators,
   newsItems,
   eventsData,
+  disclosures,
 }: {
   biasScoreData: BiasScore
   holdingsData: Holding[]
@@ -959,6 +1005,7 @@ function buildActionQueue({
   indicators: MarketIndicator[]
   newsItems: LiveNewsItem[]
   eventsData: CalendarEvent[]
+  disclosures: DisclosureItem[]
 }) {
   const seen = new Set<string>()
   return [
@@ -967,6 +1014,7 @@ function buildActionQueue({
     ...buildWatchlistActionItems(watchlistData),
     ...buildNewsActionItems(newsItems, holdingsData, watchlistData),
     ...buildCalendarActionItems(eventsData),
+    ...buildDisclosureActionItems(disclosures, holdingsData, watchlistData),
   ]
     .filter((item) => {
       if (seen.has(item.id)) return false
@@ -1019,6 +1067,9 @@ function buildDashboardSnapshot({
   liveNews,
   newsStatus,
   newsMessage,
+  disclosures,
+  disclosureStatus,
+  disclosureMessage,
   journal,
 }: {
   baseHoldings: Holding[]
@@ -1033,6 +1084,9 @@ function buildDashboardSnapshot({
   liveNews: LiveNewsItem[]
   newsStatus: NewsStatus
   newsMessage: string
+  disclosures: DisclosureItem[]
+  disclosureStatus: DisclosureStatus
+  disclosureMessage: string
   journal: InvestmentJournal
 }): DashboardSnapshot {
   const quoteMap = quoteBySymbol(quotes)
@@ -1050,6 +1104,7 @@ function buildDashboardSnapshot({
     indicators: liveIndicators,
     newsItems: liveNews,
     eventsData: calendarEventsData,
+    disclosures,
   })
 
   return {
@@ -1073,6 +1128,9 @@ function buildDashboardSnapshot({
     liveNews,
     newsStatus,
     newsMessage,
+    disclosures,
+    disclosureStatus,
+    disclosureMessage,
     actionQueue,
     journal,
   }
@@ -1714,6 +1772,21 @@ function formatNewsTime(value: string) {
   })
 }
 
+function formatDisclosureDate(value: string) {
+  if (!/^\d{8}$/.test(value)) return '접수일 확인'
+  const year = Number(value.slice(0, 4))
+  const month = Number(value.slice(4, 6))
+  const day = Number(value.slice(6, 8))
+  const date = new Date(year, month - 1, day)
+  if (Number.isNaN(date.getTime())) return '접수일 확인'
+
+  return date.toLocaleDateString('ko-KR', {
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'short',
+  })
+}
+
 function formatSavedTime(value: string | null) {
   if (!value) return '아직 저장 전'
   const date = new Date(value)
@@ -1885,6 +1958,113 @@ function NewsPage({
           </CardContent>
         </Card>
       </section>
+    </PageGrid>
+  )
+}
+
+function DisclosuresPage({
+  disclosures,
+  disclosureStatus,
+  disclosureMessage,
+  onRefreshDisclosures,
+}: {
+  disclosures: DisclosureItem[]
+  disclosureStatus: DisclosureStatus
+  disclosureMessage: string
+  onRefreshDisclosures: () => void
+}) {
+  const highImportanceCount = disclosures.filter((item) => item.importance === 'high').length
+  const positiveCount = disclosures.filter((item) => item.direction === 'positive').length
+  const riskCount = disclosures.filter((item) => item.direction === 'negative' || item.direction === 'mixed').length
+  const statusLabel =
+    disclosureStatus === 'ready'
+      ? 'OpenDART 연결'
+      : disclosureStatus === 'partial'
+        ? '일부 연결'
+        : disclosureStatus === 'loading'
+          ? '불러오는 중'
+          : disclosureStatus === 'error'
+            ? '연결 오류'
+            : '설정 필요'
+
+  return (
+    <PageGrid>
+      <section className="grid gap-4 md:grid-cols-4">
+        <MetricCard label="최근 공시" value={`${disclosures.length}건`} detail={statusLabel} tone={disclosureStatus === 'error' ? 'negative' : disclosures.length > 0 ? 'positive' : 'neutral'} />
+        <MetricCard label="높은 중요도" value={`${highImportanceCount}건`} detail="원문 우선" tone="warning" />
+        <MetricCard label="우호 가능성" value={`${positiveCount}건`} detail="수치 확인" tone="positive" />
+        <MetricCard label="리스크/혼재" value={`${riskCount}건`} detail="가격 반응 확인" tone="negative" />
+      </section>
+
+      <Card>
+        <CardHeader>
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div>
+              <CardTitle>DART 공시 원문</CardTitle>
+              <CardDescription>보유/관심 국내 종목의 최근 공시와 예상 영향</CardDescription>
+            </div>
+            <Button type="button" variant="outline" size="sm" onClick={onRefreshDisclosures} disabled={disclosureStatus === 'loading'}>
+              <RefreshCw className={cn('size-4', disclosureStatus === 'loading' && 'animate-spin')} />
+              새로고침
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant={disclosureStatus === 'ready' ? 'positive' : disclosureStatus === 'partial' ? 'warning' : disclosureStatus === 'error' ? 'negative' : 'neutral'}>
+              {statusLabel}
+            </Badge>
+            <span className="text-xs text-muted-foreground">{disclosureMessage}</span>
+          </div>
+
+          {disclosures.length > 0 ? (
+            <div className="grid gap-3 xl:grid-cols-2">
+              {disclosures.map((item) => (
+                <a
+                  key={item.id}
+                  href={item.link}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block rounded-md border border-border bg-muted/15 p-4 transition hover:border-primary/45 hover:bg-muted/25"
+                >
+                  <div className="mb-3 flex flex-wrap items-center gap-2">
+                    <Badge variant="neutral">{formatDisclosureDate(item.submittedAt)}</Badge>
+                    <Badge variant={directionVariant(item.direction)}>{directionLabel[item.direction]}</Badge>
+                    <Badge variant={item.importance === 'high' ? 'warning' : 'neutral'}>중요도 {importanceLabel[item.importance]}</Badge>
+                    <Badge variant="secondary">{item.symbol}</Badge>
+                    <Badge variant="secondary">{item.source}</Badge>
+                  </div>
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold leading-6">{item.corpName}</div>
+                      <div className="mt-1 text-sm leading-6 text-foreground/90">{item.reportName}</div>
+                    </div>
+                    <ExternalLink className="mt-1 size-4 shrink-0 text-muted-foreground" />
+                  </div>
+                  <div className="mt-3 text-sm leading-6 text-muted-foreground">{item.expectedImpact}</div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Badge variant="secondary">{item.sector}</Badge>
+                    {item.note ? <Badge variant="secondary">{item.note}</Badge> : null}
+                    {item.receiptNo ? <Badge variant="secondary">{item.receiptNo}</Badge> : null}
+                  </div>
+                </a>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-md border border-border bg-muted/15 p-5">
+              <div className="text-sm font-medium">공시 원문 연결 대기</div>
+              <div className="mt-2 text-sm leading-6 text-muted-foreground">
+                OpenDART API 키가 있으면 삼성전자, SK하이닉스, NAVER, LG에너지솔루션 같은 국내 종목의 최근 공시를 자동으로 가져옵니다.
+              </div>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <Badge variant="warning">OPENDART_API_KEY</Badge>
+                <Badge variant="secondary">Vercel 환경변수</Badge>
+                <Badge variant="secondary">서버 함수 전용</Badge>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </PageGrid>
   )
 }
@@ -2239,6 +2419,9 @@ function SettingsPage({
   newsStatus,
   newsMessage,
   liveNewsCount,
+  disclosureStatus,
+  disclosureMessage,
+  disclosureCount,
   backupData,
   onImportDashboardData,
   onResetDashboardData,
@@ -2256,6 +2439,9 @@ function SettingsPage({
   newsStatus: NewsStatus
   newsMessage: string
   liveNewsCount: number
+  disclosureStatus: DisclosureStatus
+  disclosureMessage: string
+  disclosureCount: number
   backupData: StoredDashboardData
   onImportDashboardData: (data: StoredDashboardData) => void
   onResetDashboardData: () => void
@@ -2310,6 +2496,16 @@ function SettingsPage({
       summary: calendarMessage,
       detail: '장전 점검과 이벤트가 액션 큐에 반영됩니다.',
       coverage: ['매크로', '정책', '실적 구간'],
+    },
+    {
+      id: 'runtime-disclosures',
+      name: '현재 공시 원문',
+      status: disclosureStatus as DataHealthStatus,
+      source: 'OpenDART 수신 상태',
+      metric: `${disclosureCount}건`,
+      summary: disclosureMessage,
+      detail: disclosureCount > 0 ? '공시 원문 기반 액션 큐 반영 중' : 'OPENDART_API_KEY가 없거나 최근 공시가 없습니다.',
+      coverage: ['DART 공시', '잠정실적', '주요사항보고'],
     },
   ]
 
@@ -2615,6 +2811,7 @@ type DashboardActions = {
   onDeleteWatchItem: (symbol: string) => void
   onResetWatchlist: () => void
   onRefreshNews: () => void
+  onRefreshDisclosures: () => void
   onRefreshCalendar: () => void
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
@@ -2654,6 +2851,16 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         newsStatus={snapshot.newsStatus}
         newsMessage={snapshot.newsMessage}
         onRefreshNews={actions.onRefreshNews}
+      />
+    )
+  }
+  if (page === 'disclosures') {
+    return (
+      <DisclosuresPage
+        disclosures={snapshot.disclosures}
+        disclosureStatus={snapshot.disclosureStatus}
+        disclosureMessage={snapshot.disclosureMessage}
+        onRefreshDisclosures={actions.onRefreshDisclosures}
       />
     )
   }
@@ -2697,6 +2904,9 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         newsStatus={snapshot.newsStatus}
         newsMessage={snapshot.newsMessage}
         liveNewsCount={snapshot.liveNews.length}
+        disclosureStatus={snapshot.disclosureStatus}
+        disclosureMessage={snapshot.disclosureMessage}
+        disclosureCount={snapshot.disclosures.length}
         backupData={snapshot.storedData}
         onImportDashboardData={actions.onImportDashboardData}
         onResetDashboardData={actions.onResetDashboardData}
@@ -2721,6 +2931,9 @@ export function Dashboard() {
   const [liveNews, setLiveNews] = useState<LiveNewsItem[]>([])
   const [newsStatus, setNewsStatus] = useState<NewsStatus>('idle')
   const [newsMessage, setNewsMessage] = useState('뉴스 연결 대기')
+  const [disclosureResponse, setDisclosureResponse] = useState<DisclosureApiResponse | null>(null)
+  const [disclosureStatus, setDisclosureStatus] = useState<DisclosureStatus>('idle')
+  const [disclosureMessage, setDisclosureMessage] = useState('공시 연결 대기')
   const currentPage = navItems.find((item) => item.id === activePage) ?? navItems[0]
   const trackedQuoteSymbols = useMemo(
     () =>
@@ -2843,6 +3056,47 @@ export function Dashboard() {
       setNewsMessage(error instanceof Error ? error.message : '뉴스를 불러오지 못했습니다.')
     }
   }, [])
+  const loadDisclosures = useCallback(async (signal?: AbortSignal) => {
+    setDisclosureStatus((status) => (status === 'idle' ? 'loading' : status))
+
+    try {
+      const domesticSymbols = trackedQuoteSymbols.filter((symbol) => /^\d{6}$/.test(symbol))
+      const params = new URLSearchParams({
+        symbols: domesticSymbols.join(','),
+        days: '30',
+      })
+      const response = await fetch(`/api/disclosures?${params.toString()}`, { signal })
+      const contentType = response.headers.get('content-type') ?? ''
+
+      if (!contentType.includes('application/json')) {
+        throw new Error('OpenDART 공시 API 응답을 확인할 수 없습니다.')
+      }
+
+      const payload = (await response.json()) as DisclosureApiResponse
+
+      if (!response.ok) {
+        setDisclosureStatus('error')
+        setDisclosureMessage(payload.message ?? 'OpenDART 공시 API 호출에 실패했습니다.')
+        return
+      }
+
+      if (!payload.configured) {
+        setDisclosureResponse(payload)
+        setDisclosureStatus('fallback')
+        setDisclosureMessage(payload.message ?? 'OpenDART API 환경변수 설정이 필요합니다.')
+        return
+      }
+
+      setDisclosureResponse(payload)
+      setDisclosureStatus(payload.items.length > 0 ? payload.status : 'fallback')
+      setDisclosureMessage(payload.message ?? (payload.items.length > 0 ? `${payload.items.length}개 공시 연결` : '최근 공시가 없습니다.'))
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
+
+      setDisclosureStatus('error')
+      setDisclosureMessage(error instanceof Error ? error.message : '공시를 불러오지 못했습니다.')
+    }
+  }, [trackedQuoteSymbols])
 
   useEffect(() => {
     const stored = loadStoredDashboardData()
@@ -2902,6 +3156,19 @@ export function Dashboard() {
     }
   }, [loadLiveNews])
 
+  useEffect(() => {
+    const controller = new AbortController()
+    void loadDisclosures(controller.signal)
+    const intervalId = window.setInterval(() => {
+      void loadDisclosures()
+    }, 900_000)
+
+    return () => {
+      controller.abort()
+      window.clearInterval(intervalId)
+    }
+  }, [loadDisclosures])
+
   const snapshot = useMemo(
     () =>
       buildDashboardSnapshot({
@@ -2917,12 +3184,18 @@ export function Dashboard() {
         liveNews,
         newsStatus,
         newsMessage,
+        disclosures: disclosureResponse?.items ?? [],
+        disclosureStatus,
+        disclosureMessage,
         journal,
       }),
     [
       calendarMessage,
       calendarResponse,
       calendarStatus,
+      disclosureMessage,
+      disclosureResponse,
+      disclosureStatus,
       liveNews,
       journal,
       newsMessage,
@@ -2978,6 +3251,9 @@ export function Dashboard() {
       onRefreshNews: () => {
         void loadLiveNews()
       },
+      onRefreshDisclosures: () => {
+        void loadDisclosures()
+      },
       onRefreshCalendar: () => {
         void loadCalendar()
       },
@@ -3029,7 +3305,7 @@ export function Dashboard() {
         })
       },
     }),
-    [loadCalendar, loadLiveNews],
+    [loadCalendar, loadDisclosures, loadLiveNews],
   )
 
   return (
@@ -3205,10 +3481,60 @@ export function Dashboard() {
             <ActionQueuePanel
               items={snapshot.actionQueue}
               title="오늘 액션 큐"
-              description="지표, 뉴스, 캘린더, 보유/관심종목을 합친 우선순위"
+              description="지표, 뉴스, 공시, 캘린더, 보유/관심종목을 합친 우선순위"
               maxItems={4}
               compact
             />
+
+            <Card>
+              <CardHeader>
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <CardTitle>DART 공시 체크</CardTitle>
+                    <CardDescription>{snapshot.disclosureMessage}</CardDescription>
+                  </div>
+                  <Button type="button" variant="outline" size="sm" onClick={() => setActivePage('disclosures')}>
+                    <FileText className="size-4" />
+                    공시 보기
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent>
+                {snapshot.disclosures.length > 0 ? (
+                  <div className="grid gap-3 lg:grid-cols-3">
+                    {snapshot.disclosures.slice(0, 3).map((item) => (
+                      <a
+                        key={item.id}
+                        href={item.link}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="block rounded-md border border-border bg-muted/15 p-4 transition hover:border-primary/45 hover:bg-muted/25"
+                      >
+                        <div className="mb-3 flex flex-wrap gap-2">
+                          <Badge variant="neutral">{formatDisclosureDate(item.submittedAt)}</Badge>
+                          <Badge variant={directionVariant(item.direction)}>{directionLabel[item.direction]}</Badge>
+                          <Badge variant={item.importance === 'high' ? 'warning' : 'neutral'}>{importanceLabel[item.importance]}</Badge>
+                        </div>
+                        <div className="text-sm font-semibold">{item.corpName}</div>
+                        <div className="mt-2 line-clamp-2 text-sm leading-6 text-muted-foreground">{item.reportName}</div>
+                      </a>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-md border border-border bg-muted/15 p-4">
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <Badge variant={snapshot.disclosureStatus === 'error' ? 'negative' : 'warning'}>
+                        {snapshot.disclosureStatus === 'loading' ? '확인 중' : snapshot.disclosureStatus === 'error' ? '연결 오류' : '설정 필요'}
+                      </Badge>
+                      <Badge variant="secondary">OPENDART_API_KEY</Badge>
+                    </div>
+                    <div className="text-sm leading-6 text-muted-foreground">
+                      OpenDART 키를 Vercel 환경변수에 추가하면 국내 보유/관심종목의 공시 원문이 이 영역과 액션 큐에 반영됩니다.
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
 
             <section className="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_420px]">
               <Card>

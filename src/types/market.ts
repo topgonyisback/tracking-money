@@ -111,10 +111,30 @@ export type CalendarEvent = {
   description?: string
 }
 
+export type DisclosureItem = {
+  id: string
+  symbol: string
+  corpCode: string
+  corpName: string
+  stockCode: string
+  market: 'KR' | 'US'
+  sector: string
+  reportName: string
+  submitter: string
+  submittedAt: string
+  receiptNo: string
+  link: string
+  note: string
+  source: string
+  direction: Direction
+  importance: 'low' | 'medium' | 'high'
+  expectedImpact: string
+}
+
 export type ActionQueueItem = {
   id: string
   priority: 'critical' | 'high' | 'medium' | 'low'
-  category: 'market' | 'portfolio' | 'watchlist' | 'news' | 'calendar'
+  category: 'market' | 'portfolio' | 'watchlist' | 'news' | 'calendar' | 'disclosure'
   title: string
   summary: string
   reason: string

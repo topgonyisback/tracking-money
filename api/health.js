@@ -64,13 +64,13 @@ export default async function handler(req, res) {
     {
       id: 'disclosure',
       name: '공시/실적 원문',
-      status: openDartConfigured ? 'partial' : 'planned',
+      status: openDartConfigured ? 'ready' : 'missing',
       configured: openDartConfigured,
       source: 'OpenDART',
-      cadence: '다음 구현 대상',
+      cadence: '서버 5분 캐시, 화면 15분 갱신',
       coverage: ['국내 상장사 공시', '실적 정정', '잠정실적', '주요사항보고서'],
-      summary: openDartConfigured ? 'OpenDART 키는 감지됐지만 공시 수집 라우트는 아직 연결 전입니다.' : 'OpenDART 연동은 아직 준비 단계입니다.',
-      nextAction: '공시 라우트와 종목 코드 매핑을 추가하면 뉴스와 캘린더 신뢰도가 올라갑니다.',
+      summary: openDartConfigured ? 'OpenDART 키가 서버 환경변수에 설정되어 있습니다.' : 'OpenDART 키가 설정되지 않았습니다.',
+      nextAction: openDartConfigured ? '보유/관심 국내 종목의 최근 공시를 확인할 수 있습니다.' : 'Vercel 환경변수에 OPENDART_API_KEY를 추가하면 공시 원문이 연결됩니다.',
     },
   ]
 
