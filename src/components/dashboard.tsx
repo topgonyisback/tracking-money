@@ -350,6 +350,42 @@ type ForecastCalibration = {
   recent: ForecastCalibrationRecent[]
 }
 
+type SymbolBriefingCatalyst = {
+  id: string
+  source: 'price' | 'news' | 'disclosure' | 'calendar' | 'action'
+  label: string
+  summary: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral' | 'secondary'
+  evidence: string
+  href?: string
+}
+
+type SymbolBriefingItem = {
+  symbol: string
+  name: string
+  market: 'KR' | 'US'
+  source: 'holding' | 'watchlist'
+  score: number
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  verdict: string
+  summary: string
+  priceLabel: string
+  changeLabel: string
+  exposureLabel: string
+  primaryAction: string
+  catalysts: SymbolBriefingCatalyst[]
+  nextChecks: string[]
+}
+
+type SymbolBriefing = {
+  generatedAt: string
+  summary: string
+  opportunityCount: number
+  riskCount: number
+  focusSymbols: string[]
+  items: SymbolBriefingItem[]
+}
+
 type DataFreshnessSource = {
   id: DataReliability['sources'][number]['id']
   name: string
@@ -448,6 +484,7 @@ type DashboardSnapshot = {
   overnightStressTest: OvernightStressTest
   forecastReview: ForecastReview
   forecastCalibration: ForecastCalibration
+  symbolBriefing: SymbolBriefing
   executionPlan: ExecutionPlan
   preMarketCommand: PreMarketCommandCenter
   marketSession: MarketSessionControl
@@ -1999,6 +2036,213 @@ function buildSymbolNewsImpactBoard(
     negativeCount,
     mixedCount,
     hotSymbols: items.slice(0, 5).map((item) => item.symbol),
+    items,
+  }
+}
+
+function symbolBriefingTone(score: number): SymbolBriefingItem['tone'] {
+  if (score >= 28) return 'positive'
+  if (score <= -28) return 'negative'
+  if (Math.abs(score) >= 12) return 'warning'
+  return 'neutral'
+}
+
+function symbolBriefingVerdict(score: number, source: SymbolBriefingItem['source']) {
+  if (score >= 42) return source === 'holding' ? '우호 유지' : '진입 후보'
+  if (score >= 18) return '상대강도 확인'
+  if (score <= -42) return source === 'holding' ? '방어 우선' : '진입 보류'
+  if (score <= -18) return '리스크 점검'
+  return '관찰 유지'
+}
+
+function relatedSymbolMatches(symbol: string, relatedSymbols: string[]) {
+  const normalized = normalizeUserSymbol(symbol)
+  return relatedSymbols.some((item) => normalizeUserSymbol(item) === normalized)
+}
+
+function disclosureImpactScore(item: DisclosureItem) {
+  const base = item.importance === 'high' ? 18 : item.importance === 'medium' ? 10 : 5
+  if (item.direction === 'positive') return base
+  if (item.direction === 'negative') return -base - 6
+  if (item.direction === 'mixed') return -Math.round(base * 0.65)
+  return Math.round(base * 0.25)
+}
+
+function calendarImpactScore(item: CalendarEvent) {
+  const base = item.importance === 'high' ? 14 : item.importance === 'medium' ? 8 : 4
+  const todayBoost = isTodayCalendarEvent(item) ? 6 : 0
+  const estimatedPenalty = item.status === 'estimated' ? -3 : 0
+  return base + todayBoost + estimatedPenalty
+}
+
+function actionImpactScore(item: ActionQueueItem) {
+  return priorityRank(item.priority) * 5 + Math.min(10, Math.round(item.score / 12))
+}
+
+function buildSymbolBriefing({
+  holdingsData,
+  watchlistData,
+  newsImpactBoard,
+  disclosures,
+  eventsData,
+  actionQueue,
+}: {
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+  newsImpactBoard: NewsImpactBoard
+  disclosures: DisclosureItem[]
+  eventsData: CalendarEvent[]
+  actionQueue: ActionQueueItem[]
+}): SymbolBriefing {
+  const holdingSymbols = new Set(holdingsData.map((holding) => holding.symbol))
+  const targets = [
+    ...holdingsData.map((holding) => ({
+      symbol: holding.symbol,
+      name: holding.name,
+      market: holding.market,
+      source: 'holding' as const,
+      priceLabel: formatCurrency(holding.currentPrice, holding.market),
+      changeLabel: formatChange(holding.dayChange),
+      exposureLabel: `${holding.portfolioWeight}%`,
+      priceScore: clamp(Math.round(holding.dayChange * 4), -28, 28),
+      baseSummary: holding.impactNote,
+    })),
+    ...watchlistData
+      .filter((item) => !holdingSymbols.has(item.symbol))
+      .map((item) => {
+        const market = defaultMarketForSymbol(item.symbol)
+        const nearScore = item.status === 'near' ? 18 : item.status === 'alert' ? -8 : clamp(Math.round((8 - item.distanceToBuy) * 1.6), -10, 10)
+        return {
+          symbol: item.symbol,
+          name: item.name,
+          market,
+          source: 'watchlist' as const,
+          priceLabel: formatCurrency(item.currentPrice, market),
+          changeLabel: `관심가까지 ${round(item.distanceToBuy, 1)}%`,
+          exposureLabel: watchStatusLabel[item.status],
+          priceScore: nearScore,
+          baseSummary: item.trigger,
+        }
+      }),
+  ]
+
+  const items = targets
+    .map((target) => {
+      const newsImpact = newsImpactBoard.items.find((item) => item.symbol === target.symbol)
+      const symbolDisclosures = disclosures.filter((item) => item.symbol === target.symbol).slice(0, 3)
+      const symbolEvents = eventsData.filter((event) => relatedSymbolMatches(target.symbol, event.relatedSymbols)).slice(0, 3)
+      const symbolActions = actionQueue.filter((item) => relatedSymbolMatches(target.symbol, item.relatedSymbols)).slice(0, 3)
+      const disclosureScore = clamp(symbolDisclosures.reduce((sum, item) => sum + disclosureImpactScore(item), 0), -34, 34)
+      const calendarScore = clamp(symbolEvents.reduce((sum, item) => sum + calendarImpactScore(item), 0), 0, 28)
+      const actionScore = clamp(symbolActions.reduce((sum, item) => sum + actionImpactScore(item), 0), 0, 32)
+      const newsScore = Math.round((newsImpact?.score ?? 0) * 0.45)
+      const score = clamp(target.priceScore + newsScore + disclosureScore + calendarScore + actionScore, -100, 100)
+      const tone = symbolBriefingTone(score)
+      const verdict = symbolBriefingVerdict(score, target.source)
+      const catalysts: SymbolBriefingCatalyst[] = [
+        {
+          id: `${target.symbol}-price`,
+          source: 'price',
+          label: '가격 반응',
+          summary: `${target.name} ${target.priceLabel}, ${target.changeLabel}`,
+          tone: target.priceScore > 8 ? 'positive' : target.priceScore < -8 ? 'negative' : 'neutral',
+          evidence: target.source === 'holding' ? `비중 ${target.exposureLabel}` : target.exposureLabel,
+        },
+        newsImpact
+          ? {
+              id: `${target.symbol}-news`,
+              source: 'news',
+              label: '뉴스 민감도',
+              summary: newsImpact.topHeadline,
+              tone: newsImpact.tone,
+              evidence: `${newsImpact.issueCount}건 · ${newsImpact.topKeyword}`,
+            }
+          : null,
+        ...symbolDisclosures.map((item) => ({
+          id: `${target.symbol}-disclosure-${item.id}`,
+          source: 'disclosure' as const,
+          label: '공시',
+          summary: item.reportName,
+          tone: directionVariant(item.direction),
+          evidence: `${formatDisclosureDate(item.submittedAt)} · ${importanceLabel[item.importance]}`,
+          href: item.link,
+        })),
+        ...symbolEvents.map((event) => ({
+          id: `${target.symbol}-calendar-${event.id}`,
+          source: 'calendar' as const,
+          label: '일정',
+          summary: event.title,
+          tone: event.importance === 'high' ? 'warning' : 'neutral',
+          evidence: `${event.date} ${event.time} · ${event.status ? calendarStatusLabel[event.status] : '점검'}`,
+        })),
+        ...symbolActions.map((item) => ({
+          id: `${target.symbol}-action-${item.id}`,
+          source: 'action' as const,
+          label: '액션',
+          summary: item.title,
+          tone: actionPriorityVariant(item.priority),
+          evidence: item.evidence,
+        })),
+      ].filter((item): item is SymbolBriefingCatalyst => Boolean(item))
+
+      const nextChecks = uniqueBriefItems(
+        [
+          newsImpact ? newsImpact.suggestedAction : null,
+          symbolDisclosures.length > 0 ? '공시 원문에서 수치, 조건, 정정 여부를 먼저 확인' : null,
+          symbolEvents.length > 0 ? '일정 전후 변동성 확대와 발표 시간 확인' : null,
+          symbolActions[0]?.suggestedAction,
+          target.source === 'holding' ? '지수 대비 상대강도와 비중 변경 필요성 점검' : '관심가 도달 전에 거래대금과 뉴스 방향성 확인',
+        ],
+        4,
+      )
+      const summary =
+        newsImpact?.expectedMove ??
+        (symbolDisclosures[0]?.expectedImpact ||
+          (symbolEvents[0]?.description ?? target.baseSummary))
+      const primaryAction =
+        score >= 28
+          ? target.source === 'holding'
+            ? '보유 유지 조건을 확인하되 급등 추격은 거래량으로 제한합니다.'
+            : '관심가 근처에서만 분할 접근 후보로 둡니다.'
+          : score <= -28
+            ? target.source === 'holding'
+              ? '반등 실패 시 축소 기준과 손절선을 먼저 확인합니다.'
+              : '신규 진입은 보류하고 이슈 해소를 기다립니다.'
+            : '방향이 확인될 때까지 주문보다 관찰을 우선합니다.'
+
+      return {
+        symbol: target.symbol,
+        name: target.name,
+        market: target.market,
+        source: target.source,
+        score,
+        tone,
+        verdict,
+        summary,
+        priceLabel: target.priceLabel,
+        changeLabel: target.changeLabel,
+        exposureLabel: target.exposureLabel,
+        primaryAction,
+        catalysts,
+        nextChecks,
+      }
+    })
+    .sort((left, right) => Math.abs(right.score) - Math.abs(left.score))
+
+  const opportunityCount = items.filter((item) => item.score >= 28).length
+  const riskCount = items.filter((item) => item.score <= -28).length
+  const focusSymbols = items.slice(0, 6).map((item) => item.symbol)
+  const topItem = items[0]
+  const summary = topItem
+    ? `${topItem.symbol}(${topItem.name})가 현재 가장 먼저 볼 종목입니다. ${topItem.verdict} 기준으로 ${topItem.primaryAction}`
+    : '아직 종목별로 묶을 보유/관심 데이터가 없습니다.'
+
+  return {
+    generatedAt: new Date().toISOString(),
+    summary,
+    opportunityCount,
+    riskCount,
+    focusSymbols,
     items,
   }
 }
@@ -5386,6 +5630,14 @@ function buildDashboardSnapshot({
     eventsData: calendarEventsData,
     disclosures,
   })
+  const symbolBriefing = buildSymbolBriefing({
+    holdingsData: liveHoldings,
+    watchlistData: liveWatchlist,
+    newsImpactBoard,
+    disclosures,
+    eventsData: calendarEventsData,
+    actionQueue,
+  })
   const triggeredAlerts = buildTriggeredAlerts({
     alertRulesData,
     holdingsData: liveHoldings,
@@ -5532,6 +5784,7 @@ function buildDashboardSnapshot({
     overnightStressTest,
     forecastReview,
     forecastCalibration,
+    symbolBriefing,
     executionPlan,
     preMarketCommand,
     marketSession,
@@ -7571,6 +7824,125 @@ function PageGrid({ children }: { children: ReactNode }) {
   return <div className="mx-auto grid max-w-[1600px] gap-4 p-4 md:p-6">{children}</div>
 }
 
+const symbolCatalystSourceLabel: Record<SymbolBriefingCatalyst['source'], string> = {
+  price: '가격',
+  news: '뉴스',
+  disclosure: '공시',
+  calendar: '일정',
+  action: '액션',
+}
+
+function SymbolBriefingPanel({ briefing, compact = false }: { briefing: SymbolBriefing; compact?: boolean }) {
+  const visibleItems = compact ? briefing.items.slice(0, 4) : briefing.items
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>종목별 이슈 브리핑</CardTitle>
+            <CardDescription>{briefing.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={briefing.riskCount > 0 ? 'negative' : briefing.opportunityCount > 0 ? 'positive' : 'neutral'}>
+              기회 {briefing.opportunityCount} / 리스크 {briefing.riskCount}
+            </Badge>
+            <Badge variant="secondary">{formatNewsTime(briefing.generatedAt)}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {briefing.focusSymbols.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {briefing.focusSymbols.map((symbol) => (
+              <Badge key={symbol} variant="secondary">
+                {symbol}
+              </Badge>
+            ))}
+          </div>
+        ) : null}
+
+        {visibleItems.length > 0 ? (
+          <div className="grid gap-3 xl:grid-cols-2">
+            {visibleItems.map((item) => {
+              const visibleCatalysts = item.catalysts.slice(0, compact ? 3 : 5)
+              const visibleChecks = item.nextChecks.slice(0, compact ? 2 : 4)
+
+              return (
+                <div key={item.symbol} className="rounded-md border border-border bg-muted/15 p-4">
+                  <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-sm font-semibold">{item.symbol}</span>
+                        <Badge variant={item.source === 'holding' ? 'neutral' : 'secondary'}>
+                          {item.source === 'holding' ? '보유' : '관심'}
+                        </Badge>
+                        <Badge variant={item.tone}>{item.verdict}</Badge>
+                      </div>
+                      <div className="mt-2 text-sm font-semibold">{item.name}</div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {item.priceLabel} · {item.changeLabel} · {item.exposureLabel}
+                      </div>
+                    </div>
+                    <div className="shrink-0 text-right">
+                      <div className="text-2xl font-semibold">{item.score > 0 ? `+${item.score}` : item.score}</div>
+                      <div className="text-xs text-muted-foreground">종목 점수</div>
+                    </div>
+                  </div>
+
+                  <div className="text-sm leading-6 text-muted-foreground">{item.summary}</div>
+                  <div className="mt-3 rounded-md border border-border bg-background/70 p-3 text-sm leading-6">
+                    {item.primaryAction}
+                  </div>
+
+                  <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(220px,0.75fr)]">
+                    <div className="space-y-2">
+                      {visibleCatalysts.map((catalyst) => {
+                        const content = (
+                          <div className="rounded-md border border-border bg-background/70 p-3 transition hover:border-primary/40">
+                            <div className="mb-2 flex flex-wrap items-center gap-2">
+                              <Badge variant={catalyst.tone}>{symbolCatalystSourceLabel[catalyst.source]}</Badge>
+                              <span className="text-xs text-muted-foreground">{catalyst.evidence}</span>
+                            </div>
+                            <div className="text-sm font-semibold">{catalyst.label}</div>
+                            <div className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">{catalyst.summary}</div>
+                          </div>
+                        )
+
+                        return catalyst.href ? (
+                          <a key={catalyst.id} href={catalyst.href} target="_blank" rel="noreferrer" className="block">
+                            {content}
+                          </a>
+                        ) : (
+                          <div key={catalyst.id}>{content}</div>
+                        )
+                      })}
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="text-sm font-semibold">다음 체크</div>
+                      {visibleChecks.map((check) => (
+                        <div key={check} className="flex gap-2 text-sm leading-6 text-muted-foreground">
+                          <Check className="mt-1 size-4 shrink-0 text-primary" />
+                          <span>{check}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        ) : (
+          <div className="rounded-md border border-border bg-muted/15 p-4 text-sm leading-6 text-muted-foreground">
+            보유종목이나 관심종목을 추가하면 시세, 뉴스, 공시, 일정, 액션 큐를 종목별로 묶어 보여줍니다.
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 type HoldingFormState = {
   symbol: string
   name: string
@@ -7663,12 +8035,14 @@ function formToWatchItem(form: WatchFormState, existing?: WatchItem): WatchItem 
 function HoldingsPage({
   holdingsData,
   biasScoreData,
+  symbolBriefing,
   onSaveHolding,
   onDeleteHolding,
   onResetHoldings,
 }: {
   holdingsData: Holding[]
   biasScoreData: BiasScore
+  symbolBriefing: SymbolBriefing
   onSaveHolding: (holding: Holding, previousSymbol?: string) => void
   onDeleteHolding: (symbol: string) => void
   onResetHoldings: () => void
@@ -7711,6 +8085,8 @@ function HoldingsPage({
         <MetricCard label="이슈 부담" value={`${riskCount}개`} detail="환율/금리 확인" tone={riskCount ? 'negative' : 'neutral'} />
         <MetricCard label="국내장 방향점수" value={`+${biasScoreData.score}`} detail={`신뢰도 ${confidenceLabel[biasScoreData.confidence]}`} tone={biasScoreData.stance === 'pressure' ? 'negative' : biasScoreData.stance === 'neutral' ? 'neutral' : 'positive'} />
       </section>
+
+      <SymbolBriefingPanel briefing={symbolBriefing} />
 
       <Card>
         <CardHeader>
@@ -10395,6 +10771,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
       <HoldingsPage
         holdingsData={snapshot.holdings}
         biasScoreData={snapshot.biasScore}
+        symbolBriefing={snapshot.symbolBriefing}
         onSaveHolding={actions.onSaveHolding}
         onDeleteHolding={actions.onDeleteHolding}
         onResetHoldings={actions.onResetHoldings}
@@ -11305,6 +11682,8 @@ export function Dashboard() {
             <OvernightStressTestPanel stress={snapshot.overnightStressTest} compact />
 
             <NewsImpactBoardPanel board={snapshot.newsImpactBoard} compact />
+
+            <SymbolBriefingPanel briefing={snapshot.symbolBriefing} compact />
 
             <DataReliabilityPanel reliability={snapshot.dataReliability} onRefreshAll={refreshAllData} refreshing={dataRefreshBusy} compact />
 
