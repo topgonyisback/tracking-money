@@ -324,6 +324,32 @@ type MarketSessionControl = {
   guardrails: string[]
 }
 
+type ForecastCalibrationRecent = {
+  id: string
+  dateLabel: string
+  forecastLabel: string
+  forecastScore: number
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  executionRate: number
+  summary: string
+}
+
+type ForecastCalibration = {
+  generatedAt: string
+  sampleCount: number
+  averageScore: number
+  hitRate: number
+  actionCompletionRate: number
+  currentScore: number
+  currentLabel: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  label: string
+  summary: string
+  lesson: string
+  nextFocus: string[]
+  recent: ForecastCalibrationRecent[]
+}
+
 type DataFreshnessSource = {
   id: DataReliability['sources'][number]['id']
   name: string
@@ -421,6 +447,7 @@ type DashboardSnapshot = {
   forecastSensitivity: ForecastSensitivity
   overnightStressTest: OvernightStressTest
   forecastReview: ForecastReview
+  forecastCalibration: ForecastCalibration
   executionPlan: ExecutionPlan
   preMarketCommand: PreMarketCommandCenter
   marketSession: MarketSessionControl
@@ -4984,6 +5011,86 @@ function buildForecastReview({
   }
 }
 
+function executionRate(item: Pick<JournalHistoryItem, 'completedActionCount' | 'totalActionCount'>) {
+  if (item.totalActionCount <= 0) return item.completedActionCount > 0 ? 100 : 0
+  return clamp(Math.round((item.completedActionCount / item.totalActionCount) * 100), 0, 100)
+}
+
+function calibrationTone(score: number): ForecastCalibration['tone'] {
+  if (score >= 78) return 'positive'
+  if (score >= 58) return 'warning'
+  return 'negative'
+}
+
+function calibrationLabel(score: number, sampleCount: number) {
+  if (sampleCount === 0) return '학습 대기'
+  if (score >= 78) return '예측 안정'
+  if (score >= 58) return '보정 필요'
+  return '복기 강화'
+}
+
+function buildForecastCalibration({
+  history,
+  currentReview,
+}: {
+  history: JournalHistoryItem[]
+  currentReview: ForecastReview
+}): ForecastCalibration {
+  const sample = history.slice(0, 20)
+  const sampleCount = sample.length
+  const averageScore = sampleCount > 0 ? Math.round(sample.reduce((sum, item) => sum + item.forecastScore, 0) / sampleCount) : currentReview.score
+  const hitRate = sampleCount > 0 ? Math.round((sample.filter((item) => item.forecastScore >= 62).length / sampleCount) * 100) : 0
+  const actionCompletionRate = sampleCount > 0 ? Math.round(sample.reduce((sum, item) => sum + executionRate(item), 0) / sampleCount) : 0
+  const blendedScore = sampleCount > 0 ? Math.round(averageScore * 0.65 + actionCompletionRate * 0.25 + hitRate * 0.1) : currentReview.score
+  const weakExecution = sampleCount > 0 && actionCompletionRate < 55
+  const weakForecast = sampleCount > 0 && averageScore < 58
+  const strongForecast = sampleCount >= 3 && averageScore >= 72 && actionCompletionRate >= 65
+  const recent = sample.slice(0, 6).map((item) => ({
+    id: item.id,
+    dateLabel: item.date.slice(5).replace('-', '.'),
+    forecastLabel: item.forecastLabel,
+    forecastScore: item.forecastScore,
+    tone: forecastReviewTone(item.forecastScore),
+    executionRate: executionRate(item),
+    summary: item.forecastSummary,
+  }))
+  const nextFocus = uniqueBriefItems(
+    [
+      weakForecast ? '예측이 빗나간 날의 선행지표와 실제 KOSPI/KOSDAQ 괴리를 먼저 복기' : null,
+      weakExecution ? '액션 큐 실행률을 높이기 위해 장전 체크 항목을 3개 이하로 압축' : null,
+      currentReview.score < 62 ? '오늘 검증 리포트의 개선 질문을 장후 리뷰에 반영' : null,
+      strongForecast ? '현재 룰은 유지하고 비중/실행 타이밍 기록을 더 세밀하게 누적' : null,
+      '저장된 복기 히스토리를 주 1회 확인해 반복 실수와 강한 신호를 분리',
+    ],
+    4,
+  )
+
+  return {
+    generatedAt: new Date().toISOString(),
+    sampleCount,
+    averageScore,
+    hitRate,
+    actionCompletionRate,
+    currentScore: currentReview.score,
+    currentLabel: currentReview.label,
+    tone: calibrationTone(blendedScore),
+    label: calibrationLabel(blendedScore, sampleCount),
+    summary:
+      sampleCount === 0
+        ? `아직 저장된 복기 표본이 없습니다. 현재 검증 점수는 ${currentReview.score}/100이며, 오늘 기록을 보관하면 캘리브레이션이 시작됩니다.`
+        : `최근 ${sampleCount}개 복기 기준 평균 ${averageScore}점, 적중률 ${hitRate}%, 실행률 ${actionCompletionRate}%입니다.`,
+    lesson: weakForecast
+      ? '예측 점수가 낮은 날은 방향보다 실제 수급과 보유종목 반응을 먼저 재점검해야 합니다.'
+      : weakExecution
+        ? '예측보다 실행률이 병목입니다. 장전 액션을 줄이고 완료 여부를 더 엄격히 기록하는 편이 좋습니다.'
+        : strongForecast
+          ? '예측과 실행이 모두 안정권입니다. 지금은 룰을 크게 바꾸기보다 표본을 더 쌓는 구간입니다.'
+          : '예측과 실행 모두 개선 여지가 있습니다. 장후 리뷰에서 놓친 지표와 실행하지 못한 액션을 분리해 기록하세요.',
+    nextFocus,
+    recent,
+  }
+}
+
 function executionSideLabel(side: ExecutionPlanItem['side']) {
   if (side === 'buy') return '분할 매수'
   if (side === 'sell') return '일부 축소'
@@ -5361,6 +5468,10 @@ function buildDashboardSnapshot({
     actionQueue,
     journal,
   })
+  const forecastCalibration = buildForecastCalibration({
+    history: journalHistoryData,
+    currentReview: forecastReview,
+  })
   const marketSession = buildMarketSessionControl({
     now,
     forecast,
@@ -5420,6 +5531,7 @@ function buildDashboardSnapshot({
     forecastSensitivity,
     overnightStressTest,
     forecastReview,
+    forecastCalibration,
     executionPlan,
     preMarketCommand,
     marketSession,
@@ -7084,6 +7196,125 @@ function ForecastReviewPanel({
                   {question}
                 </div>
               ))}
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ForecastCalibrationPanel({ calibration, compact = false }: { calibration: ForecastCalibration; compact?: boolean }) {
+  const recentItems = compact ? calibration.recent.slice(0, 3) : calibration.recent
+  const focusItems = compact ? calibration.nextFocus.slice(0, 3) : calibration.nextFocus
+  const metrics = [
+    {
+      label: '평균 검증 점수',
+      value: `${calibration.averageScore}/100`,
+      progress: calibration.averageScore,
+      tone: calibrationTone(calibration.averageScore),
+      detail: calibration.sampleCount > 0 ? `최근 ${calibration.sampleCount}개` : '현재 리포트 기준',
+    },
+    {
+      label: '예측 적중률',
+      value: `${calibration.hitRate}%`,
+      progress: calibration.hitRate,
+      tone: calibration.hitRate >= 70 ? 'positive' : calibration.hitRate >= 45 ? 'warning' : 'negative',
+      detail: '62점 이상 비율',
+    },
+    {
+      label: '액션 실행률',
+      value: `${calibration.actionCompletionRate}%`,
+      progress: calibration.actionCompletionRate,
+      tone: calibration.actionCompletionRate >= 70 ? 'positive' : calibration.actionCompletionRate >= 45 ? 'warning' : 'negative',
+      detail: '체크리스트 완료',
+    },
+    {
+      label: '오늘 검증',
+      value: `${calibration.currentScore}/100`,
+      progress: calibration.currentScore,
+      tone: calibration.tone,
+      detail: calibration.currentLabel,
+    },
+  ] satisfies Array<{
+    label: string
+    value: string
+    progress: number
+    tone: 'positive' | 'negative' | 'warning' | 'neutral'
+    detail: string
+  }>
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>예측 캘리브레이션</CardTitle>
+            <CardDescription>{calibration.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={calibration.tone}>{calibration.label}</Badge>
+            <Badge variant="secondary">{formatNewsTime(calibration.generatedAt)}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          {metrics.map((metric) => (
+            <div key={metric.label} className="rounded-md border border-border bg-muted/15 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-xs text-muted-foreground">{metric.label}</div>
+                  <div className="mt-2 text-xl font-semibold">{metric.value}</div>
+                </div>
+                <Badge variant={metric.tone}>{metric.detail}</Badge>
+              </div>
+              <Progress className="mt-3" value={metric.progress} />
+            </div>
+          ))}
+        </div>
+
+        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="rounded-md border border-border bg-background/70 p-4">
+            <div className="mb-3 text-sm font-semibold">최근 복기 표본</div>
+            {recentItems.length > 0 ? (
+              <div className="space-y-3">
+                {recentItems.map((item) => (
+                  <div key={item.id} className="rounded-md border border-border bg-muted/15 p-3">
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <Badge variant="secondary">{item.dateLabel}</Badge>
+                      <Badge variant={item.tone}>{item.forecastLabel}</Badge>
+                      <Badge variant={item.executionRate >= 70 ? 'positive' : item.executionRate >= 45 ? 'warning' : 'negative'}>
+                        실행 {item.executionRate}%
+                      </Badge>
+                    </div>
+                    <div className="text-sm font-semibold">{item.forecastScore}/100</div>
+                    {!compact ? <div className="mt-2 text-xs leading-5 text-muted-foreground">{item.summary}</div> : null}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-md border border-border bg-muted/15 p-4 text-sm leading-6 text-muted-foreground">
+                오늘 기록 보관을 누르면 복기 표본이 쌓이고, 이후 평균 점수와 실행률이 자동으로 계산됩니다.
+              </div>
+            )}
+          </div>
+
+          <div className="space-y-3">
+            <div className="rounded-md border border-border bg-background/70 p-4">
+              <div className="mb-2 text-sm font-semibold">이번 주 보정 포인트</div>
+              <div className="text-sm leading-6 text-muted-foreground">{calibration.lesson}</div>
+            </div>
+            <div className="rounded-md border border-border bg-background/70 p-4">
+              <div className="mb-3 text-sm font-semibold">다음 집중</div>
+              <div className="space-y-2">
+                {focusItems.map((item) => (
+                  <div key={item} className="flex gap-2 text-sm leading-6 text-muted-foreground">
+                    <Check className="mt-1 size-4 shrink-0 text-primary" />
+                    <span>{item}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         </div>
@@ -9187,6 +9418,7 @@ function NotesPage({
   morningBrief,
   marketSession,
   forecastReview,
+  forecastCalibration,
   executionPlan,
   onUpdateJournal,
   onToggleJournalAction,
@@ -9203,6 +9435,7 @@ function NotesPage({
   morningBrief: MorningBrief
   marketSession: MarketSessionControl
   forecastReview: ForecastReview
+  forecastCalibration: ForecastCalibration
   executionPlan: ExecutionPlan
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
   onToggleJournalAction: (actionId: string) => void
@@ -9239,6 +9472,8 @@ function NotesPage({
         review={forecastReview}
         onApplyReview={() => onUpdateJournal({ afterMarketReview: forecastReview.reviewDraft })}
       />
+
+      <ForecastCalibrationPanel calibration={forecastCalibration} />
 
       <ExecutionPlanPanel plan={executionPlan} />
 
@@ -10270,6 +10505,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         morningBrief={snapshot.morningBrief}
         marketSession={snapshot.marketSession}
         forecastReview={snapshot.forecastReview}
+        forecastCalibration={snapshot.forecastCalibration}
         executionPlan={snapshot.executionPlan}
         onUpdateJournal={actions.onUpdateJournal}
         onToggleJournalAction={actions.onToggleJournalAction}
@@ -11117,6 +11353,8 @@ export function Dashboard() {
             </Card>
 
             <MorningBriefPanel brief={snapshot.morningBrief} compact />
+
+            <ForecastCalibrationPanel calibration={snapshot.forecastCalibration} compact />
 
             <PortfolioPlaybookPanel playbook={snapshot.portfolioPlaybook} compact />
 
