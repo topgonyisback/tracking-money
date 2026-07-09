@@ -297,6 +297,33 @@ type MarketPulseRail = {
   items: MarketPulseItem[]
 }
 
+type MarketSessionPhase = 'overnight' | 'preopen' | 'opening' | 'session' | 'closing' | 'aftermarket' | 'closed'
+
+type MarketSessionTask = {
+  id: string
+  title: string
+  summary: string
+  priority: ActionQueueItem['priority']
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  evidence: string
+}
+
+type MarketSessionControl = {
+  generatedAt: string
+  kstTimeLabel: string
+  phase: MarketSessionPhase
+  phaseLabel: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  summary: string
+  nextCheckpointLabel: string
+  nextCheckpointTimeLabel: string
+  minutesToNext: number | null
+  tradeMode: string
+  focusSymbols: string[]
+  tasks: MarketSessionTask[]
+  guardrails: string[]
+}
+
 type DataFreshnessSource = {
   id: DataReliability['sources'][number]['id']
   name: string
@@ -396,6 +423,7 @@ type DashboardSnapshot = {
   forecastReview: ForecastReview
   executionPlan: ExecutionPlan
   preMarketCommand: PreMarketCommandCenter
+  marketSession: MarketSessionControl
   actionQueue: ActionQueueItem[]
   journal: InvestmentJournal
 }
@@ -1258,7 +1286,7 @@ function sendBrowserNotification(alert: TriggeredAlert, settings: AlertSettings)
 }
 
 function getKoreaOpenText(now = new Date()) {
-  const kstNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }))
+  const kstNow = getKstDate(now)
   const open = new Date(kstNow)
   open.setHours(9, 0, 0, 0)
 
@@ -1272,12 +1300,114 @@ function getKoreaOpenText(now = new Date()) {
   return `${hours}시간 ${minutes}분 전`
 }
 
+function getKstDate(now = new Date()) {
+  return new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }))
+}
+
 function getKstDateKey(now = new Date()) {
-  const kstNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }))
+  const kstNow = getKstDate(now)
   const year = kstNow.getFullYear()
   const month = String(kstNow.getMonth() + 1).padStart(2, '0')
   const day = String(kstNow.getDate()).padStart(2, '0')
   return `${year}-${month}-${day}`
+}
+
+function formatKstTimeLabel(now = new Date()) {
+  return now.toLocaleString('ko-KR', {
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'Asia/Seoul',
+  })
+}
+
+function formatMinutesUntil(minutes: number | null) {
+  if (minutes === null) return '다음 거래일'
+  if (minutes <= 0) return '곧'
+  if (minutes < 60) return `${minutes}분 후`
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+  return rest > 0 ? `${hours}시간 ${rest}분 후` : `${hours}시간 후`
+}
+
+function resolveMarketSessionPhase(now = new Date()) {
+  const kstNow = getKstDate(now)
+  const day = kstNow.getDay()
+  const totalMinutes = kstNow.getHours() * 60 + kstNow.getMinutes()
+
+  if (day === 0 || day === 6) {
+    return {
+      phase: 'closed' as const,
+      phaseLabel: '휴장 준비',
+      nextCheckpointLabel: '다음 평일 장전 점검',
+      nextCheckpointTimeLabel: '06:30 KST',
+      minutesToNext: null,
+    }
+  }
+  if (totalMinutes < 390) {
+    return {
+      phase: 'overnight' as const,
+      phaseLabel: '야간 선행지표',
+      nextCheckpointLabel: '장전 데이터 점검',
+      nextCheckpointTimeLabel: '06:30 KST',
+      minutesToNext: 390 - totalMinutes,
+    }
+  }
+  if (totalMinutes < 510) {
+    return {
+      phase: 'preopen' as const,
+      phaseLabel: '장전 준비',
+      nextCheckpointLabel: '개장 30분 전',
+      nextCheckpointTimeLabel: '08:30 KST',
+      minutesToNext: 510 - totalMinutes,
+    }
+  }
+  if (totalMinutes < 540) {
+    return {
+      phase: 'preopen' as const,
+      phaseLabel: '개장 직전',
+      nextCheckpointLabel: '한국장 개장',
+      nextCheckpointTimeLabel: '09:00 KST',
+      minutesToNext: 540 - totalMinutes,
+    }
+  }
+  if (totalMinutes < 570) {
+    return {
+      phase: 'opening' as const,
+      phaseLabel: '개장 직후',
+      nextCheckpointLabel: '첫 30분 확정',
+      nextCheckpointTimeLabel: '09:30 KST',
+      minutesToNext: 570 - totalMinutes,
+    }
+  }
+  if (totalMinutes < 870) {
+    return {
+      phase: 'session' as const,
+      phaseLabel: '장중 추적',
+      nextCheckpointLabel: '마감 대응 준비',
+      nextCheckpointTimeLabel: '14:30 KST',
+      minutesToNext: 870 - totalMinutes,
+    }
+  }
+  if (totalMinutes < 930) {
+    return {
+      phase: 'closing' as const,
+      phaseLabel: '마감 대응',
+      nextCheckpointLabel: '장후 복기',
+      nextCheckpointTimeLabel: '15:30 KST',
+      minutesToNext: 930 - totalMinutes,
+    }
+  }
+
+  return {
+    phase: 'aftermarket' as const,
+    phaseLabel: '장후 복기',
+    nextCheckpointLabel: '내일 장전 점검',
+    nextCheckpointTimeLabel: '06:30 KST',
+    minutesToNext: null,
+  }
 }
 
 function parseDateKey(value: string) {
@@ -2266,6 +2396,199 @@ function buildMarketPulseRail({
     topSymbols,
     playbook,
     items,
+  }
+}
+
+function marketSessionTone(phase: MarketSessionPhase, marketPulse: MarketPulseRail, dataFreshness: DataFreshness): MarketSessionControl['tone'] {
+  if (phase === 'closed') return 'neutral'
+  if (dataFreshness.staleCount > 0 || dataFreshness.missingCount > 1) return 'warning'
+  if (marketPulse.pressureScore >= 76) return 'negative'
+  if (marketPulse.opportunityScore >= 76 && marketPulse.netScore > 12) return 'positive'
+  if (marketPulse.pressureScore >= 62 || marketPulse.opportunityScore >= 62) return 'warning'
+  return 'neutral'
+}
+
+function marketSessionTradeMode(phase: MarketSessionPhase, forecast: MarketForecast, marketPulse: MarketPulseRail) {
+  if (phase === 'closed') return '다음 거래일 준비'
+  if (phase === 'aftermarket') return '복기/저장 우선'
+  if (phase === 'closing') return '마감 리스크 정리'
+  if (marketPulse.pressureScore >= 76 || forecast.baseScore <= 38) return '방어 우선'
+  if (marketPulse.opportunityScore >= 76 && forecast.baseScore >= 58) return '선별 공격'
+  if (phase === 'opening') return '첫 30분 관찰'
+  return '확인 후 대응'
+}
+
+function sessionTask(
+  id: string,
+  title: string,
+  summary: string,
+  priority: ActionQueueItem['priority'],
+  tone: MarketSessionTask['tone'],
+  evidence: string,
+): MarketSessionTask {
+  return { id, title, summary, priority, tone, evidence }
+}
+
+function sessionTaskToneFromPriority(priority: ActionQueueItem['priority']): MarketSessionTask['tone'] {
+  const variant = actionPriorityVariant(priority)
+  return variant === 'secondary' ? 'neutral' : variant
+}
+
+function buildBaseSessionTasks({
+  phase,
+  marketPulse,
+  dataFreshness,
+  forecast,
+  portfolioPlaybook,
+  forecastReview,
+}: {
+  phase: MarketSessionPhase
+  marketPulse: MarketPulseRail
+  dataFreshness: DataFreshness
+  forecast: MarketForecast
+  portfolioPlaybook: PortfolioPlaybook
+  forecastReview: ForecastReview
+}) {
+  const topPulse = marketPulse.items[0]
+  const staleTask =
+    dataFreshness.staleCount > 0 || dataFreshness.missingCount > 0
+      ? [
+          sessionTask(
+            'freshness-refresh',
+            '데이터 최신성 먼저 확인',
+            `${dataFreshness.staleCount}개 갱신 필요, ${dataFreshness.missingCount}개 수신 전입니다. 판단 전에 전체 새로고침을 실행합니다.`,
+            dataFreshness.staleCount > 0 ? 'high' : 'medium',
+            'warning',
+            dataFreshness.label,
+          ),
+        ]
+      : []
+  const pulseTask = topPulse
+    ? [
+        sessionTask(
+          `pulse-${topPulse.id}`,
+          topPulse.title,
+          topPulse.action,
+          topPulse.impactScore >= 80 ? 'high' : 'medium',
+          topPulse.tone,
+          `${marketPulseSourceLabel[topPulse.source]} · ${topPulse.impactScore}점`,
+        ),
+      ]
+    : []
+
+  if (phase === 'overnight') {
+    return [
+      ...staleTask,
+      ...pulseTask,
+      sessionTask('overnight-index', '미국 선행지표 마감 방향 확인', 'NQ=F, SOX, VIX, USD/KRW가 같은 방향인지 확인하고 국내 반도체/성장주 민감도를 정리합니다.', 'high', 'warning', `순충격 ${marketPulse.netScore}`),
+      sessionTask('overnight-brief', '장전 브리핑 초안 준비', forecast.summary, 'medium', directionVariant(forecast.baseScore >= 55 ? 'positive' : forecast.baseScore <= 45 ? 'negative' : 'neutral'), `방향점수 ${forecast.baseScore}/100`),
+    ]
+  }
+  if (phase === 'preopen') {
+    return [
+      ...staleTask,
+      ...pulseTask,
+      sessionTask('preopen-command', '08:45 장전 운전석 확인', '장전 운전석, 시장 충격 레일, 액션 큐를 보고 신규 진입/보류 조건을 확정합니다.', 'high', marketPulse.pressureScore >= 70 ? 'negative' : 'warning', marketPulse.summary),
+      sessionTask('preopen-portfolio', '고비중 보유종목 첫 가격 기준 잡기', `${portfolioPlaybook.topExposureLabel} 노출과 포지션별 행동 기준을 확인합니다.`, 'medium', portfolioPlaybook.stance === 'defensive' ? 'negative' : 'neutral', portfolioPlaybook.stanceLabel),
+    ]
+  }
+  if (phase === 'opening') {
+    return [
+      ...pulseTask,
+      sessionTask('opening-no-chase', '첫 30분 추격 매수 금지', '시초가 갭보다 09:30 전후 상대강도와 거래량을 먼저 확인합니다.', 'critical', marketPulse.pressureScore >= 70 ? 'negative' : 'warning', '09:00-09:30'),
+      sessionTask('opening-leaders', '주도주와 보유종목 괴리 확인', 'KOSPI/KOSDAQ 대비 보유 대형주와 관심 성장주가 더 강한지 비교합니다.', 'high', 'neutral', forecast.openingBias),
+    ]
+  }
+  if (phase === 'session') {
+    return [
+      ...pulseTask,
+      sessionTask('session-alerts', '알림과 액션 큐 재정렬', '가격/등락률/뉴스 조건이 새로 발동됐는지 보고 기존 계획과 충돌하는 항목을 정리합니다.', 'medium', 'neutral', '장중 추적'),
+      sessionTask('session-risk', '추가 매수는 데이터 신뢰도 확인 후', '데이터 최신성 기준 안에 있는지 확인하고, 방향점수와 실제 지수 흐름이 어긋나면 대기합니다.', 'medium', dataFreshness.tone, dataFreshness.label),
+    ]
+  }
+  if (phase === 'closing') {
+    return [
+      sessionTask('closing-risk', '마감 전 비중 리스크 정리', '내일로 넘길 리스크와 당일 새로 생긴 공시/뉴스를 분리해 기록합니다.', 'high', portfolioPlaybook.stance === 'defensive' ? 'negative' : 'warning', portfolioPlaybook.stanceLabel),
+      sessionTask('closing-review-ready', '장후 리뷰 기준 저장', '방향점수, 실제 지수 흐름, 놓친 촉매를 장후 리뷰에 바로 옮길 준비를 합니다.', 'medium', forecastReview.tone, forecastReview.label),
+    ]
+  }
+  if (phase === 'aftermarket') {
+    return [
+      sessionTask('after-review', '예측 검증 리포트 작성', forecastReview.reviewDraft, 'high', forecastReview.tone, forecastReview.actualLabel),
+      sessionTask('after-archive', '투자노트와 복기 히스토리 저장', '오늘 실행률, 장전 계획, 장후 리뷰를 저장해 다음 거래일 판단 근거로 남깁니다.', 'medium', 'positive', '장후 루틴'),
+    ]
+  }
+
+  return [
+    sessionTask('closed-prepare', '다음 거래일 관심 변수 정리', '보유/관심종목, 뉴스 키워드, 개인 캘린더를 정리하고 동기화/백업 상태를 확인합니다.', 'medium', 'neutral', '휴장'),
+    sessionTask('closed-watch', '미국 선행지표와 다음 이벤트 확인', '다음 거래일 전까지 NQ=F, SOX, 환율, 금리, 캘린더 이벤트를 우선 감시합니다.', 'medium', 'neutral', '다음 평일'),
+  ]
+}
+
+function buildMarketSessionControl({
+  now,
+  forecast,
+  marketPulse,
+  actionQueue,
+  dataFreshness,
+  executionPlan,
+  portfolioPlaybook,
+  forecastReview,
+}: {
+  now: Date
+  forecast: MarketForecast
+  marketPulse: MarketPulseRail
+  actionQueue: ActionQueueItem[]
+  dataFreshness: DataFreshness
+  executionPlan: ExecutionPlan
+  portfolioPlaybook: PortfolioPlaybook
+  forecastReview: ForecastReview
+}): MarketSessionControl {
+  const phase = resolveMarketSessionPhase(now)
+  const topActionTasks = actionQueue.slice(0, 2).map((item) =>
+    sessionTask(
+      `action-${item.id}`,
+      item.title,
+      item.suggestedAction,
+      item.priority,
+      sessionTaskToneFromPriority(item.priority),
+      item.evidence,
+    ),
+  )
+  const tasks = [...buildBaseSessionTasks({ phase: phase.phase, marketPulse, dataFreshness, forecast, portfolioPlaybook, forecastReview }), ...topActionTasks]
+    .filter((item, index, list) => list.findIndex((candidate) => candidate.id === item.id) === index)
+    .sort((left, right) => priorityRank(right.priority) - priorityRank(left.priority))
+    .slice(0, 6)
+  const focusSymbols = Array.from(
+    new Set([...marketPulse.topSymbols, ...actionQueue.flatMap((item) => item.relatedSymbols), ...executionPlan.items.map((item) => item.symbol)]),
+  )
+    .filter(Boolean)
+    .slice(0, 8)
+  const guardrails = Array.from(
+    new Set([
+      ...executionPlan.guardrails,
+      marketPulse.pressureScore >= 70 ? '압박 지수 70 이상이면 신규 진입보다 보유 리스크 확인을 우선합니다.' : null,
+      dataFreshness.staleCount > 0 ? '데이터 갱신 필요 상태에서는 예측 강도를 한 단계 낮춰 봅니다.' : null,
+      phase.phase === 'opening' ? '09:30 전에는 관심가 도달만으로 진입하지 않습니다.' : null,
+    ].filter((item): item is string => Boolean(item))),
+  ).slice(0, 5)
+  const tone = marketSessionTone(phase.phase, marketPulse, dataFreshness)
+  const tradeMode = marketSessionTradeMode(phase.phase, forecast, marketPulse)
+
+  return {
+    generatedAt: now.toISOString(),
+    kstTimeLabel: formatKstTimeLabel(now),
+    phase: phase.phase,
+    phaseLabel: phase.phaseLabel,
+    tone,
+    summary: `${phase.phaseLabel} 단계입니다. 현재 모드는 ${tradeMode}, 다음 체크포인트는 ${phase.nextCheckpointLabel}(${formatMinutesUntil(phase.minutesToNext)})입니다.`,
+    nextCheckpointLabel: phase.nextCheckpointLabel,
+    nextCheckpointTimeLabel: phase.nextCheckpointTimeLabel,
+    minutesToNext: phase.minutesToNext,
+    tradeMode,
+    focusSymbols,
+    tasks,
+    guardrails,
   }
 }
 
@@ -4864,6 +5187,7 @@ function buildDashboardSnapshot({
   disclosureStatus,
   disclosureMessage,
   journal,
+  now,
 }: {
   baseHoldings: Holding[]
   baseWatchlist: WatchItem[]
@@ -4890,6 +5214,7 @@ function buildDashboardSnapshot({
   disclosureStatus: DisclosureStatus
   disclosureMessage: string
   journal: InvestmentJournal
+  now: Date
 }): DashboardSnapshot {
   const quoteMap = quoteBySymbol(quotes)
   const liveHoldings = mergeHoldingsWithQuotes(baseHoldings, quoteMap)
@@ -5036,6 +5361,16 @@ function buildDashboardSnapshot({
     actionQueue,
     journal,
   })
+  const marketSession = buildMarketSessionControl({
+    now,
+    forecast,
+    marketPulse,
+    actionQueue,
+    dataFreshness,
+    executionPlan,
+    portfolioPlaybook,
+    forecastReview,
+  })
   return {
     holdings: liveHoldings,
     watchlist: liveWatchlist,
@@ -5087,6 +5422,7 @@ function buildDashboardSnapshot({
     forecastReview,
     executionPlan,
     preMarketCommand,
+    marketSession,
     actionQueue,
     journal,
   }
@@ -6129,6 +6465,96 @@ function MarketPulseRailPanel({ pulse, compact = false }: { pulse: MarketPulseRa
                     </div>
                   )
                 })}
+              </div>
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function MarketSessionControlPanel({ session, compact = false }: { session: MarketSessionControl; compact?: boolean }) {
+  const visibleTasks = compact ? session.tasks.slice(0, 4) : session.tasks
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>장중 컨트롤 타워</CardTitle>
+            <CardDescription>{session.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={session.tone}>{session.phaseLabel}</Badge>
+            <Badge variant="secondary">{session.kstTimeLabel}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">현재 단계</div>
+            <div className="mt-2 text-lg font-semibold">{session.phaseLabel}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">대응 모드</div>
+            <div className="mt-2 text-lg font-semibold">{session.tradeMode}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">다음 체크</div>
+            <div className="mt-2 text-sm font-semibold leading-5">{session.nextCheckpointLabel}</div>
+            <div className="mt-1 text-xs text-muted-foreground">{session.nextCheckpointTimeLabel}</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">남은 시간</div>
+            <div className="mt-2 text-lg font-semibold">{formatMinutesUntil(session.minutesToNext)}</div>
+          </div>
+        </div>
+
+        <div className={cn('grid gap-4', compact ? '2xl:grid-cols-[minmax(0,1fr)_280px]' : 'xl:grid-cols-[minmax(0,1fr)_320px]')}>
+          <div className="grid min-w-0 gap-3">
+            {visibleTasks.map((task) => (
+              <div key={task.id} className="rounded-md border border-border bg-muted/10 p-3">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant={actionPriorityVariant(task.priority)}>{actionPriorityLabel[task.priority]}</Badge>
+                      <Badge variant={task.tone}>{task.evidence}</Badge>
+                    </div>
+                    <div className="mt-2 text-sm font-semibold leading-5">{task.title}</div>
+                    <div className="mt-2 text-sm leading-5 text-muted-foreground">{task.summary}</div>
+                  </div>
+                  <Clock3 className="size-4 shrink-0 text-muted-foreground" />
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid min-w-0 content-start gap-3">
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">집중 심볼</div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {session.focusSymbols.length > 0 ? (
+                  session.focusSymbols.map((symbol) => (
+                    <Badge key={symbol} variant="neutral">
+                      {symbol}
+                    </Badge>
+                  ))
+                ) : (
+                  <span className="text-sm text-muted-foreground">확인 대기</span>
+                )}
+              </div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">가드레일</div>
+              <div className="mt-3 grid gap-2 text-sm leading-5">
+                {session.guardrails.slice(0, compact ? 3 : session.guardrails.length).map((item) => (
+                  <div key={item} className="flex gap-2">
+                    <X className="mt-0.5 size-4 shrink-0 text-negative" />
+                    <span>{item}</span>
+                  </div>
+                ))}
               </div>
             </div>
           </div>
@@ -7515,6 +7941,7 @@ function ForecastPage({
   forecastSensitivity,
   overnightStressTest,
   preMarketCommand,
+  marketSession,
   executionPlan,
   usdKrw,
 }: {
@@ -7532,6 +7959,7 @@ function ForecastPage({
   forecastSensitivity: ForecastSensitivity
   overnightStressTest: OvernightStressTest
   preMarketCommand: PreMarketCommandCenter
+  marketSession: MarketSessionControl
   executionPlan: ExecutionPlan
   usdKrw: number
 }) {
@@ -7549,6 +7977,8 @@ function ForecastPage({
       </section>
 
       <PreMarketCommandCenterPanel command={preMarketCommand} />
+
+      <MarketSessionControlPanel session={marketSession} compact />
 
       <MarketPulseRailPanel pulse={marketPulse} compact />
 
@@ -8755,6 +9185,7 @@ function NotesPage({
   biasScoreData,
   marketStatusData,
   morningBrief,
+  marketSession,
   forecastReview,
   executionPlan,
   onUpdateJournal,
@@ -8770,6 +9201,7 @@ function NotesPage({
   biasScoreData: BiasScore
   marketStatusData: MarketStatusView
   morningBrief: MorningBrief
+  marketSession: MarketSessionControl
   forecastReview: ForecastReview
   executionPlan: ExecutionPlan
   onUpdateJournal: (patch: Partial<InvestmentJournal>) => void
@@ -8800,6 +9232,8 @@ function NotesPage({
       />
 
       <MorningBriefPanel brief={morningBrief} />
+
+      <MarketSessionControlPanel session={marketSession} compact />
 
       <ForecastReviewPanel
         review={forecastReview}
@@ -9762,6 +10196,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         forecastSensitivity={snapshot.forecastSensitivity}
         overnightStressTest={snapshot.overnightStressTest}
         preMarketCommand={snapshot.preMarketCommand}
+        marketSession={snapshot.marketSession}
         executionPlan={snapshot.executionPlan}
         usdKrw={snapshot.usdKrw}
       />
@@ -9833,6 +10268,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         biasScoreData={snapshot.biasScore}
         marketStatusData={snapshot.marketStatus}
         morningBrief={snapshot.morningBrief}
+        marketSession={snapshot.marketSession}
         forecastReview={snapshot.forecastReview}
         executionPlan={snapshot.executionPlan}
         onUpdateJournal={actions.onUpdateJournal}
@@ -9895,6 +10331,7 @@ export function Dashboard() {
   const [quoteResponse, setQuoteResponse] = useState<QuotesApiResponse | null>(null)
   const [quoteStatus, setQuoteStatus] = useState<QuoteStatus>('idle')
   const [quoteMessage, setQuoteMessage] = useState('시세 연결 대기')
+  const [currentTime, setCurrentTime] = useState(() => new Date())
   const [calendarResponse, setCalendarResponse] = useState<CalendarApiResponse | null>(null)
   const [calendarStatus, setCalendarStatus] = useState<CalendarStatus>('idle')
   const [calendarMessage, setCalendarMessage] = useState('캘린더 연결 대기')
@@ -10090,6 +10527,14 @@ export function Dashboard() {
   }, [])
 
   useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      setCurrentTime(new Date())
+    }, 60_000)
+
+    return () => window.clearInterval(intervalId)
+  }, [])
+
+  useEffect(() => {
     if (!storageLoaded) return
     saveStoredDashboardData({
       holdings: userHoldings,
@@ -10189,6 +10634,7 @@ export function Dashboard() {
         disclosureStatus,
         disclosureMessage,
         journal,
+        now: currentTime,
       })
     },
     [
@@ -10198,6 +10644,7 @@ export function Dashboard() {
       disclosureMessage,
       disclosureResponse,
       disclosureStatus,
+      currentTime,
       liveNews,
       journal,
       journalHistory,
@@ -10612,6 +11059,8 @@ export function Dashboard() {
             </section>
 
             <PreMarketCommandCenterPanel command={snapshot.preMarketCommand} compact />
+
+            <MarketSessionControlPanel session={snapshot.marketSession} compact />
 
             <CatalystRadarPanel radar={snapshot.catalystRadar} compact />
 
