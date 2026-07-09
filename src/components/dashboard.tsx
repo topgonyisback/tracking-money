@@ -264,6 +264,39 @@ type CatalystRadar = {
   items: CatalystRadarItem[]
 }
 
+type MarketPulseSource = 'indicator' | CatalystSource | 'alert'
+type MarketPulseHorizon = 'now' | 'preopen' | 'session' | 'overnight'
+
+type MarketPulseItem = {
+  id: string
+  source: MarketPulseSource
+  horizon: MarketPulseHorizon
+  timeLabel: string
+  title: string
+  summary: string
+  direction: Direction
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  impactScore: number
+  opportunityScore: number
+  pressureScore: number
+  evidence: string
+  action: string
+  relatedSymbols: string[]
+}
+
+type MarketPulseRail = {
+  generatedAt: string
+  summary: string
+  netScore: number
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  opportunityScore: number
+  pressureScore: number
+  urgentCount: number
+  topSymbols: string[]
+  playbook: string[]
+  items: MarketPulseItem[]
+}
+
 type DataFreshnessSource = {
   id: DataReliability['sources'][number]['id']
   name: string
@@ -347,6 +380,7 @@ type DashboardSnapshot = {
   newsMessage: string
   newsImpactBoard: NewsImpactBoard
   catalystRadar: CatalystRadar
+  marketPulse: MarketPulseRail
   disclosures: DisclosureItem[]
   disclosureStatus: DisclosureStatus
   disclosureMessage: string
@@ -2039,6 +2073,198 @@ function buildCatalystRadar({
     topSource,
     topSymbols,
     buckets,
+    items,
+  }
+}
+
+const marketPulseSourceLabel: Record<MarketPulseSource, string> = {
+  indicator: '선행지표',
+  news: '뉴스',
+  calendar: '일정',
+  disclosure: '공시',
+  alert: '알림',
+}
+
+const marketPulseHorizonLabel: Record<MarketPulseHorizon, string> = {
+  now: '즉시',
+  preopen: '개장 전',
+  session: '장중',
+  overnight: '야간/내일',
+}
+
+const leadingIndicatorPulseWeight: Record<string, number> = {
+  SOX: 18,
+  'NQ=F': 16,
+  'USD/KRW': 16,
+  VIX: 16,
+  US10Y: 13,
+  DXY: 11,
+  KOSPI: 9,
+  KOSDAQ: 9,
+  'ES=F': 8,
+}
+
+function marketPulseHorizonFromCatalyst(bucket: CatalystBucket): MarketPulseHorizon {
+  if (bucket === 'now') return 'now'
+  if (bucket === 'today') return 'preopen'
+  return 'overnight'
+}
+
+function marketPulseTone(direction: Direction, impactScore: number): MarketPulseItem['tone'] {
+  if (direction === 'positive') return 'positive'
+  if (direction === 'negative') return 'negative'
+  if (direction === 'mixed' || impactScore >= 72) return 'warning'
+  return 'neutral'
+}
+
+function marketPulseScores(direction: Direction, impactScore: number) {
+  if (direction === 'positive') return { opportunityScore: impactScore, pressureScore: 0 }
+  if (direction === 'negative') return { opportunityScore: 0, pressureScore: impactScore }
+  if (direction === 'mixed') {
+    return {
+      opportunityScore: Math.round(impactScore * 0.42),
+      pressureScore: Math.round(impactScore * 0.62),
+    }
+  }
+  return {
+    opportunityScore: Math.round(impactScore * 0.18),
+    pressureScore: Math.round(impactScore * 0.18),
+  }
+}
+
+function aggregateMarketPulse(scores: number[]) {
+  const ranked = scores.filter((score) => score > 0).sort((left, right) => right - left)
+  return clamp(Math.round((ranked[0] ?? 0) + (ranked[1] ?? 0) * 0.35 + (ranked[2] ?? 0) * 0.2 + Math.max(0, ranked.length - 3) * 3), 0, 100)
+}
+
+function indicatorPulseAction(indicator: MarketIndicator) {
+  if (indicator.direction === 'positive') return `${indicator.symbol} 강세가 국내 대형주로 이어지는지 첫 30분 상대강도를 확인`
+  if (indicator.direction === 'negative') return `${indicator.symbol} 부담이 커졌으니 관련 고비중 종목 신규 진입은 수급 확인 뒤 판단`
+  if (indicator.direction === 'mixed') return `${indicator.symbol} 방향이 엇갈리므로 가격 반응을 먼저 확인`
+  return `${indicator.symbol}은 기준선으로 두고 뉴스·환율 변화를 같이 확인`
+}
+
+function buildIndicatorPulseItems(indicators: MarketIndicator[]): MarketPulseItem[] {
+  return indicators
+    .filter((indicator) => Math.abs(indicator.change) >= 0.05 || indicator.symbol in leadingIndicatorPulseWeight)
+    .map((indicator) => {
+      const impactScore = clamp(Math.round(Math.abs(indicator.change) * 8 + (leadingIndicatorPulseWeight[indicator.symbol] ?? 6)), 4, 100)
+      const scores = marketPulseScores(indicator.direction, impactScore)
+
+      const pulse: MarketPulseItem = {
+        id: `indicator-pulse-${indicator.symbol}`,
+        source: 'indicator',
+        horizon: 'now',
+        timeLabel: '실시간',
+        title: `${indicator.symbol} ${formatChange(indicator.change)}`,
+        summary: indicator.note,
+        direction: indicator.direction,
+        tone: marketPulseTone(indicator.direction, impactScore),
+        impactScore,
+        ...scores,
+        evidence: `${indicator.name} · ${indicator.value}`,
+        action: indicatorPulseAction(indicator),
+        relatedSymbols: [indicator.symbol],
+      }
+
+      return pulse
+    })
+    .sort((left, right) => right.impactScore - left.impactScore)
+    .slice(0, 8)
+}
+
+function buildCatalystPulseItems(radar: CatalystRadar): MarketPulseItem[] {
+  return radar.items.map((item) => {
+    const scores = marketPulseScores(item.direction, item.score)
+
+    return {
+      id: `catalyst-pulse-${item.id}`,
+      source: item.source,
+      horizon: marketPulseHorizonFromCatalyst(item.bucket),
+      timeLabel: item.timeLabel,
+      title: item.title,
+      summary: item.summary,
+      direction: item.direction,
+      tone: marketPulseTone(item.direction, item.score),
+      impactScore: item.score,
+      ...scores,
+      evidence: `${catalystSourceLabel[item.source]} · ${importanceLabel[item.importance]}`,
+      action: item.action,
+      relatedSymbols: item.relatedSymbols,
+    }
+  })
+}
+
+function buildAlertPulseItems(alerts: TriggeredAlert[]): MarketPulseItem[] {
+  return alerts.slice(0, 6).map((alert) => {
+    const impactScore = clamp(34 + severityRank(alert.severity) * 15, 0, 100)
+    const scores = marketPulseScores('negative', impactScore)
+
+    return {
+      id: `alert-pulse-${alert.id}`,
+      source: 'alert',
+      horizon: 'now',
+      timeLabel: '발동',
+      title: alert.title,
+      summary: alert.summary,
+      direction: 'negative',
+      tone: alert.severity === 'critical' || alert.severity === 'high' ? 'negative' : 'warning',
+      impactScore,
+      ...scores,
+      evidence: alert.evidence,
+      action: '알림 조건이 발동됐으니 해당 종목/지표의 가격 반응과 기존 계획을 먼저 대조',
+      relatedSymbols: alert.relatedSymbols,
+    }
+  })
+}
+
+function buildMarketPulseRail({
+  indicators,
+  radar,
+  alerts,
+}: {
+  indicators: MarketIndicator[]
+  radar: CatalystRadar
+  alerts: TriggeredAlert[]
+}): MarketPulseRail {
+  const horizonRank: Record<MarketPulseHorizon, number> = { now: 0, preopen: 1, session: 2, overnight: 3 }
+  const items = [...buildAlertPulseItems(alerts), ...buildIndicatorPulseItems(indicators), ...buildCatalystPulseItems(radar)]
+    .sort((left, right) => horizonRank[left.horizon] - horizonRank[right.horizon] || right.impactScore - left.impactScore)
+    .slice(0, 18)
+  const opportunityScore = aggregateMarketPulse(items.map((item) => item.opportunityScore))
+  const pressureScore = aggregateMarketPulse(items.map((item) => item.pressureScore))
+  const netScore = clamp(opportunityScore - pressureScore, -100, 100)
+  const tone: MarketPulseRail['tone'] = netScore >= 18 ? 'positive' : netScore <= -18 ? 'negative' : pressureScore >= 70 || opportunityScore >= 70 ? 'warning' : 'neutral'
+  const topItem = items[0]
+  const urgentCount = items.filter((item) => (item.horizon === 'now' || item.horizon === 'preopen') && item.impactScore >= 65).length
+  const topSymbols = Array.from(new Set(items.flatMap((item) => item.relatedSymbols))).filter(Boolean).slice(0, 8)
+  const summary =
+    netScore <= -18
+      ? `압박 지수가 기회 지수보다 ${Math.abs(netScore)}점 높습니다. ${topItem ? `${topItem.title}부터 확인하세요.` : '장전에는 신규 진입보다 방어 조건 확인이 먼저입니다.'}`
+      : netScore >= 18
+        ? `기회 지수가 압박 지수보다 ${netScore}점 높습니다. ${topItem ? `${topItem.title}가 핵심 신호입니다.` : '강한 종목만 선별할 수 있는 구간입니다.'}`
+        : `기회와 압박이 비슷합니다. ${topItem ? `${topItem.title}의 실제 가격 반응을 먼저 보세요.` : '첫 30분 수급 확인이 중요합니다.'}`
+  const playbook = uniqueBriefItems(
+    [
+      topItem?.action,
+      pressureScore >= 70 ? '압박 지수 70 이상이면 보유 비중 큰 종목의 추가 매수는 보류합니다.' : null,
+      opportunityScore >= 70 ? '기회 지수 70 이상이어도 지수보다 강한 종목만 분할 접근합니다.' : null,
+      urgentCount > 0 ? `즉시 확인 이벤트 ${urgentCount}개는 장 시작 전 가격/거래량 반응을 기록합니다.` : null,
+      topSymbols.length > 0 ? `${topSymbols.slice(0, 4).join(', ')}를 우선 감시 심볼로 둡니다.` : null,
+    ],
+    4,
+  )
+
+  return {
+    generatedAt: new Date().toISOString(),
+    summary,
+    netScore,
+    tone,
+    opportunityScore,
+    pressureScore,
+    urgentCount,
+    topSymbols,
+    playbook,
     items,
   }
 }
@@ -4736,6 +4962,11 @@ function buildDashboardSnapshot({
     newsItems: liveNews,
     biasScoreData: liveBiasScore,
   })
+  const marketPulse = buildMarketPulseRail({
+    indicators: liveIndicators,
+    radar: catalystRadar,
+    alerts: triggeredAlerts,
+  })
   const marketStatusView = buildMarketStatusView({ quoteMap, fetchedAt, quoteStatus })
   const expectedQuoteCount = new Set([...baseHoldings.map((holding) => holding.symbol), ...baseWatchlist.map((item) => item.symbol), ...indicatorSymbols]).size
   const dataReliability = buildDataReliability({
@@ -4840,6 +5071,7 @@ function buildDashboardSnapshot({
     newsMessage,
     newsImpactBoard,
     catalystRadar,
+    marketPulse,
     disclosures,
     disclosureStatus,
     disclosureMessage,
@@ -5786,6 +6018,119 @@ function CatalystRadarPanel({ radar, compact = false }: { radar: CatalystRadar; 
                 </div>
               </div>
             ))}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function MarketPulseRailPanel({ pulse, compact = false }: { pulse: MarketPulseRail; compact?: boolean }) {
+  const visibleItems = compact ? pulse.items.slice(0, 6) : pulse.items.slice(0, 12)
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>시장 충격 레일</CardTitle>
+            <CardDescription>{pulse.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={pulse.tone}>순충격 {pulse.netScore > 0 ? `+${pulse.netScore}` : pulse.netScore}</Badge>
+            <Badge variant={pulse.urgentCount > 0 ? 'warning' : 'secondary'}>즉시 확인 {pulse.urgentCount}개</Badge>
+            <Badge variant="secondary">{formatNewsTime(pulse.generatedAt)}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-positive/25 bg-positive/10 p-3">
+            <div className="text-xs text-muted-foreground">기회 지수</div>
+            <div className="mt-2 text-2xl font-semibold">{pulse.opportunityScore}</div>
+            <Progress className="mt-3" value={pulse.opportunityScore} />
+          </div>
+          <div className="rounded-md border border-negative/25 bg-negative/10 p-3">
+            <div className="text-xs text-muted-foreground">압박 지수</div>
+            <div className="mt-2 text-2xl font-semibold">{pulse.pressureScore}</div>
+            <Progress className="mt-3" value={pulse.pressureScore} />
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">추적 이벤트</div>
+            <div className="mt-2 text-2xl font-semibold">{pulse.items.length}개</div>
+            <div className="mt-2 text-xs text-muted-foreground">지표·뉴스·공시·일정·알림 합산</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">집중 심볼</div>
+            <div className="mt-2 text-sm font-semibold leading-5">{pulse.topSymbols.length > 0 ? pulse.topSymbols.slice(0, 5).join(', ') : '확인 대기'}</div>
+          </div>
+        </div>
+
+        <div className={cn('grid gap-4', compact ? '2xl:grid-cols-[minmax(0,1fr)_280px]' : 'xl:grid-cols-[minmax(0,1fr)_320px]')}>
+          <div className="grid min-w-0 gap-3">
+            {visibleItems.length > 0 ? (
+              visibleItems.map((item) => (
+                <div key={item.id} className="rounded-md border border-border bg-muted/10 p-3">
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge variant={item.tone}>{marketPulseHorizonLabel[item.horizon]}</Badge>
+                        <Badge variant="secondary">{marketPulseSourceLabel[item.source]}</Badge>
+                        <Badge variant={item.impactScore >= 75 ? 'warning' : 'neutral'}>{item.impactScore}점</Badge>
+                        <span className="text-xs text-muted-foreground">{item.timeLabel}</span>
+                      </div>
+                      <div className="mt-2 text-sm font-semibold leading-5">{item.title}</div>
+                      <div className="mt-2 text-sm leading-5 text-muted-foreground">{item.summary}</div>
+                      {!compact ? <div className="mt-2 text-sm leading-5">{item.action}</div> : null}
+                    </div>
+                    <div className="flex shrink-0 flex-wrap gap-1.5 lg:max-w-48 lg:justify-end">
+                      <Badge variant="positive">기회 {item.opportunityScore}</Badge>
+                      <Badge variant="negative">압박 {item.pressureScore}</Badge>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    {item.relatedSymbols.slice(0, compact ? 4 : 6).map((symbol) => (
+                      <Badge key={symbol} variant="secondary">
+                        {symbol}
+                      </Badge>
+                    ))}
+                    <Badge variant="neutral">{item.evidence}</Badge>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-md border border-border bg-muted/10 p-4 text-sm leading-6 text-muted-foreground">
+                아직 충격 레일에 올릴 이벤트가 없습니다. 시세, 뉴스, 공시, 캘린더를 새로고침하면 여기서 우선순위를 다시 계산합니다.
+              </div>
+            )}
+          </div>
+
+          <div className="grid min-w-0 content-start gap-3">
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">장전 대응</div>
+              <div className="mt-3 grid gap-2 text-sm leading-5">
+                {pulse.playbook.map((item) => (
+                  <div key={item} className="flex gap-2">
+                    <Check className="mt-0.5 size-4 shrink-0 text-primary" />
+                    <span>{item}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="text-xs font-medium text-muted-foreground">구간별 이벤트</div>
+              <div className="mt-3 grid gap-2">
+                {(['now', 'preopen', 'session', 'overnight'] as MarketPulseHorizon[]).map((horizon) => {
+                  const count = pulse.items.filter((item) => item.horizon === horizon).length
+                  return (
+                    <div key={horizon} className="flex items-center justify-between gap-3 rounded-md border border-border bg-background/70 px-3 py-2 text-sm">
+                      <span>{marketPulseHorizonLabel[horizon]}</span>
+                      <Badge variant={count > 0 ? 'warning' : 'neutral'}>{count}개</Badge>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
           </div>
         </div>
       </CardContent>
@@ -7017,16 +7362,20 @@ function MarketRadarPage({
   leadingIndicatorsData,
   biasScoreData,
   koreaMarketBridge,
+  marketPulse,
 }: {
   leadingIndicatorsData: MarketIndicator[]
   biasScoreData: BiasScore
   koreaMarketBridge: KoreaMarketBridge
+  marketPulse: MarketPulseRail
 }) {
   const indicatorChartData = buildIndicatorChartData(leadingIndicatorsData)
 
   return (
     <PageGrid>
       <KoreaMarketBridgePanel bridge={koreaMarketBridge} />
+
+      <MarketPulseRailPanel pulse={marketPulse} />
 
       <section className="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
         <Card>
@@ -7157,6 +7506,7 @@ function ForecastPage({
   leadingIndicatorsData,
   newsImpactBoard,
   catalystRadar,
+  marketPulse,
   actionQueue,
   portfolioPlaybook,
   dataReliability,
@@ -7173,6 +7523,7 @@ function ForecastPage({
   leadingIndicatorsData: MarketIndicator[]
   newsImpactBoard: NewsImpactBoard
   catalystRadar: CatalystRadar
+  marketPulse: MarketPulseRail
   actionQueue: ActionQueueItem[]
   portfolioPlaybook: PortfolioPlaybook
   dataReliability: DataReliability
@@ -7198,6 +7549,8 @@ function ForecastPage({
       </section>
 
       <PreMarketCommandCenterPanel command={preMarketCommand} />
+
+      <MarketPulseRailPanel pulse={marketPulse} compact />
 
       <DataReliabilityPanel reliability={dataReliability} compact />
 
@@ -9390,7 +9743,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
     )
   }
   if (page === 'radar') {
-    return <MarketRadarPage leadingIndicatorsData={snapshot.leadingIndicators} biasScoreData={snapshot.biasScore} koreaMarketBridge={snapshot.koreaMarketBridge} />
+    return <MarketRadarPage leadingIndicatorsData={snapshot.leadingIndicators} biasScoreData={snapshot.biasScore} koreaMarketBridge={snapshot.koreaMarketBridge} marketPulse={snapshot.marketPulse} />
   }
   if (page === 'forecast') {
     return (
@@ -9400,6 +9753,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         leadingIndicatorsData={snapshot.leadingIndicators}
         newsImpactBoard={snapshot.newsImpactBoard}
         catalystRadar={snapshot.catalystRadar}
+        marketPulse={snapshot.marketPulse}
         actionQueue={snapshot.actionQueue}
         portfolioPlaybook={snapshot.portfolioPlaybook}
         dataReliability={snapshot.dataReliability}
@@ -10260,6 +10614,8 @@ export function Dashboard() {
             <PreMarketCommandCenterPanel command={snapshot.preMarketCommand} compact />
 
             <CatalystRadarPanel radar={snapshot.catalystRadar} compact />
+
+            <MarketPulseRailPanel pulse={snapshot.marketPulse} compact />
 
             <OvernightStressTestPanel stress={snapshot.overnightStressTest} compact />
 
