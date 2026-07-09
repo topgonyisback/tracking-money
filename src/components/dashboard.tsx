@@ -386,6 +386,34 @@ type SymbolBriefing = {
   items: SymbolBriefingItem[]
 }
 
+type PersonalCoverageTone = 'positive' | 'negative' | 'warning' | 'neutral'
+
+type PersonalCoverageItem = {
+  id: string
+  label: string
+  score: number
+  maxScore: number
+  tone: PersonalCoverageTone
+  statusLabel: string
+  metric: string
+  summary: string
+  nextAction: string
+  anchors: string[]
+}
+
+type PersonalCoverage = {
+  generatedAt: string
+  score: number
+  label: string
+  tone: PersonalCoverageTone
+  summary: string
+  readyCount: number
+  warningCount: number
+  missingCount: number
+  nextActions: string[]
+  items: PersonalCoverageItem[]
+}
+
 type DataFreshnessSource = {
   id: DataReliability['sources'][number]['id']
   name: string
@@ -485,6 +513,7 @@ type DashboardSnapshot = {
   forecastReview: ForecastReview
   forecastCalibration: ForecastCalibration
   symbolBriefing: SymbolBriefing
+  personalCoverage: PersonalCoverage
   executionPlan: ExecutionPlan
   preMarketCommand: PreMarketCommandCenter
   marketSession: MarketSessionControl
@@ -2243,6 +2272,228 @@ function buildSymbolBriefing({
     opportunityCount,
     riskCount,
     focusSymbols,
+    items,
+  }
+}
+
+function personalCoverageTone(score: number): PersonalCoverageTone {
+  if (score >= 82) return 'positive'
+  if (score >= 62) return 'warning'
+  if (score >= 38) return 'neutral'
+  return 'negative'
+}
+
+function personalCoverageLabel(score: number) {
+  if (score >= 82) return '실전 준비'
+  if (score >= 62) return '사용 가능'
+  if (score >= 38) return '보강 필요'
+  return '초기 설정'
+}
+
+function personalCoverageItemTone(score: number, maxScore: number): PersonalCoverageTone {
+  const ratio = maxScore > 0 ? score / maxScore : 0
+  if (ratio >= 0.78) return 'positive'
+  if (ratio >= 0.5) return 'warning'
+  if (ratio > 0) return 'neutral'
+  return 'negative'
+}
+
+function personalCoverageItemStatus(score: number, maxScore: number) {
+  const ratio = maxScore > 0 ? score / maxScore : 0
+  if (ratio >= 0.78) return '충분'
+  if (ratio >= 0.5) return '보강'
+  if (ratio > 0) return '초기'
+  return '비어 있음'
+}
+
+function makePersonalCoverageItem({
+  id,
+  label,
+  score,
+  maxScore,
+  metric,
+  summary,
+  nextAction,
+  anchors,
+}: Omit<PersonalCoverageItem, 'tone' | 'statusLabel'>): PersonalCoverageItem {
+  const normalizedScore = clamp(Math.round(score), 0, maxScore)
+
+  return {
+    id,
+    label,
+    score: normalizedScore,
+    maxScore,
+    tone: personalCoverageItemTone(normalizedScore, maxScore),
+    statusLabel: personalCoverageItemStatus(normalizedScore, maxScore),
+    metric,
+    summary,
+    nextAction,
+    anchors,
+  }
+}
+
+function buildPersonalCoverage({
+  holdingsData,
+  watchlistData,
+  userCalendarEvents,
+  newsKeywordsData,
+  alertRulesData,
+  alertHistoryData,
+  journal,
+  journalHistoryData,
+  dataReliability,
+}: {
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+  userCalendarEvents: CalendarEvent[]
+  newsKeywordsData: string[]
+  alertRulesData: AlertRule[]
+  alertHistoryData: AlertHistoryItem[]
+  journal: InvestmentJournal
+  journalHistoryData: JournalHistoryItem[]
+  dataReliability: DataReliability
+}): PersonalCoverage {
+  const enabledAlertRules = alertRulesData.filter((rule) => rule.enabled)
+  const journalFilled = hasJournalContent(journal)
+  const journalScore = (journalFilled ? 8 : 0) + (journalHistoryData.length >= 5 ? 6 : journalHistoryData.length >= 2 ? 4 : journalHistoryData.length >= 1 ? 2 : 0)
+  const keywordScore =
+    newsKeywordsData.length >= 10 ? 14 : newsKeywordsData.length >= 6 ? 11 : newsKeywordsData.length >= 3 ? 8 : newsKeywordsData.length >= 1 ? 4 : 0
+  const personalCalendarScore = userCalendarEvents.length >= 3 ? 12 : userCalendarEvents.length >= 1 ? 8 : 0
+  const dataLinkScore = Math.round(dataReliability.score * 0.2)
+
+  const items: PersonalCoverageItem[] = [
+    makePersonalCoverageItem({
+      id: 'holdings',
+      label: '보유종목',
+      score: holdingsData.length >= 3 ? 16 : holdingsData.length >= 1 ? 10 : 0,
+      maxScore: 16,
+      metric: `${holdingsData.length}개`,
+      summary:
+        holdingsData.length >= 3
+          ? '포트폴리오 비중과 종목별 영향 계산에 충분합니다.'
+          : holdingsData.length > 0
+            ? '핵심 보유종목은 반영되지만 비중 분산 판단은 제한적입니다.'
+            : '보유종목이 없으면 포트폴리오 손익과 실행 계획이 기본값에 머뭅니다.',
+      nextAction: holdingsData.length >= 3 ? '비중과 평균단가만 주기적으로 업데이트' : '보유종목 화면에서 실제 보유 종목과 평균단가 추가',
+      anchors: holdingsData.slice(0, 4).map((item) => item.symbol),
+    }),
+    makePersonalCoverageItem({
+      id: 'watchlist',
+      label: '관심종목',
+      score: watchlistData.length >= 3 ? 12 : watchlistData.length >= 1 ? 7 : 0,
+      maxScore: 12,
+      metric: `${watchlistData.length}개`,
+      summary:
+        watchlistData.length >= 3
+          ? '관심가 근접과 신규 진입 후보를 함께 볼 수 있습니다.'
+          : watchlistData.length > 0
+            ? '일부 후보만 감시 중이라 기회 포착 범위가 좁습니다.'
+            : '관심종목이 없으면 신규 진입 후보와 뉴스 영향판이 약해집니다.',
+      nextAction: watchlistData.length >= 3 ? '관심가와 트리거 문구를 장전 기준에 맞게 유지' : '관심종목 화면에서 다음 매수 후보와 관심가 추가',
+      anchors: watchlistData.slice(0, 4).map((item) => item.symbol),
+    }),
+    makePersonalCoverageItem({
+      id: 'news-keywords',
+      label: '뉴스 키워드',
+      score: keywordScore,
+      maxScore: 14,
+      metric: `${newsKeywordsData.length}개`,
+      summary:
+        newsKeywordsData.length >= 6
+          ? '종목, 섹터, 매크로 키워드가 뉴스 수집에 고르게 들어갑니다.'
+          : newsKeywordsData.length > 0
+            ? '기본 키워드는 있지만 포트폴리오별 촉매 탐지가 더 필요합니다.'
+            : '뉴스 키워드가 없으면 실시간 이슈 감지가 멈춥니다.',
+      nextAction: newsKeywordsData.length >= 6 ? '새 보유종목을 추가할 때 키워드도 같이 보강' : '설정에서 종목명, 섹터, CPI/FOMC 같은 매크로 키워드 추가',
+      anchors: newsKeywordsData.slice(0, 5),
+    }),
+    makePersonalCoverageItem({
+      id: 'calendar',
+      label: '개인 일정',
+      score: personalCalendarScore,
+      maxScore: 12,
+      metric: `${userCalendarEvents.length}개`,
+      summary:
+        userCalendarEvents.length >= 3
+          ? '실적, 매크로, 종목 메모가 예측과 액션 큐에 들어갑니다.'
+          : userCalendarEvents.length > 0
+            ? '중요 일정 일부가 반영되어 있지만 빈 날짜가 남아 있습니다.'
+            : '개인 일정이 없으면 공식/추정 캘린더만 반영됩니다.',
+      nextAction: userCalendarEvents.length >= 3 ? '확정 일정과 추정 일정을 발표 전날 갱신' : '캘린더 화면에서 실적발표, FOMC, 환율 체크 일정 추가',
+      anchors: userCalendarEvents.slice(0, 4).map((item) => item.title),
+    }),
+    makePersonalCoverageItem({
+      id: 'alerts',
+      label: '알림 규칙',
+      score: enabledAlertRules.length >= 4 ? 12 : enabledAlertRules.length >= 2 ? 9 : enabledAlertRules.length >= 1 ? 6 : 0,
+      maxScore: 12,
+      metric: `${enabledAlertRules.length}/${alertRulesData.length}개 · 기록 ${alertHistoryData.length}개`,
+      summary:
+        enabledAlertRules.length >= 2
+          ? '가격, 뉴스, 방향점수 조건을 액션 큐와 알림 기록에 반영합니다.'
+          : enabledAlertRules.length > 0
+            ? '일부 조건만 켜져 있어 중요한 변화가 빠질 수 있습니다.'
+            : '켜진 알림 규칙이 없어 장중 변화 감지가 수동 확인에 의존합니다.',
+      nextAction: enabledAlertRules.length >= 2 ? '발동 기록을 보고 너무 잦은 조건만 조정' : '알림 화면에서 관심가, 급락, 뉴스 키워드 조건 추가',
+      anchors: enabledAlertRules.slice(0, 4).map((item) => item.name),
+    }),
+    makePersonalCoverageItem({
+      id: 'journal',
+      label: '투자노트',
+      score: journalScore,
+      maxScore: 14,
+      metric: `${journalFilled ? '작성 중' : '미작성'} · 복기 ${journalHistoryData.length}개`,
+      summary:
+        journalFilled && journalHistoryData.length > 0
+          ? '오늘 계획과 과거 복기가 예측 검증에 같이 쌓이고 있습니다.'
+          : journalFilled
+            ? '오늘 계획은 있지만 복기 히스토리가 아직 부족합니다.'
+            : journalHistoryData.length > 0
+              ? '과거 복기는 있으나 오늘 장전 계획이 비어 있습니다.'
+              : '투자노트가 비어 있으면 예측 캘리브레이션이 충분히 학습되지 않습니다.',
+      nextAction: journalFilled ? '장후 리뷰를 저장해 예측 검증 표본을 늘리기' : '투자노트 화면에서 장전 계획과 리스크 대응 한 줄씩 작성',
+      anchors: journalHistoryData.slice(0, 4).map((item) => item.date),
+    }),
+    makePersonalCoverageItem({
+      id: 'data-links',
+      label: '실데이터 연결',
+      score: dataLinkScore,
+      maxScore: 20,
+      metric: `${dataReliability.score}/100`,
+      summary: dataReliability.summary,
+      nextAction: dataReliability.nextActions[0] ?? '설정 화면에서 수신 상태와 필요한 환경변수 확인',
+      anchors: dataReliability.sources.slice(0, 4).map((item) => item.name),
+    }),
+  ]
+  const score = clamp(items.reduce((sum, item) => sum + item.score, 0), 0, 100)
+  const readyCount = items.filter((item) => item.score / item.maxScore >= 0.78).length
+  const warningCount = items.filter((item) => item.score > 0 && item.score / item.maxScore < 0.78).length
+  const missingCount = items.filter((item) => item.score === 0).length
+  const nextActions = items
+    .filter((item) => item.score / item.maxScore < 0.78)
+    .sort((left, right) => right.maxScore - right.score - (left.maxScore - left.score))
+    .slice(0, 4)
+    .map((item) => item.nextAction)
+  const label = personalCoverageLabel(score)
+  const summary =
+    score >= 82
+      ? '내 종목, 이슈, 일정, 알림, 기록이 예측 흐름에 대부분 연결되어 있습니다.'
+      : score >= 62
+        ? '핵심 데이터는 연결되어 있고 일부 개인 입력을 보강하면 판단 품질이 좋아집니다.'
+        : score >= 38
+          ? '기본 판단은 가능하지만 개인 일정, 알림, 저널 쪽 보강 여지가 큽니다.'
+          : '아직 개인 데이터가 부족해 기본 샘플과 실데이터 신호 비중이 큽니다.'
+
+  return {
+    generatedAt: new Date().toISOString(),
+    score,
+    label,
+    tone: personalCoverageTone(score),
+    summary,
+    readyCount,
+    warningCount,
+    missingCount,
+    nextActions,
     items,
   }
 }
@@ -5668,6 +5919,17 @@ function buildDashboardSnapshot({
     disclosureMessage,
     disclosureCount: disclosures.length,
   })
+  const personalCoverage = buildPersonalCoverage({
+    holdingsData: liveHoldings,
+    watchlistData: liveWatchlist,
+    userCalendarEvents,
+    newsKeywordsData,
+    alertRulesData,
+    alertHistoryData,
+    journal,
+    journalHistoryData,
+    dataReliability,
+  })
   const dataFreshness = buildDataFreshness({
     dataReliability,
     quoteFetchedAt: fetchedAt,
@@ -5785,6 +6047,7 @@ function buildDashboardSnapshot({
     forecastReview,
     forecastCalibration,
     symbolBriefing,
+    personalCoverage,
     executionPlan,
     preMarketCommand,
     marketSession,
@@ -7111,6 +7374,110 @@ function DataFreshnessPanel({
               <div className="mt-3 text-xs leading-5 text-muted-foreground">{compact ? source.summary : source.nextAction}</div>
             </div>
           ))}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function PersonalCoveragePanel({ coverage, compact = false }: { coverage: PersonalCoverage; compact?: boolean }) {
+  const visibleItems = compact ? coverage.items.slice(0, 4) : coverage.items
+  const visibleActions = coverage.nextActions.slice(0, compact ? 3 : 5)
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <CardTitle>개인화 완성도</CardTitle>
+            <CardDescription>{coverage.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={coverage.tone}>{coverage.label}</Badge>
+            <Badge variant="secondary">{coverage.score}/100</Badge>
+            <Badge variant={coverage.missingCount > 0 ? 'warning' : 'positive'}>비어 있음 {coverage.missingCount}개</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">완성도 점수</div>
+            <div className="mt-2 text-2xl font-semibold">{coverage.score}</div>
+            <Progress className="mt-3" value={coverage.score} />
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">충분</div>
+            <div className="mt-2 text-2xl font-semibold">{coverage.readyCount}개</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">보강</div>
+            <div className="mt-2 text-2xl font-semibold">{coverage.warningCount}개</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">검사 시각</div>
+            <div className="mt-2 text-sm font-semibold leading-5">{formatNewsTime(coverage.generatedAt)}</div>
+          </div>
+        </div>
+
+        <div className={cn('grid gap-4', compact ? '2xl:grid-cols-[minmax(0,1fr)_280px]' : 'xl:grid-cols-[minmax(0,1fr)_320px]')}>
+          <div className={cn('grid min-w-0 gap-3', compact ? 'md:grid-cols-2' : 'lg:grid-cols-2')}>
+            {visibleItems.map((item) => (
+              <div key={item.id} className="min-w-0 rounded-md border border-border bg-muted/10 p-3">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold">{item.label}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">{item.metric}</div>
+                  </div>
+                  <div className="flex flex-wrap justify-end gap-1.5">
+                    <Badge variant={item.tone}>{item.statusLabel}</Badge>
+                    <Badge variant="secondary">{item.score}/{item.maxScore}</Badge>
+                  </div>
+                </div>
+                <Progress className="mt-3" value={item.maxScore > 0 ? Math.round((item.score / item.maxScore) * 100) : 0} />
+                <div className="mt-3 text-xs leading-5 text-muted-foreground">{compact ? item.nextAction : item.summary}</div>
+                {!compact && item.anchors.length > 0 ? (
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    {item.anchors.slice(0, 5).map((anchor) => (
+                      <Badge key={anchor} variant="secondary">
+                        {anchor}
+                      </Badge>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+
+          <div className="grid min-w-0 content-start gap-3">
+            <div className="rounded-md border border-border bg-background/70 p-4">
+              <div className="mb-3 text-sm font-semibold">다음 보강</div>
+              <div className="space-y-2">
+                {visibleActions.length > 0 ? (
+                  visibleActions.map((action) => (
+                    <div key={action} className="flex gap-2 text-sm leading-6 text-muted-foreground">
+                      <Check className="mt-1 size-4 shrink-0 text-primary" />
+                      <span>{action}</span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-sm leading-6 text-muted-foreground">오늘은 입력 데이터보다 장중 가격 반응과 뉴스 갱신을 우선 확인합니다.</div>
+                )}
+              </div>
+            </div>
+            {!compact ? (
+              <div className="rounded-md border border-border bg-background/70 p-4">
+                <div className="mb-3 text-sm font-semibold">반영 영역</div>
+                <div className="flex flex-wrap gap-2">
+                  {['방향점수', '뉴스 영향판', '액션 큐', '실행 계획', '예측 캘리브레이션'].map((item) => (
+                    <Badge key={item} variant="secondary">
+                      {item}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
         </div>
       </CardContent>
     </Card>
@@ -10011,6 +10378,7 @@ function SettingsPage({
   disclosureCount,
   dataReliability,
   dataFreshness,
+  personalCoverage,
   backupData,
   onImportDashboardData,
   onResetDashboardData,
@@ -10035,6 +10403,7 @@ function SettingsPage({
   disclosureCount: number
   dataReliability: DataReliability
   dataFreshness: DataFreshness
+  personalCoverage: PersonalCoverage
   backupData: StoredDashboardData
   onImportDashboardData: (data: StoredDashboardData) => void
   onResetDashboardData: () => void
@@ -10473,6 +10842,8 @@ function SettingsPage({
       </section>
 
       <DataFreshnessPanel freshness={dataFreshness} />
+
+      <PersonalCoveragePanel coverage={personalCoverage} />
 
       <section className="grid gap-4 lg:grid-cols-2">
         <Card>
@@ -10915,6 +11286,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         disclosureCount={snapshot.disclosures.length}
         dataReliability={snapshot.dataReliability}
         dataFreshness={snapshot.dataFreshness}
+        personalCoverage={snapshot.personalCoverage}
         backupData={snapshot.storedData}
         onImportDashboardData={actions.onImportDashboardData}
         onResetDashboardData={actions.onResetDashboardData}
@@ -11688,6 +12060,8 @@ export function Dashboard() {
             <DataReliabilityPanel reliability={snapshot.dataReliability} onRefreshAll={refreshAllData} refreshing={dataRefreshBusy} compact />
 
             <DataFreshnessPanel freshness={snapshot.dataFreshness} onRefreshAll={refreshAllData} refreshing={dataRefreshBusy} compact />
+
+            <PersonalCoveragePanel coverage={snapshot.personalCoverage} compact />
 
             <SignalAuditPanel audit={snapshot.signalAudit} compact />
 
