@@ -264,6 +264,34 @@ type CatalystRadar = {
   items: CatalystRadarItem[]
 }
 
+type DataFreshnessSource = {
+  id: DataReliability['sources'][number]['id']
+  name: string
+  modeLabel: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  statusLabel: string
+  updatedAt: string | null
+  updatedLabel: string
+  ageMinutes: number | null
+  ageLabel: string
+  staleAfterMinutes: number
+  cadenceLabel: string
+  summary: string
+  nextAction: string
+}
+
+type DataFreshness = {
+  generatedAt: string
+  score: number
+  label: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  summary: string
+  staleCount: number
+  missingCount: number
+  nextRefreshLabel: string
+  sources: DataFreshnessSource[]
+}
+
 type MarketForecast = {
   baseScore: number
   openingBias: string
@@ -326,6 +354,7 @@ type DashboardSnapshot = {
   portfolioPlaybook: PortfolioPlaybook
   morningBrief: MorningBrief
   dataReliability: DataReliability
+  dataFreshness: DataFreshness
   signalAudit: SignalAudit
   koreaMarketBridge: KoreaMarketBridge
   forecastSensitivity: ForecastSensitivity
@@ -1122,6 +1151,38 @@ function formatMarketTime(value: string | null) {
     minute: '2-digit',
     timeZone: 'Asia/Seoul',
   })
+}
+
+function minutesSince(value: string | null, now = Date.now()) {
+  if (!value) return null
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return Math.max(0, Math.round((now - date.getTime()) / 60_000))
+}
+
+function freshnessAgeLabel(ageMinutes: number | null) {
+  if (ageMinutes === null) return '수신 전'
+  if (ageMinutes < 1) return '방금'
+  if (ageMinutes < 60) return `${ageMinutes}분 전`
+  const hours = Math.floor(ageMinutes / 60)
+  const minutes = ageMinutes % 60
+  if (hours < 24) return minutes > 0 ? `${hours}시간 ${minutes}분 전` : `${hours}시간 전`
+  const days = Math.floor(hours / 24)
+  return `${days}일 전`
+}
+
+function freshnessTone(ageMinutes: number | null, staleAfterMinutes: number, sourceTone: DataReliability['sources'][number]['tone']): DataFreshnessSource['tone'] {
+  if (ageMinutes === null) return 'negative'
+  if (ageMinutes > staleAfterMinutes * 2) return 'negative'
+  if (ageMinutes > staleAfterMinutes) return 'warning'
+  return sourceTone === 'positive' ? 'positive' : sourceTone === 'negative' ? 'warning' : sourceTone
+}
+
+function freshnessStatusLabel(ageMinutes: number | null, staleAfterMinutes: number) {
+  if (ageMinutes === null) return '수신 전'
+  if (ageMinutes > staleAfterMinutes * 2) return '오래됨'
+  if (ageMinutes > staleAfterMinutes) return '갱신 필요'
+  return '최신'
 }
 
 type NotificationPermissionState = NotificationPermission | 'unsupported'
@@ -3970,6 +4031,103 @@ function buildDataReliability({
   }
 }
 
+function buildDataFreshness({
+  dataReliability,
+  quoteFetchedAt,
+  newsFetchedAt,
+  calendarFetchedAt,
+  disclosureFetchedAt,
+}: {
+  dataReliability: DataReliability
+  quoteFetchedAt: string | null
+  newsFetchedAt: string | null
+  calendarFetchedAt: string | null
+  disclosureFetchedAt: string | null
+}): DataFreshness {
+  const now = Date.now()
+  const timestampBySource: Record<DataFreshnessSource['id'], string | null> = {
+    quotes: quoteFetchedAt,
+    news: newsFetchedAt,
+    calendar: calendarFetchedAt,
+    disclosures: disclosureFetchedAt,
+  }
+  const staleAfterBySource: Record<DataFreshnessSource['id'], number> = {
+    quotes: 5,
+    news: 15,
+    disclosures: 30,
+    calendar: 90,
+  }
+  const cadenceBySource: Record<DataFreshnessSource['id'], string> = {
+    quotes: '화면 120초 갱신 / 5분 초과 경고',
+    news: '화면 10분 갱신 / 15분 초과 경고',
+    disclosures: '화면 15분 갱신 / 30분 초과 경고',
+    calendar: '화면 1시간 갱신 / 90분 초과 경고',
+  }
+  const sources = dataReliability.sources.map((source) => {
+    const updatedAt = timestampBySource[source.id]
+    const staleAfterMinutes = staleAfterBySource[source.id]
+    const ageMinutes = minutesSince(updatedAt, now)
+    const statusLabel = freshnessStatusLabel(ageMinutes, staleAfterMinutes)
+    const tone = freshnessTone(ageMinutes, staleAfterMinutes, source.tone)
+    const ageLabel = freshnessAgeLabel(ageMinutes)
+    const summary =
+      ageMinutes === null
+        ? `${source.name}은 아직 이번 세션에서 수신 시간이 확인되지 않았습니다.`
+        : `${source.name}은 ${ageLabel} 수신된 ${source.modeLabel}입니다.`
+
+    return {
+      id: source.id,
+      name: source.name,
+      modeLabel: source.modeLabel,
+      tone,
+      statusLabel,
+      updatedAt,
+      updatedLabel: updatedAt ? formatNewsTime(updatedAt) : '수신 전',
+      ageMinutes,
+      ageLabel,
+      staleAfterMinutes,
+      cadenceLabel: cadenceBySource[source.id],
+      summary,
+      nextAction: tone === 'negative' || tone === 'warning' ? source.nextAction : `${source.name}은 현재 최신성 기준 안에 있습니다.`,
+    }
+  })
+  const freshnessPoints: number[] = sources.map((source) => {
+    if (source.ageMinutes === null) return 0
+    if (source.ageMinutes <= source.staleAfterMinutes) return 100
+    if (source.ageMinutes <= source.staleAfterMinutes * 2) return 62
+    return 24
+  })
+  const score = Math.round(freshnessPoints.reduce((sum, point) => sum + point, 0) / Math.max(1, freshnessPoints.length))
+  const staleCount = sources.filter((source) => source.statusLabel === '갱신 필요' || source.statusLabel === '오래됨').length
+  const missingCount = sources.filter((source) => source.ageMinutes === null).length
+  const nextSource = sources
+    .filter((source) => source.ageMinutes !== null)
+    .sort((left, right) => {
+      const leftRemaining = left.staleAfterMinutes - (left.ageMinutes ?? 0)
+      const rightRemaining = right.staleAfterMinutes - (right.ageMinutes ?? 0)
+      return leftRemaining - rightRemaining
+    })[0]
+  const label = score >= 82 ? '최신성 양호' : score >= 60 ? '일부 갱신 필요' : '최신성 점검 필요'
+  const tone: DataFreshness['tone'] = score >= 82 ? 'positive' : score >= 60 ? 'warning' : 'negative'
+
+  return {
+    generatedAt: new Date(now).toISOString(),
+    score,
+    label,
+    tone,
+    summary:
+      staleCount > 0
+        ? `${staleCount}개 데이터 소스가 권장 갱신 기준을 넘겼습니다. 장전 판단 전 전체 새로고침을 먼저 실행하세요.`
+        : missingCount > 0
+          ? `${missingCount}개 데이터 소스의 수신 시간이 아직 없습니다. 연결 상태를 확인한 뒤 판단 강도를 낮춰 보세요.`
+          : '모든 핵심 데이터가 권장 최신성 기준 안에 있습니다.',
+    staleCount,
+    missingCount,
+    nextRefreshLabel: nextSource ? `${nextSource.name} ${Math.max(0, nextSource.staleAfterMinutes - (nextSource.ageMinutes ?? 0))}분 내 재확인` : '수신 후 계산',
+    sources,
+  }
+}
+
 const signalAuditSourceMeta: Record<
   ForecastImpact['source'],
   {
@@ -4465,6 +4623,9 @@ function buildDashboardSnapshot({
   journalHistoryData,
   quotes,
   fetchedAt,
+  newsFetchedAt,
+  calendarFetchedAt,
+  disclosureFetchedAt,
   quoteStatus,
   quoteMessage,
   calendarEventsData,
@@ -4488,6 +4649,9 @@ function buildDashboardSnapshot({
   journalHistoryData: JournalHistoryItem[]
   quotes: MarketQuote[]
   fetchedAt: string | null
+  newsFetchedAt: string | null
+  calendarFetchedAt: string | null
+  disclosureFetchedAt: string | null
   quoteStatus: QuoteStatus
   quoteMessage: string
   calendarEventsData: CalendarEvent[]
@@ -4589,6 +4753,13 @@ function buildDashboardSnapshot({
     disclosureMessage,
     disclosureCount: disclosures.length,
   })
+  const dataFreshness = buildDataFreshness({
+    dataReliability,
+    quoteFetchedAt: fetchedAt,
+    newsFetchedAt,
+    calendarFetchedAt,
+    disclosureFetchedAt,
+  })
   const signalAudit = buildSignalAudit({
     forecast,
     dataReliability,
@@ -4676,6 +4847,7 @@ function buildDashboardSnapshot({
     portfolioPlaybook,
     morningBrief,
     dataReliability,
+    dataFreshness,
     signalAudit,
     koreaMarketBridge,
     forecastSensitivity,
@@ -5723,6 +5895,86 @@ function DataReliabilityPanel({
               ))}
             </div>
           </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function DataFreshnessPanel({
+  freshness,
+  onRefreshAll,
+  refreshing = false,
+  compact = false,
+}: {
+  freshness: DataFreshness
+  onRefreshAll?: () => void
+  refreshing?: boolean
+  compact?: boolean
+}) {
+  const visibleSources = compact ? freshness.sources.slice(0, 4) : freshness.sources
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <CardTitle>데이터 최신성 가드</CardTitle>
+            <CardDescription>{freshness.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={freshness.tone}>{freshness.label}</Badge>
+            <Badge variant="secondary">다음 확인 {freshness.nextRefreshLabel}</Badge>
+            {onRefreshAll ? (
+              <Button type="button" variant="outline" size="sm" onClick={onRefreshAll} disabled={refreshing}>
+                <RefreshCw className={cn('size-4', refreshing && 'animate-spin')} />
+                전체 새로고침
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">최신성 점수</div>
+            <div className="mt-2 text-2xl font-semibold">{freshness.score}/100</div>
+            <Progress className="mt-3" value={freshness.score} />
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">갱신 필요</div>
+            <div className="mt-2 text-2xl font-semibold">{freshness.staleCount}개</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">수신 전</div>
+            <div className="mt-2 text-2xl font-semibold">{freshness.missingCount}개</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">검사 시각</div>
+            <div className="mt-2 text-sm font-semibold leading-5">{formatNewsTime(freshness.generatedAt)}</div>
+          </div>
+        </div>
+
+        <div className={cn('grid gap-3', compact ? 'md:grid-cols-2 xl:grid-cols-4' : 'lg:grid-cols-2')}>
+          {visibleSources.map((source) => (
+            <div key={source.id} className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <div className="text-sm font-semibold">{source.name}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">{source.cadenceLabel}</div>
+                </div>
+                <div className="flex flex-wrap justify-end gap-1.5">
+                  <Badge variant={source.tone}>{source.statusLabel}</Badge>
+                  <Badge variant="secondary">{source.modeLabel}</Badge>
+                </div>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Badge variant="neutral">{source.ageLabel}</Badge>
+                <Badge variant="secondary">기준 {source.staleAfterMinutes}분</Badge>
+              </div>
+              <div className="mt-3 text-xs leading-5 text-muted-foreground">{compact ? source.summary : source.nextAction}</div>
+            </div>
+          ))}
         </div>
       </CardContent>
     </Card>
@@ -6908,6 +7160,7 @@ function ForecastPage({
   actionQueue,
   portfolioPlaybook,
   dataReliability,
+  dataFreshness,
   signalAudit,
   forecastSensitivity,
   overnightStressTest,
@@ -6923,6 +7176,7 @@ function ForecastPage({
   actionQueue: ActionQueueItem[]
   portfolioPlaybook: PortfolioPlaybook
   dataReliability: DataReliability
+  dataFreshness: DataFreshness
   signalAudit: SignalAudit
   forecastSensitivity: ForecastSensitivity
   overnightStressTest: OvernightStressTest
@@ -6946,6 +7200,8 @@ function ForecastPage({
       <PreMarketCommandCenterPanel command={preMarketCommand} />
 
       <DataReliabilityPanel reliability={dataReliability} compact />
+
+      <DataFreshnessPanel freshness={dataFreshness} compact />
 
       <SignalAuditPanel audit={signalAudit} />
 
@@ -8356,6 +8612,7 @@ function SettingsPage({
   disclosureMessage,
   disclosureCount,
   dataReliability,
+  dataFreshness,
   backupData,
   onImportDashboardData,
   onResetDashboardData,
@@ -8379,6 +8636,7 @@ function SettingsPage({
   disclosureMessage: string
   disclosureCount: number
   dataReliability: DataReliability
+  dataFreshness: DataFreshness
   backupData: StoredDashboardData
   onImportDashboardData: (data: StoredDashboardData) => void
   onResetDashboardData: () => void
@@ -8816,6 +9074,8 @@ function SettingsPage({
         </Card>
       </section>
 
+      <DataFreshnessPanel freshness={dataFreshness} />
+
       <section className="grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
@@ -9143,6 +9403,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         actionQueue={snapshot.actionQueue}
         portfolioPlaybook={snapshot.portfolioPlaybook}
         dataReliability={snapshot.dataReliability}
+        dataFreshness={snapshot.dataFreshness}
         signalAudit={snapshot.signalAudit}
         forecastSensitivity={snapshot.forecastSensitivity}
         overnightStressTest={snapshot.overnightStressTest}
@@ -9250,6 +9511,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         disclosureMessage={snapshot.disclosureMessage}
         disclosureCount={snapshot.disclosures.length}
         dataReliability={snapshot.dataReliability}
+        dataFreshness={snapshot.dataFreshness}
         backupData={snapshot.storedData}
         onImportDashboardData={actions.onImportDashboardData}
         onResetDashboardData={actions.onResetDashboardData}
@@ -9283,6 +9545,7 @@ export function Dashboard() {
   const [calendarStatus, setCalendarStatus] = useState<CalendarStatus>('idle')
   const [calendarMessage, setCalendarMessage] = useState('캘린더 연결 대기')
   const [liveNews, setLiveNews] = useState<LiveNewsItem[]>([])
+  const [newsFetchedAt, setNewsFetchedAt] = useState<string | null>(null)
   const [newsStatus, setNewsStatus] = useState<NewsStatus>('idle')
   const [newsMessage, setNewsMessage] = useState('뉴스 연결 대기')
   const [disclosureResponse, setDisclosureResponse] = useState<DisclosureApiResponse | null>(null)
@@ -9387,6 +9650,7 @@ export function Dashboard() {
 
       if (!response.ok) {
         setLiveNews(payload.items ?? [])
+        setNewsFetchedAt(payload.fetchedAt ?? new Date().toISOString())
         setNewsStatus('error')
         setNewsMessage(payload.message ?? '네이버 뉴스 API 호출에 실패했습니다.')
         return
@@ -9394,18 +9658,21 @@ export function Dashboard() {
 
       if (!payload.configured) {
         setLiveNews([])
+        setNewsFetchedAt(payload.fetchedAt ?? new Date().toISOString())
         setNewsStatus('fallback')
         setNewsMessage(payload.message ?? '네이버 뉴스 API 환경변수 설정이 필요합니다.')
         return
       }
 
       setLiveNews(payload.items)
+      setNewsFetchedAt(payload.fetchedAt ?? new Date().toISOString())
       setNewsStatus(payload.items.length > 0 ? 'ready' : 'fallback')
       setNewsMessage(payload.items.length > 0 ? `최근 수집 ${formatNewsTime(payload.fetchedAt ?? '')}` : '수집된 뉴스가 없습니다.')
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return
 
       setLiveNews([])
+      setNewsFetchedAt(null)
       setNewsStatus('error')
       setNewsMessage(error instanceof Error ? error.message : '뉴스를 불러오지 못했습니다.')
     }
@@ -9553,6 +9820,9 @@ export function Dashboard() {
         alertHistoryData: alertHistory,
         journalHistoryData: journalHistory,
         fetchedAt: quoteResponse?.fetchedAt ?? null,
+        newsFetchedAt,
+        calendarFetchedAt: calendarResponse?.fetchedAt ?? null,
+        disclosureFetchedAt: disclosureResponse?.fetchedAt ?? null,
         quoteStatus,
         quoteMessage,
         calendarEventsData: mergeCalendarEvents(automaticCalendarEvents, userCalendarEvents),
@@ -9578,6 +9848,7 @@ export function Dashboard() {
       journal,
       journalHistory,
       newsMessage,
+      newsFetchedAt,
       newsStatus,
       quoteMessage,
       quoteResponse,
@@ -9995,6 +10266,8 @@ export function Dashboard() {
             <NewsImpactBoardPanel board={snapshot.newsImpactBoard} compact />
 
             <DataReliabilityPanel reliability={snapshot.dataReliability} onRefreshAll={refreshAllData} refreshing={dataRefreshBusy} compact />
+
+            <DataFreshnessPanel freshness={snapshot.dataFreshness} onRefreshAll={refreshAllData} refreshing={dataRefreshBusy} compact />
 
             <SignalAuditPanel audit={snapshot.signalAudit} compact />
 

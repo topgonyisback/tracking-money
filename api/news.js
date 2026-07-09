@@ -229,6 +229,7 @@ export default async function handler(req, res) {
   if (!clientId || !clientSecret) {
     sendJson(res, 200, {
       configured: false,
+      fetchedAt: new Date().toISOString(),
       items: [],
       message: 'Vercel 환경변수 NAVER_CLIENT_ID, NAVER_CLIENT_SECRET 설정이 필요합니다.',
     })
@@ -293,6 +294,7 @@ export default async function handler(req, res) {
   } catch (error) {
     sendJson(res, 502, {
       configured: true,
+      fetchedAt: new Date().toISOString(),
       items: [],
       message: error instanceof Error ? error.message : '네이버 뉴스 API 호출에 실패했습니다.',
     })
