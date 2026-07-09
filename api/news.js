@@ -79,8 +79,76 @@ const NEGATIVE_WORDS = [
 ]
 
 const HIGH_IMPORTANCE_WORDS = ['실적', 'CPI', 'FOMC', '금리', '환율', '관세', '규제', '가이던스', '서프라이즈']
+const MARKET_CONTEXT_WORDS = [
+  '주가',
+  '증시',
+  '코스피',
+  '코스닥',
+  '나스닥',
+  '선물',
+  '실적',
+  '매출',
+  '영업이익',
+  '가이던스',
+  '수출',
+  '수급',
+  '투자',
+  '공급',
+  '수요',
+  '가격',
+  '마진',
+  '반도체',
+  'AI',
+  'HBM',
+  '메모리',
+  '칩',
+  '데이터센터',
+  '전기차',
+  '배터리',
+  '환율',
+  '금리',
+  '물가',
+  'CPI',
+  'FOMC',
+]
+const NOISE_CONTEXT_WORDS = [
+  '아파트',
+  '주공',
+  '단지',
+  '입지',
+  '분양',
+  '건축',
+  '설계',
+  '랜드마크',
+  '공항',
+  '터미널',
+  'SNS',
+  '근황',
+  '방송인',
+  '배우',
+  '예능',
+  '패션',
+]
+const KEYWORD_CONTEXT_MAP = {
+  삼성전자: ['D램', 'HBM', '파운드리', '메모리', '갤럭시', '실적', '영업이익', '반도체', 'AI', '수출', '주가'],
+  SK하이닉스: ['D램', 'HBM', '메모리', '실적', '영업이익', '반도체', 'AI', '엔비디아', '주가'],
+  엔비디아: ['GPU', 'AI', 'HBM', '데이터센터', '칩', '반도체', '블랙웰', '실적', '가이던스', '나스닥', '주가'],
+  애플: ['아이폰', '맥', 'AI', '실적', '매출', '공급망', '반도체', '앱스토어', '주가', '나스닥'],
+  테슬라: ['전기차', 'EV', '배터리', '로보택시', '자율주행', '인도량', '판매', '실적', '주가', '나스닥'],
+  반도체: ['D램', 'HBM', '메모리', '파운드리', '장비', '수출', 'AI', '엔비디아', '삼성전자', 'SK하이닉스'],
+  AI: ['반도체', 'GPU', '데이터센터', 'HBM', '엔비디아', '오픈AI', '클라우드', '투자', '수익화'],
+  환율: ['원달러', '달러', '외국인', '수급', '수출', '금리', '물가', '코스피'],
+  CPI: ['물가', '인플레이션', '금리', '연준', 'FOMC', '나스닥', '채권', '달러'],
+  FOMC: ['연준', '파월', '금리', '점도표', '채권', '달러', '나스닥', '물가'],
+  금리: ['연준', '채권', '국채', '물가', '인플레이션', 'FOMC', '나스닥', '성장주'],
+  배터리: ['전기차', '양극재', '리튬', 'LG에너지솔루션', '테슬라', '수주', '실적', 'IRA'],
+}
 const REQUEST_DELAY_MS = 250
 const RETRY_DELAY_MS = 800
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max)
+}
 
 function sendJson(res, statusCode, payload) {
   res.statusCode = statusCode
@@ -115,7 +183,51 @@ function getSource(link) {
   }
 }
 
-function classifyNews(keyword, title, description) {
+function countHits(words, text) {
+  return words.filter((word) => text.includes(word)).length
+}
+
+function evaluateNewsQuality(keyword, title, description) {
+  const text = `${title} ${description}`
+  const titleHit = title.includes(keyword)
+  const descriptionHit = description.includes(keyword)
+  const marketHits = countHits(MARKET_CONTEXT_WORDS, text)
+  const keywordContextHits = countHits(KEYWORD_CONTEXT_MAP[keyword] ?? [], text)
+  const importanceHits = countHits(HIGH_IMPORTANCE_WORDS, text)
+  const noiseHits = countHits(NOISE_CONTEXT_WORDS, text)
+
+  const score = clamp(
+    (titleHit ? 30 : 0) +
+      (descriptionHit ? 12 : 0) +
+      marketHits * 7 +
+      keywordContextHits * 9 +
+      importanceHits * 6 -
+      (marketHits + keywordContextHits === 0 ? noiseHits * 12 : noiseHits * 5),
+    0,
+    100,
+  )
+
+  const quality = score >= 72 ? 'high' : score >= 48 ? 'medium' : score >= 28 ? 'low' : 'noise'
+  const reason =
+    quality === 'high'
+      ? '제목과 본문이 시장 변수와 직접 연결됩니다.'
+      : quality === 'medium'
+        ? '시장 관련 문맥이 확인되어 예측 재료로 참고 가능합니다.'
+        : quality === 'low'
+          ? '키워드는 맞지만 가격/실적/수급 연결은 약합니다.'
+          : '단순 언급 가능성이 높아 예측 재료에서 제외했습니다.'
+
+  return {
+    relevanceScore: score,
+    quality,
+    reason,
+    marketHits,
+    keywordContextHits,
+    noiseHits,
+  }
+}
+
+function classifyNews(keyword, title, description, quality) {
   const text = `${title} ${description}`
   const positiveHits = POSITIVE_WORDS.filter((word) => text.includes(word)).length
   const negativeHits = NEGATIVE_WORDS.filter((word) => text.includes(word)).length
@@ -126,9 +238,24 @@ function classifyNews(keyword, title, description) {
   if (negativeHits > positiveHits) direction = 'negative'
   if (positiveHits > 0 && negativeHits > 0 && positiveHits === negativeHits) direction = 'mixed'
 
-  const importance = importanceHits > 0 || keyword === 'CPI' || keyword === 'FOMC' ? 'high' : 'medium'
+  const importance =
+    importanceHits > 0 || keyword === 'CPI' || keyword === 'FOMC'
+      ? 'high'
+      : quality.quality === 'high'
+        ? 'high'
+        : quality.quality === 'low'
+          ? 'low'
+          : 'medium'
+  const confidence =
+    quality.quality === 'high' && positiveHits + negativeHits > 0
+      ? 'high'
+      : quality.quality === 'noise' || positiveHits + negativeHits === 0
+        ? 'low'
+        : 'medium'
   const expectedImpact =
-    direction === 'positive'
+    quality.quality === 'low'
+      ? '시장 관련성은 낮아 단독 판단보다 가격 반응 확인용으로만 봅니다.'
+      : direction === 'positive'
       ? '관련 종목과 국내장 심리에 우호적인 재료로 볼 수 있습니다.'
       : direction === 'negative'
         ? '장 시작 전 수급과 갭하락 리스크를 먼저 확인해야 합니다.'
@@ -139,7 +266,7 @@ function classifyNews(keyword, title, description) {
   return {
     direction,
     importance,
-    confidence: positiveHits + negativeHits > 0 ? 'medium' : 'low',
+    confidence,
     relatedSymbols: SYMBOL_MAP[keyword] ?? [],
     sectors: SECTOR_MAP[keyword] ?? [keyword],
     expectedImpact,
@@ -202,7 +329,8 @@ async function fetchNaverNews({ keyword, display, clientId, clientSecret }) {
     const title = cleanText(item.title)
     const description = cleanText(item.description)
     const link = item.originallink || item.link
-    const classified = classifyNews(keyword, title, description)
+    const quality = evaluateNewsQuality(keyword, title, description)
+    const classified = classifyNews(keyword, title, description, quality)
 
     return {
       id: `${keyword}-${item.pubDate ?? index}-${link}`,
@@ -212,6 +340,9 @@ async function fetchNaverNews({ keyword, display, clientId, clientSecret }) {
       link,
       description,
       publishedAt: item.pubDate,
+      relevanceScore: quality.relevanceScore,
+      quality: quality.quality,
+      qualityReason: quality.reason,
       ...classified,
     }
   })
@@ -266,10 +397,17 @@ export default async function handler(req, res) {
     }
 
     const seenLinks = new Set()
+    const seenTitles = new Set()
+    const rawCount = results.length
+    const qualityFilteredCount = results.filter((item) => item.quality === 'noise').length
     const items = results
       .filter((item) => {
         if (seenLinks.has(item.link)) return false
+        if (item.quality === 'noise') return false
         seenLinks.add(item.link)
+        const titleKey = `${item.source}:${item.title.replace(/\s+/g, ' ').trim()}`
+        if (seenTitles.has(titleKey)) return false
+        seenTitles.add(titleKey)
         return true
       })
       .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime())
@@ -280,6 +418,9 @@ export default async function handler(req, res) {
       configured: true,
       fetchedAt: new Date().toISOString(),
       keywords,
+      rawCount,
+      qualityFilteredCount,
+      qualityGate: 'market-relevance-v1',
       items,
       message:
         errors.length > 0

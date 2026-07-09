@@ -536,6 +536,9 @@ type DashboardSnapshot = {
   liveNews: LiveNewsItem[]
   newsStatus: NewsStatus
   newsMessage: string
+  newsRawCount: number
+  newsQualityFilteredCount: number
+  newsQualityGate: string | null
   newsImpactBoard: NewsImpactBoard
   catalystRadar: CatalystRadar
   marketPulse: MarketPulseRail
@@ -6100,6 +6103,9 @@ function buildDashboardSnapshot({
   liveNews,
   newsStatus,
   newsMessage,
+  newsRawCount,
+  newsQualityFilteredCount,
+  newsQualityGate,
   disclosures,
   disclosureStatus,
   disclosureMessage,
@@ -6127,6 +6133,9 @@ function buildDashboardSnapshot({
   liveNews: LiveNewsItem[]
   newsStatus: NewsStatus
   newsMessage: string
+  newsRawCount: number
+  newsQualityFilteredCount: number
+  newsQualityGate: string | null
   disclosures: DisclosureItem[]
   disclosureStatus: DisclosureStatus
   disclosureMessage: string
@@ -6352,6 +6361,9 @@ function buildDashboardSnapshot({
     liveNews,
     newsStatus,
     newsMessage,
+    newsRawCount,
+    newsQualityFilteredCount,
+    newsQualityGate,
     newsImpactBoard,
     catalystRadar,
     marketPulse,
@@ -9302,7 +9314,25 @@ type NewsApiResponse = {
   configured: boolean
   fetchedAt?: string
   items: LiveNewsItem[]
+  rawCount?: number
+  qualityFilteredCount?: number
+  qualityGate?: string
   message?: string
+}
+
+const newsQualityLabel: Record<NonNullable<LiveNewsItem['quality']>, string> = {
+  high: '높음',
+  medium: '보통',
+  low: '낮음',
+  noise: '제외',
+}
+
+function newsQualityVariant(quality?: LiveNewsItem['quality']): 'positive' | 'negative' | 'warning' | 'neutral' {
+  if (quality === 'high') return 'positive'
+  if (quality === 'medium') return 'neutral'
+  if (quality === 'low') return 'warning'
+  if (quality === 'noise') return 'negative'
+  return 'neutral'
 }
 
 function formatNewsTime(value: string) {
@@ -9553,6 +9583,9 @@ function NewsPage({
   liveNews,
   newsStatus,
   newsMessage,
+  newsRawCount,
+  newsQualityFilteredCount,
+  newsQualityGate,
   newsImpactBoard,
   issueScenarioMatrix,
   onRefreshNews,
@@ -9562,6 +9595,9 @@ function NewsPage({
   liveNews: LiveNewsItem[]
   newsStatus: NewsStatus
   newsMessage: string
+  newsRawCount: number
+  newsQualityFilteredCount: number
+  newsQualityGate: string | null
   newsImpactBoard: NewsImpactBoard
   issueScenarioMatrix: IssueScenarioMatrix
   onRefreshNews: () => void
@@ -9577,6 +9613,10 @@ function NewsPage({
   const linkedNewsCount = hasLiveNews
     ? liveNews.filter((item) => holdingsData.some((holding) => item.relatedSymbols.includes(holding.symbol))).length
     : keyIssues.filter((issue) => holdingsData.some((holding) => issue.relatedSymbols.includes(holding.symbol))).length
+  const highQualityCount = hasLiveNews ? liveNews.filter((item) => item.quality === 'high').length : 0
+  const qualityFilterDetail = newsQualityGate
+    ? `원문 ${newsRawCount}건 중 제외 ${newsQualityFilteredCount}건`
+    : '관련도 게이트 대기'
   const statusLabel =
     newsStatus === 'ready'
       ? '네이버 API 연결'
@@ -9588,10 +9628,11 @@ function NewsPage({
 
   return (
     <PageGrid>
-      <section className="grid gap-4 md:grid-cols-3">
+      <section className="grid gap-4 md:grid-cols-4">
         <MetricCard label="뉴스 피드" value={`${hasLiveNews ? liveNews.length : keyIssues.length}건`} detail={statusLabel} tone={newsStatus === 'error' ? 'negative' : hasLiveNews ? 'positive' : 'neutral'} />
         <MetricCard label="높은 중요도" value={`${highImportanceCount}건`} detail="우선 확인" tone="warning" />
         <MetricCard label="보유종목 연결" value={`${linkedNewsCount}건`} detail="포트폴리오 영향" tone="positive" />
+        <MetricCard label="품질 필터" value={`${highQualityCount}건`} detail={qualityFilterDetail} tone={newsQualityFilteredCount > 0 ? 'warning' : hasLiveNews ? 'positive' : 'neutral'} />
       </section>
 
       <NewsImpactBoardPanel board={newsImpactBoard} />
@@ -9648,6 +9689,8 @@ function NewsPage({
                       <Badge variant="neutral">{formatNewsTime(item.publishedAt)}</Badge>
                       <Badge variant={directionVariant(item.direction)}>{directionLabel[item.direction]}</Badge>
                       <Badge variant={item.importance === 'high' ? 'warning' : 'neutral'}>중요도 {importanceLabel[item.importance]}</Badge>
+                      <Badge variant={newsQualityVariant(item.quality)}>품질 {item.quality ? newsQualityLabel[item.quality] : '미분류'}</Badge>
+                      {typeof item.relevanceScore === 'number' ? <Badge variant="secondary">관련도 {item.relevanceScore}</Badge> : null}
                       <Badge variant="secondary">{item.keyword}</Badge>
                       <Badge variant="secondary">{item.source}</Badge>
                     </div>
@@ -9657,6 +9700,7 @@ function NewsPage({
                     </div>
                     <div className="mt-2 line-clamp-2 text-sm leading-6 text-muted-foreground">{item.description}</div>
                     <div className="mt-2 text-sm leading-6 text-foreground/85">{item.expectedImpact}</div>
+                    {item.qualityReason ? <div className="mt-2 text-xs leading-5 text-muted-foreground">{item.qualityReason}</div> : null}
                     <div className="mt-3 flex flex-wrap gap-2">
                       {[...item.relatedSymbols, ...item.sectors].map((tag) => (
                         <Badge key={tag} variant="secondary">
@@ -11648,6 +11692,9 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         liveNews={snapshot.liveNews}
         newsStatus={snapshot.newsStatus}
         newsMessage={snapshot.newsMessage}
+        newsRawCount={snapshot.newsRawCount}
+        newsQualityFilteredCount={snapshot.newsQualityFilteredCount}
+        newsQualityGate={snapshot.newsQualityGate}
         newsImpactBoard={snapshot.newsImpactBoard}
         issueScenarioMatrix={snapshot.issueScenarioMatrix}
         onRefreshNews={actions.onRefreshNews}
@@ -11780,6 +11827,9 @@ export function Dashboard() {
   const [newsFetchedAt, setNewsFetchedAt] = useState<string | null>(null)
   const [newsStatus, setNewsStatus] = useState<NewsStatus>('idle')
   const [newsMessage, setNewsMessage] = useState('뉴스 연결 대기')
+  const [newsRawCount, setNewsRawCount] = useState(0)
+  const [newsQualityFilteredCount, setNewsQualityFilteredCount] = useState(0)
+  const [newsQualityGate, setNewsQualityGate] = useState<string | null>(null)
   const [disclosureResponse, setDisclosureResponse] = useState<DisclosureApiResponse | null>(null)
   const [disclosureStatus, setDisclosureStatus] = useState<DisclosureStatus>('idle')
   const [disclosureMessage, setDisclosureMessage] = useState('공시 연결 대기')
@@ -11883,6 +11933,9 @@ export function Dashboard() {
       if (!response.ok) {
         setLiveNews(payload.items ?? [])
         setNewsFetchedAt(payload.fetchedAt ?? new Date().toISOString())
+        setNewsRawCount(payload.rawCount ?? payload.items?.length ?? 0)
+        setNewsQualityFilteredCount(payload.qualityFilteredCount ?? 0)
+        setNewsQualityGate(payload.qualityGate ?? null)
         setNewsStatus('error')
         setNewsMessage(payload.message ?? '네이버 뉴스 API 호출에 실패했습니다.')
         return
@@ -11891,6 +11944,9 @@ export function Dashboard() {
       if (!payload.configured) {
         setLiveNews([])
         setNewsFetchedAt(payload.fetchedAt ?? new Date().toISOString())
+        setNewsRawCount(0)
+        setNewsQualityFilteredCount(0)
+        setNewsQualityGate(null)
         setNewsStatus('fallback')
         setNewsMessage(payload.message ?? '네이버 뉴스 API 환경변수 설정이 필요합니다.')
         return
@@ -11898,6 +11954,9 @@ export function Dashboard() {
 
       setLiveNews(payload.items)
       setNewsFetchedAt(payload.fetchedAt ?? new Date().toISOString())
+      setNewsRawCount(payload.rawCount ?? payload.items.length)
+      setNewsQualityFilteredCount(payload.qualityFilteredCount ?? 0)
+      setNewsQualityGate(payload.qualityGate ?? null)
       setNewsStatus(payload.items.length > 0 ? 'ready' : 'fallback')
       setNewsMessage(payload.items.length > 0 ? `최근 수집 ${formatNewsTime(payload.fetchedAt ?? '')}` : '수집된 뉴스가 없습니다.')
     } catch (error) {
@@ -11905,6 +11964,9 @@ export function Dashboard() {
 
       setLiveNews([])
       setNewsFetchedAt(null)
+      setNewsRawCount(0)
+      setNewsQualityFilteredCount(0)
+      setNewsQualityGate(null)
       setNewsStatus('error')
       setNewsMessage(error instanceof Error ? error.message : '뉴스를 불러오지 못했습니다.')
     }
@@ -12071,6 +12133,9 @@ export function Dashboard() {
         liveNews,
         newsStatus,
         newsMessage,
+        newsRawCount,
+        newsQualityFilteredCount,
+        newsQualityGate,
         disclosures: disclosureResponse?.items ?? [],
         disclosureStatus,
         disclosureMessage,
@@ -12090,6 +12155,9 @@ export function Dashboard() {
       journal,
       journalHistory,
       newsMessage,
+      newsQualityFilteredCount,
+      newsQualityGate,
+      newsRawCount,
       newsFetchedAt,
       newsStatus,
       quoteMessage,
@@ -12484,6 +12552,12 @@ export function Dashboard() {
                         <div className="mb-2 flex flex-wrap items-center gap-2">
                           <Badge variant="neutral">{issueTime}</Badge>
                           <Badge variant={directionVariant(issue.direction)}>{importanceLabel[issue.importance]}</Badge>
+                          {isLiveIssue ? (
+                            <>
+                              <Badge variant={newsQualityVariant(issue.quality)}>품질 {issue.quality ? newsQualityLabel[issue.quality] : '미분류'}</Badge>
+                              {typeof issue.relevanceScore === 'number' ? <Badge variant="secondary">관련도 {issue.relevanceScore}</Badge> : null}
+                            </>
+                          ) : null}
                           {issueTags.map((tag) => (
                             <Badge key={tag} variant="secondary">
                               {tag}

@@ -122,6 +122,9 @@ export type LiveNewsItem = {
   relatedSymbols: string[]
   sectors: string[]
   expectedImpact: string
+  relevanceScore?: number
+  quality?: 'high' | 'medium' | 'low' | 'noise'
+  qualityReason?: string
 }
 
 export type SymbolNewsImpact = {
