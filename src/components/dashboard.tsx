@@ -483,6 +483,24 @@ type DataFreshness = {
   sources: DataFreshnessSource[]
 }
 
+type NewsQualitySignal = {
+  generatedAt: string
+  score: number
+  label: string
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  averageRelevance: number
+  rawCount: number
+  usableCount: number
+  filteredCount: number
+  highQualityCount: number
+  mediumQualityCount: number
+  lowQualityCount: number
+  qualityGate: string | null
+  summary: string
+  nextAction: string
+  focusItems: string[]
+}
+
 type MarketForecast = {
   baseScore: number
   openingBias: string
@@ -539,6 +557,7 @@ type DashboardSnapshot = {
   newsRawCount: number
   newsQualityFilteredCount: number
   newsQualityGate: string | null
+  newsQuality: NewsQualitySignal
   newsImpactBoard: NewsImpactBoard
   catalystRadar: CatalystRadar
   marketPulse: MarketPulseRail
@@ -2834,6 +2853,92 @@ function buildNewsBiasFactor(newsItems: LiveNewsItem[], holdingsData: Holding[],
   } satisfies BiasScore['positives'][number]
 }
 
+function newsQualityTone(score: number): NewsQualitySignal['tone'] {
+  if (score >= 78) return 'positive'
+  if (score >= 58) return 'neutral'
+  if (score >= 38) return 'warning'
+  return 'negative'
+}
+
+function newsQualityLabelFromScore(score: number) {
+  if (score >= 78) return '뉴스 품질 우수'
+  if (score >= 58) return '뉴스 선별 참고'
+  if (score >= 38) return '뉴스 품질 주의'
+  return '뉴스 재점검'
+}
+
+function buildNewsQualitySignal({
+  liveNews,
+  rawCount,
+  filteredCount,
+  qualityGate,
+}: {
+  liveNews: LiveNewsItem[]
+  rawCount: number
+  filteredCount: number
+  qualityGate: string | null
+}): NewsQualitySignal {
+  const usableCount = liveNews.length
+  const normalizedRawCount = Math.max(rawCount, usableCount + filteredCount)
+  const relevanceScores = liveNews.map((item) => item.relevanceScore).filter((score): score is number => typeof score === 'number')
+  const averageRelevance = relevanceScores.length > 0 ? Math.round(relevanceScores.reduce((sum, score) => sum + score, 0) / relevanceScores.length) : 0
+  const highQualityCount = liveNews.filter((item) => item.quality === 'high').length
+  const mediumQualityCount = liveNews.filter((item) => item.quality === 'medium').length
+  const lowQualityCount = liveNews.filter((item) => item.quality === 'low').length
+  const filteredRatio = normalizedRawCount > 0 ? filteredCount / normalizedRawCount : 0
+  const highRatio = usableCount > 0 ? highQualityCount / usableCount : 0
+  const lowRatio = usableCount > 0 ? lowQualityCount / usableCount : 0
+  const score =
+    usableCount === 0
+      ? filteredCount > 0
+        ? 32
+        : qualityGate
+          ? 24
+          : 18
+      : clamp(Math.round(averageRelevance * 0.62 + highRatio * 22 + (1 - filteredRatio) * 18 - lowRatio * 12), 0, 100)
+  const tone = newsQualityTone(score)
+  const label = newsQualityLabelFromScore(score)
+  const focusItems = liveNews
+    .slice()
+    .sort((left, right) => (right.relevanceScore ?? 0) - (left.relevanceScore ?? 0))
+    .slice(0, 3)
+    .map((item) => `${item.keyword}: ${item.title}`)
+  const summary =
+    usableCount === 0
+      ? qualityGate
+        ? '뉴스 품질 게이트가 켜져 있지만 현재 예측에 쓸 뉴스가 없습니다.'
+        : '뉴스 품질 게이트 응답을 아직 받지 못했습니다.'
+      : filteredCount > 0
+        ? `원문 ${normalizedRawCount}건 중 ${filteredCount}건을 단순 언급성 기사로 제외하고 ${usableCount}건만 예측에 반영합니다.`
+        : `수집 뉴스 ${usableCount}건이 품질 게이트를 통과해 예측에 반영됩니다.`
+  const nextAction =
+    score >= 78
+      ? '현재 뉴스는 시장 문맥이 뚜렷합니다. 상위 이슈의 가격 반응만 확인하면 됩니다.'
+      : score >= 58
+        ? '관련도 낮은 뉴스는 단독 판단보다 보조 신호로 보고, 보유종목 직접 언급 기사를 우선하세요.'
+        : score >= 38
+          ? '뉴스 키워드를 종목명+핵심 이슈 형태로 좁히고, 낮은 품질 기사는 예측 강도를 낮춰 봅니다.'
+          : '뉴스가 예측 재료로 약합니다. 시세, 선행지표, 공시 원문을 더 우선해서 판단하세요.'
+
+  return {
+    generatedAt: new Date().toISOString(),
+    score,
+    label,
+    tone,
+    averageRelevance,
+    rawCount: normalizedRawCount,
+    usableCount,
+    filteredCount,
+    highQualityCount,
+    mediumQualityCount,
+    lowQualityCount,
+    qualityGate,
+    summary,
+    nextAction,
+    focusItems: focusItems.length > 0 ? focusItems : ['뉴스 품질 게이트 통과 항목이 아직 없습니다.'],
+  }
+}
+
 function applyNewsBiasFactor(score: BiasScore, factor: BiasScore['positives'][number] | null): BiasScore {
   if (!factor) return score
 
@@ -3562,18 +3667,21 @@ function forecastConfidence({
   biasScoreData,
   quoteStatus,
   newsStatus,
+  newsQuality,
   disclosureStatus,
   calendarStatus,
 }: {
   biasScoreData: BiasScore
   quoteStatus: QuoteStatus
   newsStatus: NewsStatus
+  newsQuality: NewsQualitySignal
   disclosureStatus: DisclosureStatus
   calendarStatus: CalendarStatus
 }): MarketForecast['confidence'] {
+  const newsQualityPoint = newsStatus === 'ready' ? (newsQuality.score >= 58 ? 1 : newsQuality.score >= 38 ? 0.5 : 0) : 0
   const statusScore =
     (quoteStatus === 'ready' ? 2 : quoteStatus === 'partial' ? 1 : 0) +
-    (newsStatus === 'ready' ? 1 : 0) +
+    newsQualityPoint +
     (disclosureStatus === 'ready' || disclosureStatus === 'partial' ? 1 : 0) +
     (calendarStatus === 'ready' ? 1 : 0)
   const biasScoreValue = biasScoreData.confidence === 'high' ? 2 : biasScoreData.confidence === 'medium' ? 1 : 0
@@ -3588,6 +3696,7 @@ function buildMarketForecast({
   biasScoreData,
   holdingsData,
   newsItems,
+  newsQuality,
   eventsData,
   disclosures,
   quoteStatus,
@@ -3598,6 +3707,7 @@ function buildMarketForecast({
   biasScoreData: BiasScore
   holdingsData: Holding[]
   newsItems: LiveNewsItem[]
+  newsQuality: NewsQualitySignal
   eventsData: CalendarEvent[]
   disclosures: DisclosureItem[]
   quoteStatus: QuoteStatus
@@ -3637,8 +3747,13 @@ function buildMarketForecast({
           : baseScore >= 35
             ? '-0.7% ~ -0.1%'
             : '-1.2% ~ -0.5%'
-  const confidence = forecastConfidence({ biasScoreData, quoteStatus, newsStatus, disclosureStatus, calendarStatus })
+  const confidence = forecastConfidence({ biasScoreData, quoteStatus, newsStatus, newsQuality, disclosureStatus, calendarStatus })
+  const qualityChecklist =
+    newsStatus === 'ready' && newsQuality.score < 58
+      ? [`뉴스 품질 ${newsQuality.score}/100: 낮은 관련도 뉴스는 예측 강도를 한 단계 낮춰 보기`]
+      : []
   const checklist = [
+    ...qualityChecklist,
     topPositive ? `${topPositive.label} 유지 여부` : 'NQ=F와 SOX 방향 확인',
     topRisk ? `${topRisk.label} 완화 여부` : 'USD/KRW와 VIX 급변 여부',
     '개장 30분 외국인 선물 수급',
@@ -5285,6 +5400,7 @@ function buildDataReliability({
   newsStatus,
   newsMessage,
   liveNewsCount,
+  newsQuality,
   calendarStatus,
   calendarMessage,
   calendarEventCount,
@@ -5299,6 +5415,7 @@ function buildDataReliability({
   newsStatus: NewsStatus
   newsMessage: string
   liveNewsCount: number
+  newsQuality: NewsQualitySignal
   calendarStatus: CalendarStatus
   calendarMessage: string
   calendarEventCount: number
@@ -5311,7 +5428,10 @@ function buildDataReliability({
     quoteStatus === 'ready' || quoteStatus === 'partial'
       ? clamp(statusReliabilityScore(quoteStatus) + Math.round(quoteCoverage * 10), 0, 100)
       : statusReliabilityScore(quoteStatus)
-  const newsScore = newsStatus === 'ready' ? clamp(statusReliabilityScore(newsStatus) + Math.min(8, liveNewsCount), 0, 100) : statusReliabilityScore(newsStatus)
+  const newsScore =
+    newsStatus === 'ready'
+      ? clamp(Math.round(statusReliabilityScore(newsStatus) * 0.55 + newsQuality.score * 0.45 + Math.min(5, liveNewsCount)), 0, 100)
+      : statusReliabilityScore(newsStatus)
   const calendarScore =
     calendarStatus === 'ready' ? clamp(statusReliabilityScore(calendarStatus) + Math.min(6, Math.round(calendarEventCount / 2)), 0, 100) : statusReliabilityScore(calendarStatus)
   const disclosureScore =
@@ -5345,14 +5465,16 @@ function buildDataReliability({
       tone: dataHealthVariant(newsStatus),
       score: newsScore,
       weight: 25,
-      metric: `${liveNewsCount}건`,
+      metric: `${liveNewsCount}건 · 품질 ${newsQuality.score}점`,
       endpoint: '/api/news -> Naver News Open API',
       requiredConfig: 'NAVER_CLIENT_ID, NAVER_CLIENT_SECRET',
-      summary: newsMessage,
-      effect: '종목별 이슈, 방향점수 보정, 액션 큐와 장전 브리핑에 반영됩니다.',
+      summary: newsStatus === 'ready' ? `${newsMessage} ${newsQuality.summary}` : newsMessage,
+      effect: '품질 게이트를 통과한 뉴스만 종목별 이슈, 방향점수 보정, 액션 큐와 장전 브리핑에 반영됩니다.',
       nextAction:
         newsStatus === 'ready'
-          ? '키워드가 내 보유/관심종목을 충분히 덮는지 확인하고 필요하면 설정에서 추가'
+          ? newsQuality.score >= 58
+            ? '키워드가 내 보유/관심종목을 충분히 덮는지 확인하고 필요하면 설정에서 추가'
+            : newsQuality.nextAction
           : 'Vercel 환경변수 NAVER_CLIENT_ID, NAVER_CLIENT_SECRET과 키워드 목록 확인',
     },
     {
@@ -6147,6 +6269,12 @@ function buildDashboardSnapshot({
   const liveWatchlist = mergeWatchlistWithQuotes(baseWatchlist, quoteMap)
   const liveIndicators = mergeIndicatorsWithQuotes(quoteMap)
   const newsImpactBoard = buildSymbolNewsImpactBoard(liveNews, liveHoldings, liveWatchlist)
+  const newsQuality = buildNewsQualitySignal({
+    liveNews,
+    rawCount: newsRawCount,
+    filteredCount: newsQualityFilteredCount,
+    qualityGate: newsQualityGate,
+  })
   const catalystRadar = buildCatalystRadar({
     liveNews,
     calendarEventsData,
@@ -6163,6 +6291,7 @@ function buildDashboardSnapshot({
     biasScoreData: liveBiasScore,
     holdingsData: liveHoldings,
     newsItems: liveNews,
+    newsQuality,
     eventsData: calendarEventsData,
     disclosures,
     quoteStatus,
@@ -6244,6 +6373,7 @@ function buildDashboardSnapshot({
     newsStatus,
     newsMessage,
     liveNewsCount: liveNews.length,
+    newsQuality,
     calendarStatus,
     calendarMessage,
     calendarEventCount: calendarEventsData.length,
@@ -6364,6 +6494,7 @@ function buildDashboardSnapshot({
     newsRawCount,
     newsQualityFilteredCount,
     newsQualityGate,
+    newsQuality,
     newsImpactBoard,
     catalystRadar,
     marketPulse,
@@ -7837,6 +7968,72 @@ function DataFreshnessPanel({
               <div className="mt-3 text-xs leading-5 text-muted-foreground">{compact ? source.summary : source.nextAction}</div>
             </div>
           ))}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function NewsQualityPanel({ quality, compact = false }: { quality: NewsQualitySignal; compact?: boolean }) {
+  const visibleFocusItems = quality.focusItems.slice(0, compact ? 2 : 3)
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle>뉴스 품질 리포트</CardTitle>
+            <CardDescription>{quality.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={quality.tone}>{quality.label}</Badge>
+            {quality.qualityGate ? <Badge variant="secondary">{quality.qualityGate}</Badge> : <Badge variant="neutral">게이트 대기</Badge>}
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">품질 점수</div>
+            <div className="mt-2 text-2xl font-semibold">{quality.score}/100</div>
+            <Progress className="mt-3" value={quality.score} />
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">평균 관련도</div>
+            <div className="mt-2 text-2xl font-semibold">{quality.averageRelevance}</div>
+            <div className="mt-1 text-xs text-muted-foreground">뉴스 카드 관련도 평균</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">예측 반영</div>
+            <div className="mt-2 text-2xl font-semibold">{quality.usableCount}/{quality.rawCount}</div>
+            <div className="mt-1 text-xs text-muted-foreground">통과/원문</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">품질 분포</div>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              <Badge variant="positive">높음 {quality.highQualityCount}</Badge>
+              <Badge variant="neutral">보통 {quality.mediumQualityCount}</Badge>
+              <Badge variant="warning">낮음 {quality.lowQualityCount}</Badge>
+              <Badge variant="negative">제외 {quality.filteredCount}</Badge>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+          <div className="rounded-md border border-border bg-background/70 p-4">
+            <div className="mb-2 text-sm font-semibold">품질 보정 액션</div>
+            <div className="text-sm leading-6 text-muted-foreground">{quality.nextAction}</div>
+          </div>
+          <div className="rounded-md border border-border bg-background/70 p-4">
+            <div className="mb-2 text-sm font-semibold">우선 확인 뉴스</div>
+            <div className="space-y-2">
+              {visibleFocusItems.map((item) => (
+                <div key={item} className="text-sm leading-6 text-muted-foreground">
+                  {item}
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       </CardContent>
     </Card>
@@ -9586,6 +9783,7 @@ function NewsPage({
   newsRawCount,
   newsQualityFilteredCount,
   newsQualityGate,
+  newsQuality,
   newsImpactBoard,
   issueScenarioMatrix,
   onRefreshNews,
@@ -9598,6 +9796,7 @@ function NewsPage({
   newsRawCount: number
   newsQualityFilteredCount: number
   newsQualityGate: string | null
+  newsQuality: NewsQualitySignal
   newsImpactBoard: NewsImpactBoard
   issueScenarioMatrix: IssueScenarioMatrix
   onRefreshNews: () => void
@@ -9636,6 +9835,8 @@ function NewsPage({
       </section>
 
       <NewsImpactBoardPanel board={newsImpactBoard} />
+
+      <NewsQualityPanel quality={newsQuality} />
 
       <IssueScenarioMatrixPanel matrix={issueScenarioMatrix} />
 
@@ -11695,6 +11896,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         newsRawCount={snapshot.newsRawCount}
         newsQualityFilteredCount={snapshot.newsQualityFilteredCount}
         newsQualityGate={snapshot.newsQualityGate}
+        newsQuality={snapshot.newsQuality}
         newsImpactBoard={snapshot.newsImpactBoard}
         issueScenarioMatrix={snapshot.issueScenarioMatrix}
         onRefreshNews={actions.onRefreshNews}
@@ -12584,6 +12786,8 @@ export function Dashboard() {
             <OvernightStressTestPanel stress={snapshot.overnightStressTest} compact />
 
             <NewsImpactBoardPanel board={snapshot.newsImpactBoard} compact />
+
+            <NewsQualityPanel quality={snapshot.newsQuality} compact />
 
             <IssueScenarioMatrixPanel matrix={snapshot.issueScenarioMatrix} compact />
 
