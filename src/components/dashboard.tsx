@@ -64,6 +64,7 @@ import type {
   AlertSettings,
   BiasScore,
   CalendarEvent,
+  Confidence,
   DataReliability,
   Direction,
   DisclosureItem,
@@ -386,6 +387,46 @@ type SymbolBriefing = {
   items: SymbolBriefingItem[]
 }
 
+type IssueScenarioSource = 'news' | 'disclosure' | 'calendar'
+
+type IssueScenarioBranch = {
+  label: string
+  scoreDelta: number
+  marketImpact: string
+  trigger: string
+  action: string
+}
+
+type IssueScenarioItem = {
+  id: string
+  source: IssueScenarioSource
+  title: string
+  timeLabel: string
+  importance: 'low' | 'medium' | 'high'
+  confidence: Confidence
+  baseDirection: Direction
+  tone: 'positive' | 'negative' | 'warning' | 'neutral'
+  opportunityScore: number
+  pressureScore: number
+  netScore: number
+  summary: string
+  relatedSymbols: string[]
+  upside: IssueScenarioBranch
+  downside: IssueScenarioBranch
+  confirmationChecks: string[]
+}
+
+type IssueScenarioMatrix = {
+  generatedAt: string
+  status: 'live' | 'fallback' | 'empty'
+  summary: string
+  opportunityCount: number
+  pressureCount: number
+  balancedCount: number
+  watchSymbols: string[]
+  items: IssueScenarioItem[]
+}
+
 type PersonalCoverageTone = 'positive' | 'negative' | 'warning' | 'neutral'
 
 type PersonalCoverageItem = {
@@ -513,6 +554,7 @@ type DashboardSnapshot = {
   forecastReview: ForecastReview
   forecastCalibration: ForecastCalibration
   symbolBriefing: SymbolBriefing
+  issueScenarioMatrix: IssueScenarioMatrix
   personalCoverage: PersonalCoverage
   executionPlan: ExecutionPlan
   preMarketCommand: PreMarketCommandCenter
@@ -2065,6 +2107,279 @@ function buildSymbolNewsImpactBoard(
     negativeCount,
     mixedCount,
     hotSymbols: items.slice(0, 5).map((item) => item.symbol),
+    items,
+  }
+}
+
+function issueScenarioImportanceScore(importance: IssueScenarioItem['importance']) {
+  if (importance === 'high') return 28
+  if (importance === 'medium') return 18
+  return 10
+}
+
+function issueScenarioConfidenceScore(confidence: Confidence) {
+  if (confidence === 'high') return 8
+  if (confidence === 'medium') return 5
+  return 2
+}
+
+const issueScenarioSourceLabel: Record<IssueScenarioSource, string> = {
+  news: '뉴스',
+  disclosure: '공시',
+  calendar: '일정',
+}
+
+function issueScenarioTone(opportunityScore: number, pressureScore: number): IssueScenarioItem['tone'] {
+  const netScore = opportunityScore - pressureScore
+  if (netScore >= 14) return 'positive'
+  if (netScore <= -14) return 'negative'
+  if (opportunityScore >= 24 && pressureScore >= 24) return 'warning'
+  return 'neutral'
+}
+
+function issueScenarioBranchCopy({
+  direction,
+  source,
+  title,
+  relatedSymbols,
+  opportunityScore,
+  pressureScore,
+}: {
+  direction: Direction
+  source: IssueScenarioSource
+  title: string
+  relatedSymbols: string[]
+  opportunityScore: number
+  pressureScore: number
+}): { upside: IssueScenarioBranch; downside: IssueScenarioBranch; checks: string[] } {
+  const focus = relatedSymbols.slice(0, 3).join(', ') || 'KOSPI, KOSDAQ'
+  const upsideDelta = clamp(Math.round(opportunityScore * 0.35), 2, 18)
+  const downsideDelta = clamp(Math.round(pressureScore * 0.35), 2, 18)
+  const sourceLabel = issueScenarioSourceLabel[source]
+  const positiveBias = direction === 'positive'
+  const negativeBias = direction === 'negative'
+
+  return {
+    upside: {
+      label: positiveBias ? '재료 확인' : negativeBias ? '악재 완화' : '상방 해석',
+      scoreDelta: upsideDelta,
+      marketImpact: positiveBias
+        ? `관련 심볼 ${focus}가 지수보다 강하면 국내장 위험선호를 ${upsideDelta}점가량 보강합니다.`
+        : negativeBias
+          ? `악재가 추가 확산되지 않으면 낙폭과대 반등 후보 ${focus}를 선별합니다.`
+          : `이슈가 우호적으로 해석되면 ${focus} 중심의 선별 강세를 확인합니다.`,
+      trigger: positiveBias
+        ? '후속 기사, 원문, 가격 반응이 같은 방향이고 거래대금이 증가'
+        : negativeBias
+          ? '우려 수치가 예상보다 작거나 장 시작 후 매도 압력이 둔화'
+          : '불확실성 해소 문구와 관련 종목 상대강도 동시 확인',
+      action: positiveBias
+        ? '갭상승 추격보다 09:30 이후 상대강도 유지 종목만 분할 접근'
+        : '신규 매수보다 반등 지속 여부 확인 후 보유 리스크 조절',
+    },
+    downside: {
+      label: negativeBias ? '악재 확산' : positiveBias ? '선반영 반전' : '하방 해석',
+      scoreDelta: -downsideDelta,
+      marketImpact: negativeBias
+        ? `${sourceLabel}가 추가 부담으로 확인되면 국내장 방향점수를 ${downsideDelta}점가량 낮춥니다.`
+        : positiveBias
+          ? `호재가 선반영으로 꺾이면 ${focus}의 시초가 반락과 차익실현을 경계합니다.`
+          : `불확실성이 커지면 ${focus}보다 지수 방어와 환율/VIX 확인이 먼저입니다.`,
+      trigger: negativeBias
+        ? '후속 기사, 원문 수치, 해외 선물, 환율이 동시에 부담으로 확대'
+        : positiveBias
+          ? '호재 기사에도 관련 종목이 지수보다 약하거나 거래대금이 줄어듦'
+          : '예상보다 강한 변동성과 관련 종목 약세가 동시에 발생',
+      action: negativeBias
+        ? '첫 반등 실패 전까지 신규 진입 보류, 보유 종목은 방어선과 축소 기준 확인'
+        : '추격 매수 금지, 기존 보유는 전일 고점 회복 여부만 확인',
+    },
+    checks: uniqueBriefItems(
+      [
+        `${sourceLabel} 원문/후속 기사에서 숫자와 표현이 바뀌었는지 확인`,
+        `${focus}의 09:00~09:30 상대강도와 거래대금 확인`,
+        'NQ=F, SOX, USD/KRW, VIX가 같은 방향으로 확인되는지 점검',
+        title.length > 34 ? title.slice(0, 34) : title,
+      ],
+      4,
+    ),
+  }
+}
+
+function issueScenarioRelatedSymbols({
+  title,
+  relatedSymbols,
+  sectors,
+  holdingsData,
+  watchlistData,
+}: {
+  title: string
+  relatedSymbols: string[]
+  sectors: string[]
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+}) {
+  const normalizedRelated = new Set([...relatedSymbols, ...sectors].map((item) => normalizeUserSymbol(item)))
+  const titleText = title.toLocaleLowerCase('ko-KR')
+  const trackedMatches = [...holdingsData, ...watchlistData].filter((target) => {
+    const profile = getSymbolProfile(target.symbol, target.name)
+    const normalizedSymbol = normalizeUserSymbol(target.symbol)
+    const normalizedName = target.name.toLocaleLowerCase('ko-KR')
+    return (
+      normalizedRelated.has(normalizedSymbol) ||
+      titleText.includes(normalizedName) ||
+      normalizedRelated.has(normalizeUserSymbol(profile.sector)) ||
+      profile.sensitivity.some((symbol) => normalizedRelated.has(normalizeUserSymbol(symbol)))
+    )
+  })
+
+  return Array.from(new Set([...trackedMatches.map((item) => item.symbol), ...relatedSymbols, ...sectors])).filter(Boolean).slice(0, 8)
+}
+
+function buildIssueScenarioMatrix({
+  liveNews,
+  disclosures,
+  eventsData,
+  holdingsData,
+  watchlistData,
+  forecast,
+}: {
+  liveNews: LiveNewsItem[]
+  disclosures: DisclosureItem[]
+  eventsData: CalendarEvent[]
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+  forecast: MarketForecast
+}): IssueScenarioMatrix {
+  const newsItems = liveNews.length > 0 ? liveNews : fallbackNewsImpactItems()
+  const marketTilt = forecast.baseScore - 50
+  const newsCandidates = newsItems.slice(0, 8).map((item) => ({
+    id: `issue-news-${item.id}`,
+    source: 'news' as const,
+    title: item.title,
+    timeLabel: formatNewsTime(item.publishedAt),
+    importance: item.importance,
+    confidence: item.confidence,
+    direction: item.direction,
+    relatedSymbols: item.relatedSymbols,
+    sectors: item.sectors,
+    summary: item.expectedImpact,
+  }))
+  const disclosureCandidates = disclosures.slice(0, 5).map((item) => ({
+    id: `issue-disclosure-${item.id}`,
+    source: 'disclosure' as const,
+    title: `${item.corpName} · ${item.reportName}`,
+    timeLabel: formatDisclosureDate(item.submittedAt),
+    importance: item.importance,
+    confidence: item.importance === 'high' ? ('high' as const) : ('medium' as const),
+    direction: item.direction,
+    relatedSymbols: [item.symbol, item.sector],
+    sectors: [item.sector],
+    summary: item.expectedImpact,
+  }))
+  const calendarCandidates = eventsData
+    .filter((event) => event.importance === 'high' || isTodayCalendarEvent(event) || event.type === 'earnings')
+    .slice(0, 6)
+    .map((event) => ({
+      id: `issue-calendar-${event.id}`,
+      source: 'calendar' as const,
+      title: event.title,
+      timeLabel: `${event.date} ${event.time}`,
+      importance: event.importance,
+      confidence: event.confidence ?? ('medium' as const),
+      direction: event.type === 'macro' || event.type === 'policy' ? ('mixed' as const) : ('neutral' as const),
+      relatedSymbols: event.relatedSymbols,
+      sectors: event.relatedSymbols.filter((symbol) => !/^[A-Z0-9=^/.-]+$/i.test(symbol)),
+      summary: event.description ?? `${calendarTypeLabel[event.type]} 일정은 발표 전후 변동성 확대 여부를 확인합니다.`,
+    }))
+  const candidates = [...newsCandidates, ...disclosureCandidates, ...calendarCandidates]
+
+  const items = candidates
+    .map((candidate): IssueScenarioItem => {
+      const baseScore = issueScenarioImportanceScore(candidate.importance) + issueScenarioConfidenceScore(candidate.confidence)
+      const trackedSymbols = issueScenarioRelatedSymbols({
+        title: candidate.title,
+        relatedSymbols: candidate.relatedSymbols,
+        sectors: candidate.sectors,
+        holdingsData,
+        watchlistData,
+      })
+      const trackingBoost = Math.min(10, trackedSymbols.filter((symbol) => [...holdingsData, ...watchlistData].some((item) => item.symbol === symbol)).length * 3)
+      const calendarBoost = candidate.source === 'calendar' && candidate.importance === 'high' ? 4 : 0
+      const disclosureBoost = candidate.source === 'disclosure' && candidate.importance === 'high' ? 5 : 0
+      const positiveTilt = Math.max(0, marketTilt)
+      const negativeTilt = Math.max(0, -marketTilt)
+      const opportunityScore = clamp(
+        Math.round(
+          candidate.direction === 'positive'
+            ? baseScore + trackingBoost + positiveTilt * 0.22
+            : candidate.direction === 'negative'
+              ? baseScore * 0.38 + trackingBoost * 0.5 + positiveTilt * 0.12
+              : baseScore * 0.68 + trackingBoost * 0.7 + calendarBoost,
+        ),
+        0,
+        100,
+      )
+      const pressureScore = clamp(
+        Math.round(
+          candidate.direction === 'negative'
+            ? baseScore + trackingBoost + negativeTilt * 0.22 + disclosureBoost
+            : candidate.direction === 'positive'
+              ? baseScore * 0.38 + trackingBoost * 0.45 + negativeTilt * 0.12
+              : baseScore * 0.72 + trackingBoost * 0.75 + calendarBoost + negativeTilt * 0.08,
+        ),
+        0,
+        100,
+      )
+      const tone = issueScenarioTone(opportunityScore, pressureScore)
+      const { upside, downside, checks } = issueScenarioBranchCopy({
+        direction: candidate.direction,
+        source: candidate.source,
+        title: candidate.title,
+        relatedSymbols: trackedSymbols,
+        opportunityScore,
+        pressureScore,
+      })
+
+      return {
+        id: candidate.id,
+        source: candidate.source,
+        title: candidate.title,
+        timeLabel: candidate.timeLabel,
+        importance: candidate.importance,
+        confidence: candidate.confidence,
+        baseDirection: candidate.direction,
+        tone,
+        opportunityScore,
+        pressureScore,
+        netScore: opportunityScore - pressureScore,
+        summary: candidate.summary,
+        relatedSymbols: trackedSymbols,
+        upside,
+        downside,
+        confirmationChecks: checks,
+      }
+    })
+    .sort((left, right) => Math.max(right.opportunityScore, right.pressureScore) - Math.max(left.opportunityScore, left.pressureScore))
+    .slice(0, 10)
+
+  const opportunityCount = items.filter((item) => item.netScore >= 14).length
+  const pressureCount = items.filter((item) => item.netScore <= -14).length
+  const balancedCount = items.length - opportunityCount - pressureCount
+  const watchSymbols = Array.from(new Set(items.flatMap((item) => item.relatedSymbols))).slice(0, 8)
+  const topItem = items[0]
+  const summary = topItem
+    ? `${topItem.title} 이슈는 상방 ${topItem.opportunityScore}점, 하방 ${topItem.pressureScore}점으로 먼저 확인합니다.`
+    : '아직 시나리오로 나눌 이슈가 없습니다. 뉴스, 공시, 캘린더를 새로고침하면 다시 계산합니다.'
+
+  return {
+    generatedAt: new Date().toISOString(),
+    status: items.length === 0 ? 'empty' : liveNews.length > 0 || disclosures.length > 0 ? 'live' : 'fallback',
+    summary,
+    opportunityCount,
+    pressureCount,
+    balancedCount,
+    watchSymbols,
     items,
   }
 }
@@ -5846,6 +6161,14 @@ function buildDashboardSnapshot({
     disclosureStatus,
     calendarStatus,
   })
+  const issueScenarioMatrix = buildIssueScenarioMatrix({
+    liveNews,
+    disclosures,
+    eventsData: calendarEventsData,
+    holdingsData: liveHoldings,
+    watchlistData: liveWatchlist,
+    forecast,
+  })
   const usdKrw = getQuote(quoteMap, 'USD/KRW')?.price ?? Number(marketStatus.usdKrw.replace(/,/g, ''))
   const portfolioPlaybook = buildPortfolioPlaybook({
     holdingsData: liveHoldings,
@@ -6047,6 +6370,7 @@ function buildDashboardSnapshot({
     forecastReview,
     forecastCalibration,
     symbolBriefing,
+    issueScenarioMatrix,
     personalCoverage,
     executionPlan,
     preMarketCommand,
@@ -6877,6 +7201,133 @@ function NewsImpactBoardPanel({ board, compact = false }: { board: NewsImpactBoa
         ) : (
           <div className="rounded-md border border-border bg-muted/10 p-4 text-sm leading-6 text-muted-foreground">
             보유종목이나 관심종목과 연결된 뉴스가 아직 없습니다. 뉴스 키워드에 종목명이나 섹터 키워드를 추가하면 이 영역에 바로 반영됩니다.
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+const issueScenarioStatusLabel: Record<IssueScenarioMatrix['status'], string> = {
+  live: '실데이터 이슈',
+  fallback: '샘플/추정 이슈',
+  empty: '대기',
+}
+
+function IssueScenarioMatrixPanel({ matrix, compact = false }: { matrix: IssueScenarioMatrix; compact?: boolean }) {
+  const visibleItems = compact ? matrix.items.slice(0, 4) : matrix.items
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>이슈 상·하방 시나리오</CardTitle>
+            <CardDescription>{matrix.summary}</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={matrix.status === 'live' ? 'positive' : matrix.status === 'fallback' ? 'warning' : 'neutral'}>{issueScenarioStatusLabel[matrix.status]}</Badge>
+            <Badge variant="secondary">{formatNewsTime(matrix.generatedAt)}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-md border border-positive/25 bg-positive/10 p-3">
+            <div className="text-xs text-muted-foreground">상방 우세</div>
+            <div className="mt-2 text-2xl font-semibold">{matrix.opportunityCount}개</div>
+          </div>
+          <div className="rounded-md border border-negative/25 bg-negative/10 p-3">
+            <div className="text-xs text-muted-foreground">하방 우세</div>
+            <div className="mt-2 text-2xl font-semibold">{matrix.pressureCount}개</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">양방향 확인</div>
+            <div className="mt-2 text-2xl font-semibold">{matrix.balancedCount}개</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/15 p-3">
+            <div className="text-xs text-muted-foreground">체크 심볼</div>
+            <div className="mt-2 text-sm font-semibold leading-5">{matrix.watchSymbols.length > 0 ? matrix.watchSymbols.slice(0, 5).join(', ') : '확인 대기'}</div>
+          </div>
+        </div>
+
+        {visibleItems.length > 0 ? (
+          <div className="grid gap-3">
+            {visibleItems.map((item) => (
+              <div key={item.id} className="rounded-md border border-border bg-muted/10 p-3">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant={item.tone}>{issueScenarioSourceLabel[item.source]}</Badge>
+                      <Badge variant={directionVariant(item.baseDirection)}>{directionLabel[item.baseDirection]}</Badge>
+                      <Badge variant={item.importance === 'high' ? 'warning' : 'neutral'}>중요도 {importanceLabel[item.importance]}</Badge>
+                      <Badge variant="secondary">신뢰도 {confidenceLabel[item.confidence]}</Badge>
+                      <span className="text-xs text-muted-foreground">{item.timeLabel}</span>
+                    </div>
+                    <div className="mt-2 text-sm font-semibold leading-5">{item.title}</div>
+                    <div className="mt-2 text-sm leading-5 text-muted-foreground">{item.summary}</div>
+                  </div>
+                  <div className="flex shrink-0 flex-wrap gap-2 lg:max-w-52 lg:justify-end">
+                    <Badge variant="positive">상방 {item.opportunityScore}</Badge>
+                    <Badge variant="negative">하방 {item.pressureScore}</Badge>
+                    <Badge variant={item.netScore >= 0 ? 'positive' : 'negative'}>{item.netScore >= 0 ? `+${item.netScore}` : item.netScore}</Badge>
+                  </div>
+                </div>
+
+                <div className={cn('mt-3 grid gap-3', compact ? 'lg:grid-cols-2' : 'xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_280px]')}>
+                  <div className="rounded-md border border-positive/25 bg-positive/10 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <div className="text-sm font-semibold text-positive">{item.upside.label}</div>
+                      <Badge variant="positive">+{item.upside.scoreDelta}</Badge>
+                    </div>
+                    <div className="text-sm leading-5">{item.upside.marketImpact}</div>
+                    {!compact ? (
+                      <>
+                        <div className="mt-2 text-xs leading-5 text-muted-foreground">조건 · {item.upside.trigger}</div>
+                        <div className="mt-2 text-xs leading-5 text-muted-foreground">액션 · {item.upside.action}</div>
+                      </>
+                    ) : null}
+                  </div>
+                  <div className="rounded-md border border-negative/25 bg-negative/10 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <div className="text-sm font-semibold text-negative">{item.downside.label}</div>
+                      <Badge variant="negative">{item.downside.scoreDelta}</Badge>
+                    </div>
+                    <div className="text-sm leading-5">{item.downside.marketImpact}</div>
+                    {!compact ? (
+                      <>
+                        <div className="mt-2 text-xs leading-5 text-muted-foreground">조건 · {item.downside.trigger}</div>
+                        <div className="mt-2 text-xs leading-5 text-muted-foreground">액션 · {item.downside.action}</div>
+                      </>
+                    ) : null}
+                  </div>
+                  {!compact ? (
+                    <div className="rounded-md border border-border bg-background/70 p-3">
+                      <div className="mb-2 text-xs font-medium text-muted-foreground">확인 순서</div>
+                      <div className="grid gap-2">
+                        {item.confirmationChecks.map((check) => (
+                          <div key={check} className="text-xs leading-5 text-muted-foreground">
+                            {check}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  {item.relatedSymbols.slice(0, compact ? 5 : 8).map((symbol) => (
+                    <Badge key={symbol} variant="secondary">
+                      {symbol}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-md border border-border bg-muted/10 p-4 text-sm leading-6 text-muted-foreground">
+            아직 분기 시나리오를 만들 이슈가 없습니다. 뉴스, 공시, 캘린더 수신 후 다시 계산됩니다.
           </div>
         )}
       </CardContent>
@@ -9103,6 +9554,7 @@ function NewsPage({
   newsStatus,
   newsMessage,
   newsImpactBoard,
+  issueScenarioMatrix,
   onRefreshNews,
 }: {
   holdingsData: Holding[]
@@ -9111,6 +9563,7 @@ function NewsPage({
   newsStatus: NewsStatus
   newsMessage: string
   newsImpactBoard: NewsImpactBoard
+  issueScenarioMatrix: IssueScenarioMatrix
   onRefreshNews: () => void
 }) {
   const [activeKeyword, setActiveKeyword] = useState('전체')
@@ -9142,6 +9595,8 @@ function NewsPage({
       </section>
 
       <NewsImpactBoardPanel board={newsImpactBoard} />
+
+      <IssueScenarioMatrixPanel matrix={issueScenarioMatrix} />
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
         <Card>
@@ -11194,6 +11649,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         newsStatus={snapshot.newsStatus}
         newsMessage={snapshot.newsMessage}
         newsImpactBoard={snapshot.newsImpactBoard}
+        issueScenarioMatrix={snapshot.issueScenarioMatrix}
         onRefreshNews={actions.onRefreshNews}
       />
     )
@@ -12054,6 +12510,8 @@ export function Dashboard() {
             <OvernightStressTestPanel stress={snapshot.overnightStressTest} compact />
 
             <NewsImpactBoardPanel board={snapshot.newsImpactBoard} compact />
+
+            <IssueScenarioMatrixPanel matrix={snapshot.issueScenarioMatrix} compact />
 
             <SymbolBriefingPanel briefing={snapshot.symbolBriefing} compact />
 
