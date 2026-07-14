@@ -501,6 +501,15 @@ type NewsQualitySignal = {
   focusItems: string[]
 }
 
+type SuggestedAlertRule = {
+  id: string
+  rule: AlertRule
+  priority: 'critical' | 'high' | 'medium' | 'low'
+  reason: string
+  evidence: string
+  relatedSymbols: string[]
+}
+
 type MarketForecast = {
   baseScore: number
   openingBias: string
@@ -539,6 +548,7 @@ type DashboardSnapshot = {
   alertSettings: AlertSettings
   alertHistory: AlertHistoryItem[]
   triggeredAlerts: TriggeredAlert[]
+  suggestedAlertRules: SuggestedAlertRule[]
   storedData: StoredDashboardData
   leadingIndicators: MarketIndicator[]
   biasScore: BiasScore
@@ -5335,6 +5345,195 @@ function buildTriggeredAlerts({
     .sort((a, b) => priorityRank(b.severity) - priorityRank(a.severity))
 }
 
+function alertRuleMatchKey(rule: Pick<AlertRule, 'type' | 'target' | 'threshold'>) {
+  const target = normalizeUserSymbol(rule.target) || normalizeNewsKeyword(rule.target).toLocaleLowerCase('ko-KR')
+  const threshold = rule.type === 'news-keyword' ? 'keyword' : String(round(rule.threshold, 2))
+  return `${rule.type}:${target}:${threshold}`
+}
+
+function suggestedAlertRuleId(rule: Pick<AlertRule, 'name' | 'type' | 'target' | 'threshold'>) {
+  return `suggested-alert-${simpleHash(`${rule.name}|${rule.type}|${rule.target}|${rule.threshold}`)}`
+}
+
+function makeSuggestedAlertRule({
+  name,
+  type,
+  target,
+  threshold,
+  priority,
+  reason,
+  evidence,
+  relatedSymbols,
+}: {
+  name: string
+  type: AlertRule['type']
+  target: string
+  threshold: number
+  priority: SuggestedAlertRule['priority']
+  reason: string
+  evidence: string
+  relatedSymbols: string[]
+}): SuggestedAlertRule {
+  const rule = {
+    id: suggestedAlertRuleId({ name, type, target, threshold }),
+    name,
+    type,
+    target,
+    threshold,
+    enabled: true,
+    createdAt: new Date().toISOString(),
+  } satisfies AlertRule
+
+  return {
+    id: rule.id,
+    rule,
+    priority,
+    reason,
+    evidence,
+    relatedSymbols,
+  }
+}
+
+function buildSuggestedAlertRules({
+  alertRulesData,
+  holdingsData,
+  watchlistData,
+  indicators,
+  newsItems,
+  biasScoreData,
+  forecast,
+  newsQuality,
+}: {
+  alertRulesData: AlertRule[]
+  holdingsData: Holding[]
+  watchlistData: WatchItem[]
+  indicators: MarketIndicator[]
+  newsItems: LiveNewsItem[]
+  biasScoreData: BiasScore
+  forecast: MarketForecast
+  newsQuality: NewsQualitySignal
+}): SuggestedAlertRule[] {
+  const existingKeys = new Set(alertRulesData.map(alertRuleMatchKey))
+  const candidates: SuggestedAlertRule[] = []
+  const addCandidate = (candidate: SuggestedAlertRule) => {
+    const key = alertRuleMatchKey(candidate.rule)
+    if (existingKeys.has(key)) return
+    if (candidates.some((item) => alertRuleMatchKey(item.rule) === key)) return
+    candidates.push(candidate)
+  }
+
+  watchlistData
+    .slice()
+    .sort((left, right) => left.distanceToBuy - right.distanceToBuy)
+    .slice(0, 4)
+    .forEach((item) => {
+      addCandidate(
+        makeSuggestedAlertRule({
+          name: `${item.name} 관심가 도달`,
+          type: 'price-below',
+          target: item.symbol,
+          threshold: item.targetBuyPrice,
+          priority: item.status === 'alert' || item.distanceToBuy <= 1.5 ? 'high' : 'medium',
+          reason: '관심가에 가까운 종목은 화면을 보지 못해도 가격 조건으로 잡아두는 편이 좋습니다.',
+          evidence: `현재 ${formatCurrency(item.currentPrice, defaultMarketForSymbol(item.symbol))} / 관심가 ${formatCurrency(item.targetBuyPrice, defaultMarketForSymbol(item.symbol))} / 거리 ${item.distanceToBuy.toFixed(1)}%`,
+          relatedSymbols: [item.symbol],
+        }),
+      )
+    })
+
+  holdingsData
+    .slice()
+    .sort((left, right) => right.portfolioWeight - left.portfolioWeight)
+    .slice(0, 3)
+    .forEach((holding) => {
+      const threshold = holding.portfolioWeight >= 28 ? -2.5 : -3
+      addCandidate(
+        makeSuggestedAlertRule({
+          name: `${holding.name} 급락 방어`,
+          type: 'change-below',
+          target: holding.symbol,
+          threshold,
+          priority: holding.portfolioWeight >= 28 ? 'high' : 'medium',
+          reason: '고비중 보유종목은 장중 급락 조건을 자동으로 걸어두면 대응 속도가 빨라집니다.',
+          evidence: `비중 ${holding.portfolioWeight}% / 오늘 ${formatChange(holding.dayChange)} / 기준 ${formatChange(threshold)}`,
+          relatedSymbols: [holding.symbol],
+        }),
+      )
+    })
+
+  const indicatorSuggestions = [
+    { symbol: 'SOX', type: 'change-below' as const, threshold: -1.4, name: 'SOX 약세 전환', priority: 'high' as const },
+    { symbol: 'NQ=F', type: 'change-below' as const, threshold: -0.6, name: '나스닥 선물 약세 전환', priority: 'high' as const },
+    { symbol: 'USD/KRW', type: 'change-above' as const, threshold: 0.45, name: '환율 재상승 경계', priority: 'high' as const },
+    { symbol: 'VIX', type: 'change-above' as const, threshold: 4, name: 'VIX 변동성 확대', priority: 'medium' as const },
+  ]
+  indicatorSuggestions.forEach((suggestion) => {
+    const indicator = indicators.find((item) => item.symbol === suggestion.symbol)
+    addCandidate(
+      makeSuggestedAlertRule({
+        name: suggestion.name,
+        type: suggestion.type,
+        target: suggestion.symbol,
+        threshold: suggestion.threshold,
+        priority: suggestion.priority,
+        reason: '국내장 다음날 흐름에 영향을 주는 미국 선행지표는 조건 알림으로 따로 잡아둡니다.',
+        evidence: indicator ? `${indicator.name} 현재 ${formatChange(indicator.change)} · ${indicator.note}` : `${suggestion.symbol} 기준 ${formatChange(suggestion.threshold)}`,
+        relatedSymbols: [suggestion.symbol],
+      }),
+    )
+  })
+
+  const highQualityNews = newsItems
+    .filter((item) => item.quality === 'high' || item.importance === 'high')
+    .slice()
+    .sort((left, right) => (right.relevanceScore ?? 0) - (left.relevanceScore ?? 0))
+    .slice(0, 2)
+  highQualityNews.forEach((item) => {
+    addCandidate(
+      makeSuggestedAlertRule({
+        name: `${item.keyword} 뉴스 감시`,
+        type: 'news-keyword',
+        target: item.keyword,
+        threshold: 0,
+        priority: item.importance === 'high' || item.quality === 'high' ? 'medium' : 'low',
+        reason: '관련도 높은 뉴스 키워드는 후속 기사 발생 시 다시 확인할 수 있게 조건으로 저장합니다.',
+        evidence: `품질 ${item.quality ? newsQualityLabel[item.quality] : '미분류'} · 관련도 ${item.relevanceScore ?? newsQuality.averageRelevance} · ${item.title}`,
+        relatedSymbols: item.relatedSymbols.length > 0 ? item.relatedSymbols : [item.keyword],
+      }),
+    )
+  })
+
+  if (forecast.baseScore <= 48 || biasScoreData.stance === 'pressure') {
+    addCandidate(
+      makeSuggestedAlertRule({
+        name: '방향점수 방어선 이탈',
+        type: 'bias-below',
+        target: biasScoreData.market,
+        threshold: 42,
+        priority: 'high',
+        reason: '방향점수가 방어 구간으로 내려가면 신규 진입보다 리스크 확인을 먼저 해야 합니다.',
+        evidence: `현재 ${forecast.baseScore}/100 · ${forecast.openingBias}`,
+        relatedSymbols: [biasScoreData.market],
+      }),
+    )
+  } else if (forecast.baseScore >= 58) {
+    addCandidate(
+      makeSuggestedAlertRule({
+        name: '방향점수 상방 확인',
+        type: 'bias-above',
+        target: biasScoreData.market,
+        threshold: 62,
+        priority: 'medium',
+        reason: '상방 조건이 확인될 때만 관심종목 분할 접근을 검토하도록 기준선을 잡습니다.',
+        evidence: `현재 ${forecast.baseScore}/100 · ${forecast.openingBias}`,
+        relatedSymbols: [biasScoreData.market],
+      }),
+    )
+  }
+
+  return candidates.sort((left, right) => priorityRank(right.priority) - priorityRank(left.priority)).slice(0, 6)
+}
+
 function buildMarketStatusView({
   quoteMap,
   fetchedAt,
@@ -6358,6 +6557,16 @@ function buildDashboardSnapshot({
     newsItems: liveNews,
     biasScoreData: liveBiasScore,
   })
+  const suggestedAlertRules = buildSuggestedAlertRules({
+    alertRulesData,
+    holdingsData: liveHoldings,
+    watchlistData: liveWatchlist,
+    indicators: liveIndicators,
+    newsItems: liveNews,
+    biasScoreData: liveBiasScore,
+    forecast,
+    newsQuality,
+  })
   const marketPulse = buildMarketPulseRail({
     indicators: liveIndicators,
     radar: catalystRadar,
@@ -6466,6 +6675,7 @@ function buildDashboardSnapshot({
     alertSettings: alertSettingsData,
     alertHistory: alertHistoryData,
     triggeredAlerts,
+    suggestedAlertRules,
     storedData: {
       holdings: baseHoldings,
       watchlist: baseWatchlist,
@@ -10418,6 +10628,7 @@ function AlertsPage({
   alertHistory,
   notificationPermission,
   triggeredAlerts,
+  suggestedAlertRules,
   onSaveAlertRule,
   onDeleteAlertRule,
   onToggleAlertRule,
@@ -10433,6 +10644,7 @@ function AlertsPage({
   alertHistory: AlertHistoryItem[]
   notificationPermission: NotificationPermissionState
   triggeredAlerts: TriggeredAlert[]
+  suggestedAlertRules: SuggestedAlertRule[]
   onSaveAlertRule: (rule: AlertRule, previousId?: string) => void
   onDeleteAlertRule: (id: string) => void
   onToggleAlertRule: (id: string) => void
@@ -10475,6 +10687,13 @@ function AlertsPage({
     clearForm()
   }
 
+  function addSuggestedRule(suggestion: SuggestedAlertRule) {
+    onSaveAlertRule({
+      ...suggestion.rule,
+      createdAt: new Date().toISOString(),
+    })
+  }
+
   return (
     <PageGrid>
       <section className="grid gap-4 md:grid-cols-4">
@@ -10483,6 +10702,54 @@ function AlertsPage({
         <MetricCard label="관심가/트리거" value={`${watchlistCount}개`} detail="가격 조건" tone={watchlistCount > 0 ? 'positive' : 'neutral'} />
         <MetricCard label="알림 기록" value={`${unreadHistoryCount}/${alertHistory.length}`} detail={notificationStatusLabel} tone={highTriggeredCount > 0 ? 'negative' : unreadHistoryCount > 0 ? 'warning' : 'neutral'} />
       </section>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>추천 알림 규칙</CardTitle>
+          <CardDescription>현재 보유/관심종목, 선행지표, 뉴스 품질, 방향점수를 기준으로 필요한 조건만 제안합니다</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {suggestedAlertRules.length > 0 ? (
+            <div className="grid gap-3 lg:grid-cols-2">
+              {suggestedAlertRules.map((suggestion) => (
+                <div key={suggestion.id} className="rounded-md border border-border bg-muted/15 p-4">
+                  <div className="mb-3 flex flex-wrap items-center gap-2">
+                    <Badge variant={actionPriorityVariant(suggestion.priority)}>{actionPriorityLabel[suggestion.priority]}</Badge>
+                    <Badge variant="secondary">{alertRuleTypeLabel[suggestion.rule.type]}</Badge>
+                    <Badge variant="secondary">{suggestion.rule.target}</Badge>
+                    {suggestion.relatedSymbols.slice(0, 3).map((symbol) => (
+                      <Badge key={symbol} variant="secondary">
+                        {symbol}
+                      </Badge>
+                    ))}
+                  </div>
+                  <div className="text-sm font-semibold">{suggestion.rule.name}</div>
+                  <div className="mt-2 text-sm leading-6 text-foreground/85">{suggestion.reason}</div>
+                  <div className="mt-2 text-xs leading-5 text-muted-foreground">{suggestion.evidence}</div>
+                  <div className="mt-4 flex flex-wrap items-center gap-2">
+                    <Badge variant="neutral">
+                      {suggestion.rule.type === 'news-keyword' ? '키워드 발생' : `기준 ${formatNumber(suggestion.rule.threshold)}`}
+                    </Badge>
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={() => addSuggestedRule(suggestion)}
+                      aria-label={`${suggestion.rule.name} 추천 알림 추가`}
+                    >
+                      <Bell className="size-4" />
+                      추가
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-md border border-border bg-muted/15 p-4 text-sm leading-6 text-muted-foreground">
+              지금은 새로 추천할 알림 규칙이 없습니다. 이미 같은 조건이 있거나, 보유/관심종목과 선행지표 기준이 충분히 커버되고 있습니다.
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
         <Card>
@@ -11936,6 +12203,7 @@ function renderPage(page: PageId, snapshot: DashboardSnapshot, actions: Dashboar
         alertHistory={snapshot.alertHistory}
         notificationPermission={actions.notificationPermission}
         triggeredAlerts={snapshot.triggeredAlerts}
+        suggestedAlertRules={snapshot.suggestedAlertRules}
         onSaveAlertRule={actions.onSaveAlertRule}
         onDeleteAlertRule={actions.onDeleteAlertRule}
         onToggleAlertRule={actions.onToggleAlertRule}
